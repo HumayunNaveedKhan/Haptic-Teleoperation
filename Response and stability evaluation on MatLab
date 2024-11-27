@@ -1,0 +1,45 @@
+%zeta response
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Parameters
+k = 10;                % Gain
+wn = 10;               % Natural frequency (rad/s)
+zeta_values = [0.3, 0.7, 1.0]; % Damping ratios
+Ts = 0.05;             % Sampling time for discretization
+
+% Create a single figure with 3 subplots
+figure;
+
+for i = 1:length(zeta_values)
+    zeta = zeta_values(i);
+    
+    % Define transfer function G(s) for current zeta
+    numerator = k * wn^2;
+    denominator = [1, 2*zeta*wn, wn^2];
+    G_s = tf(numerator, denominator);
+    
+    % Time response
+    subplot(3, length(zeta_values), i); % Row 1: Time Response
+    step(G_s);
+    title(['Time Response (\zeta = ', num2str(zeta), ')']);
+    grid on;
+    
+    % Discretize G(s) using Tustin method
+    G_z = c2d(G_s, Ts, 'tustin');
+    
+    % Sampled time response
+    subplot(3, length(zeta_values), length(zeta_values) + i); % Row 2: Sampled Response
+    step(G_z);
+    title(['Sampled Response (\zeta = ', num2str(zeta), ')']);
+    grid on;
+    
+    % s-plane pole-zero map
+    subplot(3, length(zeta_values), 2*length(zeta_values) + i); % Row 3: s-Plane
+    pzmap(G_s);
+    title(['s-Plane (\zeta = ', num2str(zeta), ')']);
+    grid on;
+end
+
+% Adjust layout
+sgtitle('System Responses for Different Damping Ratios (\zeta)');
+
+
+%zeta response of smith tf
