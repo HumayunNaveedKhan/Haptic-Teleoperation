@@ -1,0 +1,1273 @@
+{\rtf1\ansi\deff0\nouicompat{\fonttbl{\f0\fnil\fcharset0 Calibri;}}
+{\*\generator Riched20 10.0.18362}\viewkind4\uc1 
+\pard\sa200\sl276\slmult1\f0\fs22\lang9 #include <winsock2.h>\par
+#include <stdlib.h>\par
+#include <stdio.h>\par
+#include <iostream>\par
+#include <fstream>\par
+#include <dos.h>\par
+#include "chai3d.h"\par
+#include <GLFW/glfw3.h>\par
+#include <chrono>\par
+#include <algorithm>\par
+#include <stack>\par
+#include <numeric>\par
+#include <valarray>\par
+#include <conio.h>\par
+#include <ctime>\par
+#include <thread>\par
+\par
+#pragma comment(lib, "ws2_32.lib")\par
+\par
+////////////////////////////////////////////////////////////////////////////////\par
+using namespace chai3d;\par
+using namespace std;\par
+\par
+\par
+////////////////////////////////////////////////////////////////////////////////\par
+// Device Param.\par
+////////////////////////////////////////////////////////////////////////////////\par
+#define DOF 3\par
+\par
+double pos_curr[DOF] = \{ 0, 0, 0 \};\par
+double pos_prev[DOF] = \{ 0, 0, 0 \};\par
+double pos_recv[DOF] = \{ 0, 0, 0 \};\par
+double Fd[DOF];\par
+\par
+////////////////////////////////////////////////////////////////////////////////\par
+// UDP Param.\par
+////////////////////////////////////////////////////////////////////////////////\par
+#define BUFSIZE 4096\par
+#define SERVER_IP "192.168.0.104" //"127.0.0.1"\par
+#define UDP_PORT 4000\par
+#define SENDDATA_NUM 3\par
+#define READDATA_NUM 3\par
+\par
+\par
+int retval;\par
+WSADATA wsa;\par
+\par
+SOCKET sock;\par
+\par
+// \'b5\'a5\'c0\'cc\'c5\'cd \'c5\'eb\'bd\'c5\'bf\'a1 \'bb\'e7\'bf\'eb\'c7\'d2 \'ba\'af\'bc\'f6\par
+SOCKADDR_IN serveraddr;\par
+SOCKADDR_IN clientaddr;\par
+\par
+int addrlen;\par
+char sbuf[BUFSIZE + 1], rbuf[BUFSIZE + 1];\par
+\par
+float SendData[SENDDATA_NUM], ReadData[READDATA_NUM];\par
+\par
+bool isFirstRecv = false;\par
+\par
+////////////////////////////////////////////////////////////////////////////////\par
+// Delay Param.\par
+////////////////////////////////////////////////////////////////////////////////\par
+#define DELAY 1\par
+#define DELAYDATA_NUM 3\par
+\par
+double ClientData[DELAYDATA_NUM];\par
+double DelayDataBuf[DELAYDATA_NUM][DELAY];\par
+double DelayData[DELAYDATA_NUM];\par
+\par
+\par
+////////////////////////////////////////////////////////////////////////////////\par
+// GUI - GENERAL SETTINGS\par
+////////////////////////////////////////////////////////////////////////////////\par
+\par
+// stereo Mode\par
+/*\par
+\tab C_STEREO_DISABLED:            Stereo is disabled\par
+\tab C_STEREO_ACTIVE:              Active stereo for OpenGL NVDIA QUADRO cards\par
+\tab C_STEREO_PASSIVE_LEFT_RIGHT:  Passive stereo where L/R images are rendered next to each other\par
+\tab C_STEREO_PASSIVE_TOP_BOTTOM:  Passive stereo where L/R images are rendered above each other\par
+*/\par
+cStereoMode stereoMode = C_STEREO_DISABLED;\par
+\par
+// fullscreen mode\par
+bool fullscreen = false;\par
+\par
+// mirrored display\par
+bool mirroredDisplay = false;\par
+double delayn = 0;\par
+double delaym = 0;\par
+double range = 0;\par
+int i;\par
+double sum = 0;\par
+double average = 0;\par
+int n;\par
+double* p;\par
+int countd = 0;\par
+int timeUDPS;\par
+int timeUDPR;\par
+int place;\par
+\par
+double *arr2;\par
+\par
+double arr[100];\par
+double* pvalue = 0;\par
+//float* p = new float[(int)i];\par
+\par
+\par
+\par
+stack<double> delayarray;\par
+std::vector<double> delay2;\par
+\par
+\par
+struct Timer\par
+\{\par
+\tab chrono::time_point<std::chrono::steady_clock>start, end;\par
+\tab chrono::duration<float>duration;\par
+\tab Timer()\par
+\tab\{\par
+\tab\tab start = std::chrono::high_resolution_clock::now();\par
+\par
+\tab\}\par
+\tab ~Timer()\par
+\tab\{\par
+\tab\tab end = std::chrono::high_resolution_clock::now();\par
+\tab\tab duration = end - start;\par
+\tab\tab float ms = duration.count() * 1000.0f;\par
+\tab\tab timeUDPR = ms;\par
+\tab\tab //cout << "Timer took" << ms << "ms" << endl;\par
+\par
+\tab\}\par
+\};\par
+struct Timer2\par
+\{\par
+\tab chrono::time_point<std::chrono::steady_clock>start, end;\par
+\tab chrono::duration<float>duration;\par
+\tab Timer2()\par
+\tab\{\par
+\tab\tab start = std::chrono::high_resolution_clock::now();\par
+\par
+\tab\}\par
+\tab ~Timer2()\par
+\tab\{\par
+\tab\tab end = std::chrono::high_resolution_clock::now();\par
+\tab\tab duration = end - start;\par
+\tab\tab float ms = duration.count() * 1000.0f;\par
+\tab\tab timeUDPS = ms;\par
+\tab\tab //cout << "Timer took" << ms << "ms" << endl;\par
+\par
+\tab\}\par
+\};\par
+\par
+////////////////////////////////////////////////////////////////////////////////\par
+// GUI - DECLARED VARIABLES\par
+////////////////////////////////////////////////////////////////////////////////\par
+\par
+// a world that contains all objects of the virtual environment\par
+cWorld* world;\par
+\par
+// a camera to render the world in the window display\par
+cCamera* camera;\par
+\par
+// a light source to illuminate the objects in the world\par
+cDirectionalLight* light;\par
+\par
+// a haptic device handler\par
+cHapticDeviceHandler* handler;\par
+\par
+// a pointer to the current haptic device\par
+cGenericHapticDevicePtr hapticDevice;\par
+\par
+// a label to display the haptic device model\par
+cLabel* labelHapticDeviceModel;\par
+\par
+// a label to display the position [m] of the haptic device\par
+cLabel* labelHapticDevicePosition;\par
+\par
+// a global variable to store the position [m] of the haptic device\par
+cVector3d hapticDevicePosition;\par
+\par
+// a global variable to store the velocity [m/s] of the haptic device\par
+cVector3d hapticDeviceVelocity;\par
+\par
+// a font for rendering text\par
+cFontPtr font;\par
+\par
+// a label to display the rate [Hz] at which the simulation is running\par
+cLabel* labelRates;\par
+\par
+cLabel* labelMax;\par
+cLabel* labelMin;\par
+\par
+cLabel* labelXd;\par
+cLabel* labelXd_Prev;\par
+\par
+cLabel* labelX_Recv;\par
+\par
+cLabel* labelFd;\par
+\par
+cLabel* labelIP;\par
+\par
+cLabel* labelDelay;\par
+cLabel* labelDashes_1;\par
+cLabel* labelServerLabel;\par
+cLabel* labelDashes_2;\par
+cLabel* labelKeyboardOptions;\par
+cLabel* labelPotentialField;\par
+cLabel* labelExitApplication;\par
+cLabel* labelScopeInfo;\par
+cLabel* labelScope1Info;\par
+cLabel* labelMirror;\par
+cLabel* labelToggleScreen;\par
+cLabel* labelavg;\par
+cLabel* labelmax;\par
+cLabel* labelmax2;\par
+\par
+// a small sphere (cursor) representing the haptic device \par
+cShapeTorus* cursor;\par
+\par
+// a line representing the velocity of the haptic device\par
+cShapeLine* velocity;\par
+\par
+// a scope to monitor position values of haptic device\par
+cScope* scope;\par
+cScope* scope1;\par
+\par
+// a flag for using force field (ON/OFF)\par
+bool useForceField = true;\par
+\par
+// a flag to indicate if the haptic simulation currently running\par
+bool simulationRunning = false;\par
+\par
+// a flag to indicate if the haptic simulation has terminated\par
+bool simulationFinished = true;\par
+\par
+// a frequency counter to measure the simulation graphic rate\par
+cFrequencyCounter freqCounterGraphics;\par
+\par
+// a frequency counter to measure the simulation haptic rate\par
+cFrequencyCounter freqCounterHaptics;\par
+\par
+// haptic thread\par
+cThread* hapticsThread;\par
+\par
+// a handle to window display context\par
+GLFWwindow* window = NULL;\par
+\par
+// current width of window\par
+int width = 0;\par
+\par
+// current height of window\par
+int height = 0;\par
+\par
+// swap interval for the display context (vertical synchronization)\par
+int swapInterval = 1;\par
+\par
+\par
+////////////////////////////////////////////////////////////////////////////////\par
+// GUI - DECLARED FUNCTIONS\par
+////////////////////////////////////////////////////////////////////////////////\par
+\par
+// callback when the window display is resized\par
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);\par
+\par
+// callback when an error GLFW occurs\par
+void errorCallback(int error, const char* a_description);\par
+\par
+// callback when a key is pressed\par
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);\par
+\par
+// this function renders the scene\par
+void updateGraphics(void);\par
+\par
+// this function contains the main haptics simulation loop\par
+void updateHaptics(void);\par
+\par
+// this function closes the application\par
+void close(void);\par
+\par
+void InitUDP(void);\par
+void modifiedEBA(void);\par
+void CloseUDP();\par
+void UDPSendData(float sData[SENDDATA_NUM]);\par
+void UDPReadData();\par
+void err_quit(const char* msg);\par
+void err_display(const char* msg);\par
+\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+\par
+\par
+\par
+\par
+\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+int main(int argc, char* argv[])\par
+\{\par
+\tab InitUDP();\par
+\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\tab // INITIALIZATION\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\par
+\tab cout << endl;\par
+\tab cout << "-----------------------------------" << endl;\par
+\tab cout << "Tele-HandShake Client" << endl;\par
+\tab cout << "-----------------------------------" << endl << endl << endl;\par
+\tab cout << "Keyboard Options:" << endl << endl;\par
+\tab cout << "[1] - Enable/Disable potential field" << endl;\par
+\tab cout << endl;\par
+\tab cout << "[q] - Exit application" << endl;\par
+\tab cout << endl << endl;\par
+\par
+\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\tab // OPEN GL - WINDOW DISPLAY\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\par
+\tab // initialize GLFW library\par
+\tab if (!glfwInit())\par
+\tab\{\par
+\tab\tab cout << "failed initialization" << endl;\par
+\tab\tab cSleepMs(1000);\par
+\tab\tab return 1;\par
+\tab\}\par
+\par
+\tab // set error callback\par
+\tab glfwSetErrorCallback(errorCallback);\par
+\par
+\tab // compute desired size of window\par
+\tab const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());\par
+\tab int w = 1.2 * mode->height;\par
+\tab int h = 0.7 * mode->height;\par
+\tab int x = 0.7 * (mode->width - w);\par
+\tab int y = 0.7 * (mode->height - h);\par
+\par
+\tab // set OpenGL version\par
+\tab glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);\par
+\tab glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);\par
+\par
+\tab // set active stereo mode\par
+\tab if (stereoMode == C_STEREO_ACTIVE)\par
+\tab\{\par
+\tab\tab glfwWindowHint(GLFW_STEREO, GL_TRUE);\par
+\tab\}\par
+\tab else\par
+\tab\{\par
+\tab\tab glfwWindowHint(GLFW_STEREO, GL_FALSE);\par
+\tab\}\par
+\par
+\tab // create display context\par
+\tab window = glfwCreateWindow(w, h, "Tele-HandShake (Client)", NULL, NULL);\par
+\tab if (!window)\par
+\tab\{\par
+\tab\tab cout << "failed to create window" << endl;\par
+\tab\tab cSleepMs(1000);\par
+\tab\tab glfwTerminate();\par
+\tab\tab return 1;\par
+\tab\}\par
+\par
+\tab // get width and height of window\par
+\tab glfwGetWindowSize(window, &width, &height);\par
+\par
+\tab // set position of window\par
+\tab glfwSetWindowPos(window, x, y);\par
+\par
+\tab // set key callback\par
+\tab glfwSetKeyCallback(window, keyCallback);\par
+\par
+\tab // set resize callback\par
+\tab glfwSetWindowSizeCallback(window, windowSizeCallback);\par
+\par
+\tab // set current display context\par
+\tab glfwMakeContextCurrent(window);\par
+\par
+\tab // sets the swap interval for the current display context\par
+\tab glfwSwapInterval(swapInterval);\par
+\par
+#ifdef GLEW_VERSION\par
+\tab // initialize GLEW library\par
+\tab if (glewInit() != GLEW_OK)\par
+\tab\{\par
+\tab\tab cout << "failed to initialize GLEW library" << endl;\par
+\tab\tab glfwTerminate();\par
+\tab\tab return 1;\par
+\tab\}\par
+#endif\par
+\par
+\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\tab // WORLD - CAMERA - LIGHTING\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\par
+\tab // create a new world.\par
+\tab world = new cWorld();\par
+\par
+\tab // set the background color of the environment\par
+\tab world->m_backgroundColor.setBlack();\par
+\par
+\tab // create a camera and insert it into the virtual world\par
+\tab camera = new cCamera(world);\par
+\tab world->addChild(camera);\par
+\par
+\tab // position and orient the camera\par
+\tab camera->set(cVector3d(0.5, 0.0, 0.0),    // camera position (eye)\par
+\tab\tab cVector3d(0.0, 0.0, 0.0),    // look at position (target)\par
+\tab\tab cVector3d(0.0, 0.0, 1.0));   // direction of the (up) vector\par
+\par
+// set the near and far clipping planes of the camera\par
+\tab camera->setClippingPlanes(0.01, 10.0);\par
+\par
+\tab // set stereo mode\par
+\tab camera->setStereoMode(stereoMode);\par
+\par
+\tab // set stereo eye separation and focal length (applies only if stereo is enabled)\par
+\tab camera->setStereoEyeSeparation(0.005);\par
+\tab camera->setStereoFocalLength(0.5);\par
+\par
+\tab // set vertical mirrored display mode\par
+\tab camera->setMirrorVertical(mirroredDisplay);\par
+\par
+\tab // create a directional light source\par
+\tab light = new cDirectionalLight(world);\par
+\par
+\tab // insert light source inside world\par
+\tab world->addChild(light);\par
+\par
+\tab // enable light source\par
+\tab light->setEnabled(true);\par
+\par
+\tab // define direction of light beam\par
+\tab light->setDir(-1.0, 0.0, 0.0);\par
+\par
+\tab // create a sphere (cursor) to represent the haptic device\par
+\tab cursor = new cShapeTorus(0.03, 0.05);\par
+\par
+\tab // insert cursor inside world\par
+\tab world->addChild(cursor);\par
+\par
+\tab // create small line to illustrate the velocity of the haptic device\par
+\tab velocity = new cShapeLine(cVector3d(0, 0, 0), cVector3d(0, 0, 0));\par
+\par
+\tab // insert line inside world\par
+\tab world->addChild(velocity);\par
+\par
+\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\tab // HAPTIC DEVICE\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\par
+\tab // create a haptic device handler\par
+\tab handler = new cHapticDeviceHandler();\par
+\par
+\tab // get a handle to the first haptic device\par
+\tab handler->getDevice(hapticDevice, 0);\par
+\par
+\tab // open a connection with the haptic device\par
+\tab hapticDevice->open();\par
+\par
+\tab // retrieve information about the current haptic device\par
+\tab cHapticDeviceInfo info = hapticDevice->getSpecifications();\par
+\par
+\tab // if the device has a gripper, enable the gripper to behave like a user switch\par
+\tab hapticDevice->setEnableGripperUserSwitch(true);\par
+\par
+\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\tab // WIDGETS\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\par
+\tab // create a font\par
+\tab font = NEW_CFONTCALIBRI20();\par
+\par
+\tab // create a label to display the haptic device model\par
+\tab labelHapticDeviceModel = new cLabel(font);\par
+\tab camera->m_frontLayer->addChild(labelHapticDeviceModel);\par
+\tab labelHapticDeviceModel->setText(info.m_modelName);\par
+\tab labelHapticDeviceModel->m_fontColor.setBlueRoyal();\par
+\par
+\tab // create a label to display the position of haptic device\par
+\tab labelHapticDevicePosition = new cLabel(font);\par
+\tab camera->m_frontLayer->addChild(labelHapticDevicePosition);\par
+\par
+\tab // create a label to display the haptic and graphic rate of the simulation\par
+\tab labelRates = new cLabel(font);\par
+\tab camera->m_frontLayer->addChild(labelRates);\par
+\par
+\par
+\tab // create a scope to plot haptic device position data\par
+\tab scope = new cScope();\par
+\tab camera->m_frontLayer->addChild(scope);\par
+\tab scope->setLocalPos(100, 60);\par
+\tab scope->setRange(-0.1, 0.1);\par
+\tab scope->setSignalEnabled(true, true, true, true);\par
+\tab scope->setTransparencyLevel(0.6);\par
+\par
+\par
+\tab scope1 = new cScope();\par
+\tab camera->m_frontLayer->addChild(scope1);\par
+\tab scope1->setLocalPos(100, 60);\par
+\tab scope1->setRange(0, 10); // try static scale within range \par
+\tab scope1->setSignalEnabled(true, true, true, true);\par
+\tab scope1->setTransparencyLevel(0.3);\par
+\tab\par
+\tab // \par
+\par
+\tab //arr[100] = delay; // Error using it\par
+\par
+\par
+\tab labelMin = new cLabel(font);\par
+\tab camera->m_frontLayer->addChild(labelMin);\par
+\tab labelMin->setText("0");\par
+\tab labelMin->setLocalPos(85, 55);\par
+\par
+\tab labelMax = new cLabel(font);\par
+\tab camera->m_frontLayer->addChild(labelMax);\par
+\tab labelMax->setText("0.1");\par
+\tab labelMax->setLocalPos(70, 300);\par
+\par
+\tab labelMin = new cLabel(font);\par
+\tab camera->m_frontLayer->addChild(labelMin);\par
+\tab labelMin->setText("-0.1");\par
+\tab labelMin->setLocalPos(65, 120);\par
+\par
+\tab //labelMax = new cLabel(font);\par
+\tab //camera->m_frontLayer->addChild(labelMax);\par
+\tab //labelMax->setText("Max");\par
+\tab //labelMax->setLocalPos(65, 100); // x = 50 for range 1000 or 4 digits, x = 75 for range of 2 digits\par
+\par
+\par
+\tab labelMax = new cLabel(font);\par
+\tab camera->m_frontLayer->addChild(labelMax);\par
+\tab labelMax->setText("Delay Scope (ms)");\par
+\tab labelMax->setLocalPos(385, 100);\par
+\par
+\tab labelMax = new cLabel(font);\par
+\tab camera->m_frontLayer->addChild(labelMax);\par
+\tab labelMax->setText("Position scope");\par
+\tab labelMax->setLocalPos(380, 300);\par
+\par
+\par
+\tab labelXd_Prev = new cLabel(font);\par
+\tab labelXd = new cLabel(font);\par
+\tab labelX_Recv = new cLabel(font);\par
+\tab labelFd = new cLabel(font);\par
+\par
+\tab labelIP = new cLabel(font);\par
+\par
+\tab labelDelay = new cLabel(font);\par
+\tab labelDashes_1 = new cLabel(font);\par
+\tab labelServerLabel = new cLabel(font);\par
+\tab labelDashes_2 = new cLabel(font);\par
+\tab labelKeyboardOptions = new cLabel(font);\par
+\tab labelPotentialField = new cLabel(font);\par
+\tab labelExitApplication = new cLabel(font);\par
+\tab labelScopeInfo = new cLabel(font);\par
+\tab labelmax = new cLabel(font);\par
+\tab labelMirror = new cLabel(font);\par
+\tab labelToggleScreen = new cLabel(font);\par
+\tab labelavg = new cLabel(font);\par
+\tab\par
+\tab camera->m_frontLayer->addChild(labelXd_Prev);\par
+\tab camera->m_frontLayer->addChild(labelXd);\par
+\tab camera->m_frontLayer->addChild(labelX_Recv);\par
+\tab camera->m_frontLayer->addChild(labelFd);\par
+\par
+\par
+\tab camera->m_frontLayer->addChild(labelavg); // Add on\par
+\tab\par
+\tab\par
+\tab\par
+\tab camera->m_frontLayer->addChild(labelIP);\par
+\par
+\tab camera->m_frontLayer->addChild(labelDashes_1);\par
+\tab camera->m_frontLayer->addChild(labelServerLabel);\par
+\tab camera->m_frontLayer->addChild(labelDashes_2);\par
+\tab camera->m_frontLayer->addChild(labelKeyboardOptions);\par
+\tab camera->m_frontLayer->addChild(labelPotentialField);\par
+\tab camera->m_frontLayer->addChild(labelExitApplication);\par
+\tab camera->m_frontLayer->addChild(labelScopeInfo);\par
+\tab camera->m_frontLayer->addChild(labelMirror);\par
+\tab camera->m_frontLayer->addChild(labelToggleScreen);\par
+\tab camera->m_frontLayer->addChild(labelDelay);\par
+\tab camera->m_frontLayer->addChild(labelmax);\par
+\par
+\tab //labelDashes_1->setText("     ______________________________________________________");\par
+\tab //labelDashes_1->setLocalPos(160, height - 60);\par
+\tab //labelDashes_1->m_fontColor.setBlueLight();\par
+\par
+\tab labelServerLabel->setText("Dr.Riaz Uddin Telepresence (Client)");\par
+\tab labelServerLabel->setLocalPos(350, height - 90);\par
+\tab labelServerLabel->m_fontColor.setBlueLight();\par
+\par
+\tab //labelDashes_2->setText("     ______________________________________________________");\par
+\tab //labelDashes_2->setLocalPos(160, height - 100);\par
+\tab //labelDashes_2->m_fontColor.setBlueLight();\par
+\par
+\tab labelKeyboardOptions->setText("Keyboard Options : ");\par
+\tab labelKeyboardOptions->setLocalPos(500, height - 120);\par
+\tab labelKeyboardOptions->m_fontColor.setWhite();\par
+\par
+\tab labelMirror->setText("Press 'm' for getting mirrored screen ");\par
+\tab labelMirror->setLocalPos(500, height - 140);\par
+\tab labelMirror->m_fontColor.setRed();\par
+\par
+\tab labelToggleScreen->setText("Falcon Options ");\par
+\tab labelToggleScreen->setLocalPos(500, height - 180);\par
+\tab labelToggleScreen->m_fontColor.setWhite();\par
+\par
+\tab labelPotentialField->setText("Press '1' to Enable/Disable Potential Field");\par
+\tab labelPotentialField->setLocalPos(500, height - 160);\par
+\tab labelPotentialField->m_fontColor.setBlue();\par
+\par
+\tab labelExitApplication->setText("Press '+' to increase offset Delay");\par
+\tab labelExitApplication->setLocalPos(500, height - 200);\par
+\tab labelExitApplication->m_fontColor.setBlue();\par
+\par
+\tab\par
+\par
+\tab labelScopeInfo->setText("Scope Information: ");\par
+\tab labelScopeInfo->setLocalPos(20, height - 120);\par
+\tab labelScopeInfo->m_fontColor.setWhite();\par
+\par
+\par
+\tab labelIP->setText("Server IP: ");\par
+\tab labelIP->setLocalPos(20, height - 140);\par
+\tab labelIP->m_fontColor.setRed();\par
+\par
+\tab //arr[100] = delay;       // error using\par
+\par
+\tab labelavg->setText("Average Delay: ");\par
+\tab labelavg->setLocalPos(110, height - 500);\par
+\tab labelavg->m_fontColor.setWhite();\par
+\par
+\par
+\tab labelXd_Prev->setText("Prev Xd: ");\par
+\tab labelXd_Prev->setLocalPos(20, height - 160);\par
+\tab labelXd_Prev->m_fontColor.setBlue();\par
+\par
+\tab labelXd->setText("Curr Xd: ");\par
+\tab labelXd->setLocalPos(20, height - 180);\par
+\tab labelXd->m_fontColor.setRed();\par
+\par
+\tab labelX_Recv->setText("Recv: ");\par
+\tab labelX_Recv->setLocalPos(20, height - 200);\par
+\tab labelX_Recv->m_fontColor.setBlue();\par
+\par
+\par
+\tab labelFd->setText("Fd: ");\par
+\tab labelFd->setLocalPos(20, height - 220);\par
+\tab labelFd->m_fontColor.setRed();\par
+\par
+\tab labelRates->setText("Frequency: ");\par
+\tab labelRates->setLocalPos(20, height - 240);\par
+\tab labelRates->m_fontColor.setWhite();\par
+\par
+\tab labelDelay->setText("Delay: ");\par
+\tab labelDelay->setLocalPos(680, height - 500);\par
+\tab labelDelay->m_fontColor.setWhite();\par
+\par
+\tab labelmax->setText("Max: ");\par
+\tab labelmax->setLocalPos(10, 100);\par
+\tab labelmax->m_fontColor.setWhite();\par
+\par
+\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\tab // START SIMULATION\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\par
+\tab // create a thread which starts the main haptics rendering loop\par
+\tab hapticsThread = new cThread();\par
+\tab hapticsThread->start(updateHaptics, CTHREAD_PRIORITY_HAPTICS);\par
+\par
+\tab // setup callback when application exits\par
+\tab atexit(close);\par
+\par
+\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\tab // MAIN GRAPHIC LOOP\par
+\tab ////////////////////////////////////////////////////////////////////////////////\par
+\par
+\tab // call window size callback at initialization\par
+\tab windowSizeCallback(window, width, height);\par
+\par
+\tab while (!glfwWindowShouldClose(window))\par
+\tab\{\par
+\tab\tab // get width and height of window\par
+\tab\tab glfwGetWindowSize(window, &width, &height);\par
+\par
+\tab\tab // render graphics\par
+\tab\tab updateGraphics();\par
+\par
+\tab\tab // swap buffers\par
+\tab\tab glfwSwapBuffers(window);\par
+\par
+\tab\tab // process events\par
+\tab\tab glfwPollEvents();\par
+\par
+\tab\tab // signal frequency counter\par
+\tab\tab freqCounterGraphics.signal(1);\par
+\tab\}\par
+\par
+\tab\par
+\tab // close window\par
+\tab glfwDestroyWindow(window);\par
+\par
+\tab // terminate GLFW library\par
+\tab glfwTerminate();\par
+\par
+\tab // exit\par
+\tab\par
+\tab return (0);\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+\par
+\par
+\par
+\par
+\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void updateGraphics(void)\par
+\{\par
+\par
+\tab /////////////////////////////////////////////////////////////////////\par
+\tab // UPDATE WIDGETS\par
+\tab /////////////////////////////////////////////////////////////////////\par
+\par
+\tab // update position data\par
+\tab labelHapticDevicePosition->setText(hapticDevicePosition.str(3));\par
+\par
+\tab // update haptic and graphic rate data\par
+\tab labelRates->setText(cStr(freqCounterGraphics.getFrequency(), 0) + " Hz / " +\par
+\tab\tab cStr(freqCounterHaptics.getFrequency(), 0) + " Hz");\par
+\par
+\tab // update position of label\par
+\tab labelRates->setLocalPos((int)(0.5 * (width - labelRates->getWidth())), 15);\par
+\par
+\tab delayarray.push(delayn);\par
+\tab range = max(0, delayn);\par
+\tab range = range + 2;\par
+\tab /*while (delayn > 0)\par
+\tab\{\par
+\tab\tab arr2 = delayn;\par
+\tab\tab (150);\par
+\tab\}*/\par
+\tab\par
+\tab //while (1 > 0)\par
+\tab //\{\par
+\tab //\tab arr2 = delayn;\par
+\tab //\tab delay;\par
+\tab //\tab return;\par
+\tab //\}\par
+\tab\par
+\tab if (delayn <= 10)\par
+\tab\{\par
+\tab\tab delaym = delayn;\par
+\tab\}\par
+\tab else if (delayn <= 20)\par
+\tab\{\par
+\tab\tab delaym = delayn / 2;\par
+\tab\}\par
+\tab else if (delayn <= 50)\par
+\tab\{\par
+\tab\tab delaym = delayn / 5;\par
+\tab\}\par
+\tab else if (delayn <= 100)\par
+\tab\{\par
+\tab\tab delaym = delayn / 10;\par
+\tab\}\par
+\tab else if (delayn <= 200)\par
+\tab\{\par
+\tab\tab delaym = delayn / 20;\par
+\tab\}\par
+\tab else if (delayn <= 400)\par
+\tab\{\par
+\tab\tab delaym = delayn / 40;\par
+\tab\}\par
+\tab else if (delayn <= 600)\par
+\tab\{\par
+\tab\tab delaym = delayn / 60;\par
+\tab\}\par
+\tab else if (delayn <= 800)\par
+\tab\{\par
+\tab\tab delaym = delayn / 80;\par
+\tab\}\par
+\tab else if (delayn <= 1000)\par
+\tab\{\par
+\tab\tab delaym = delayn / 100;\par
+\tab\}\par
+\tab else if (delayn <= 1500)\par
+\tab\{\par
+\tab\tab delaym = delayn / 150;\par
+\tab\}\par
+\tab else if (delayn <= 2000)\par
+\tab\{\par
+\tab\tab delaym = delayn / 200;\par
+\tab\}\par
+\tab else if (delayn <= 2500)\par
+\tab\{\par
+\tab\tab delaym = delayn / 250;\par
+\tab\}\par
+\par
+\tab i = 100;        // number of values\par
+\tab p = new (nothrow) double[i];\par
+\tab if (p == nullptr)\par
+\tab\tab cout << "Error: Average array memory could not be allocated";\par
+\tab /*else if (sum > 0); \{\par
+\tab\tab delete(&sum);\par
+\tab\}*/\par
+\tab else\par
+\tab\{\par
+\tab\tab for (n = 0; n < 100; n++)\par
+\tab\tab\{\par
+\tab\tab\tab p[n] = delayn;\par
+\tab\tab\}\par
+\tab\tab int len = *(&p + 1) - p;\par
+\tab\tab /*int place;\par
+\tab\tab place--;\par
+\tab\tab i = place;*/\par
+\tab\tab while (len == 100) \{\par
+\tab\tab\tab delete[] p;\par
+\tab\tab\tab p[i] = p[i + 1];\par
+\tab\tab\tab i++;\par
+\tab\tab\}\par
+\tab\tab for (n = 0; n <= 100; n++) \{\par
+\tab\tab\tab sum = sum + p[n];\par
+\tab\tab\tab break;\par
+\tab\tab\}\par
+\par
+\tab\}\par
+\tab //if (sum > 0); \{\par
+\tab //\tab sum = 0;\par
+\tab //\tab //delete &sum;\par
+\tab //\}\par
+\tab\par
+\par
+\tab average = sum / 100;\par
+\tab //delete(&average);\par
+\par
+\tab //int place;\par
+\tab //place--;\par
+\tab //while (average > 0) \{\par
+\tab //\tab //delete[] p;\par
+\tab //\tab i(average);\par
+\tab //\}\par
+\tab\par
+\tab //int len = *(&p + 1) - p;\par
+\tab //while (len == 100) \{\par
+\tab //\tab double* average;\par
+\tab //\}\par
+\par
+\tab //average = average / n;\par
+\tab\par
+\par
+\tab //for (int i = 0; i < n; i++) \{\par
+\tab //\tab arr2 = arr2 + p[i];\par
+\tab //\}\par
+\tab\par
+\par
+\tab // update information to scope\par
+\tab scope->setSignalValues(hapticDevicePosition.x(), hapticDevicePosition.y(), hapticDevicePosition.z());\par
+\tab scope1->setSignalValues(delaym);\par
+\par
+\tab labelIP->setText("Server IP: " + string(inet_ntoa(serveraddr.sin_addr)) + ":" + cStr(ntohs(serveraddr.sin_port)));\par
+\tab labelXd_Prev->setText("Prev Xd: " + cStr(pos_prev[0], 3U) + "  " + cStr(pos_prev[1], 3U) + "  " + cStr(pos_prev[2], 3U));\par
+\tab labelXd->setText("Xd: " + cStr(pos_curr[0], 3U) + "  " + cStr(pos_curr[1], 3U) + "  " + cStr(pos_curr[2], 3U));\par
+\tab labelX_Recv->setText("Recv X: " + cStr(pos_recv[0], 3U) + "  " + cStr(pos_recv[1], 3U) + "  " + cStr(pos_recv[2], 3U));\par
+\tab labelFd->setText("Fd: " + cStr(Fd[0], 3U) + "  " + cStr(Fd[1], 3U) + "  " + cStr(Fd[2], 3U));\par
+\tab labelDelay->setText("Delay:" + cStr(delayn, 3U) + "ms");\par
+\tab labelavg->setText("Average Delay:" + cStr(average, 3U) + "ms");\par
+\tab labelmax->setText("Max :" + cStr(range, 3U) + "ms");\par
+\par
+\par
+\par
+\par
+\tab //labelavg->setText("Average Delay:" + cStr(sum,3U)+"ms");\par
+\par
+\par
+\par
+\tab\par
+\tab /////////////////////////////////////////////////////////////////////\par
+\tab // RENDER SCENE\par
+\tab /////////////////////////////////////////////////////////////////////\par
+\par
+\tab // update shadow maps (if any)\par
+\tab world->updateShadowMaps(false, mirroredDisplay);\par
+\par
+\tab // render world\par
+\tab camera->renderView(width, height);\par
+\par
+\tab // wait until all OpenGL commands are completed\par
+\tab glFinish();\par
+\par
+\tab // check for any OpenGL errors\par
+\tab GLenum err;\par
+\tab err = glGetError();\par
+\tab if (err != GL_NO_ERROR) cout << "Error:  %s\\n" << gluErrorString(err);\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void updateHaptics(void)\par
+\{\par
+\tab // simulation in now running\par
+\tab simulationRunning = true;\par
+\tab simulationFinished = false;\par
+\par
+\tab // main haptic simulation loop\par
+\tab // \par
+\tab // \par
+\tab //ofstream myFile;\par
+\tab //myFile.open("Felcon.csv");\par
+\tab //myFile.open("Delay.csv");\par
+\par
+\tab while (simulationRunning)\par
+\tab\{\par
+\tab\tab /////////////////////////////////////////////////////////////////////\par
+\tab\tab // READ HAPTIC DEVICE\par
+\tab\tab /////////////////////////////////////////////////////////////////////\par
+\par
+\tab\tab // read position \par
+\tab\tab cVector3d position;\par
+\tab\tab hapticDevice->getPosition(position);\par
+\par
+\tab\tab // read linear velocity \par
+\tab\tab cVector3d linearVelocity;\par
+\tab\tab hapticDevice->getLinearVelocity(linearVelocity);\par
+\par
+\tab\tab //cout << "Linear Velocity" << "(" << linearVelocity << ")" << endl;\par
+\tab\tab //cout << endl;\par
+\tab\tab //cout << "Prev position:" << "(" << pos_prev[0] << "," << pos_prev[1] << "," << pos_prev[2] << ")" << endl;\par
+\tab\tab //cout << "Curr position:" << "(" << pos_curr[0] << "," << pos_curr[1] << "," << pos_curr[2] << ")" << endl;\par
+\tab\tab //cout << "Recv position:" << "(" << pos_recv[0] << "," << pos_recv[1] << "," << pos_recv[2] << ")" << endl;\par
+\tab\par
+\par
+\tab\tab\tab //myFile << pos_prev[0] << "," << pos_prev[1] << "," << pos_prev[2] << "," << pos_curr[0] << "," << pos_curr[1] << "," << pos_curr[2] << "," << pos_recv[0] << "," << pos_recv[1] << "," << pos_recv[2] << endl;\par
+\tab\tab //myFile << delayn << endl;\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\tab\tab // read user-switch status (button 0)\par
+\tab\tab bool button0, button1, button2, button3;\par
+\par
+\tab\tab button0 = false;\par
+\tab\tab button1 = false;\par
+\tab\tab button2 = false;\par
+\tab\tab button3 = false;\par
+\par
+\tab\tab hapticDevice->getUserSwitch(0, button0);\par
+\tab\tab hapticDevice->getUserSwitch(1, button1);\par
+\tab\tab hapticDevice->getUserSwitch(2, button2);\par
+\tab\tab hapticDevice->getUserSwitch(3, button3);\par
+\par
+\par
+\tab\tab /////////////////////////////////////////////////////////////////////\par
+\tab\tab // UPDATE 3D CURSOR MODEL\par
+\tab\tab /////////////////////////////////////////////////////////////////////\par
+\par
+\tab\tab // update arrow\par
+\tab\tab velocity->m_pointA = position;\par
+\tab\tab velocity->m_pointB = cAdd(position, linearVelocity);\par
+\par
+\tab\tab // update position and orientation of cursor\par
+\tab\tab cursor->setLocalPos(position);\par
+\par
+\tab\tab // adjust the  color of the cursor according to the status of\par
+\tab\tab // the user-switch (ON = TRUE / OFF = FALSE)\par
+\tab\tab if (button0)\par
+\tab\tab\{\par
+\tab\tab\tab cursor->m_material->setGreenMediumAquamarine();\par
+\tab\tab\}\par
+\tab\tab else if (button1)\par
+\tab\tab\{\par
+\tab\tab\tab cursor->m_material->setYellowGold();\par
+\tab\tab\}\par
+\tab\tab else if (button2)\par
+\tab\tab\{\par
+\tab\tab\tab cursor->m_material->setOrangeCoral();\par
+\tab\tab\}\par
+\tab\tab else if (button3)\par
+\tab\tab\{\par
+\tab\tab\tab cursor->m_material->setPurpleLavender();\par
+\tab\tab\}\par
+\tab\tab else\par
+\tab\tab\{\par
+\tab\tab\tab cursor->m_material->setBlueRoyal();\par
+\tab\tab\}\par
+\par
+\tab\tab // update global variable for graphic display update\par
+\tab\tab hapticDevicePosition = position;\par
+\tab\tab hapticDeviceVelocity = linearVelocity;\par
+\par
+\par
+\tab\tab /////////////////////////////////////////////////////////////////////\par
+\tab\tab // COMPUTE AND APPLY FORCES\par
+\tab\tab /////////////////////////////////////////////////////////////////////\par
+\tab\tab for (int i = 0; i < DOF; i++)\par
+\tab\tab\{\par
+\tab\tab\tab pos_curr[i] = hapticDevicePosition(i);\par
+\tab\tab\}\par
+\par
+\tab\tab SendData[0] = pos_curr[0];\par
+\tab\tab SendData[1] = pos_curr[1];\par
+\tab\tab SendData[2] = pos_curr[2];\par
+\par
+\tab\tab UDPSendData(SendData);\par
+\par
+\tab\tab // \'b5\'a5\'c0\'cc\'c5\'cd \'b9\'de\'b1\'e2\par
+\tab\tab UDPReadData();\par
+\par
+\tab\tab pos_recv[0] = ReadData[0];\par
+\tab\tab pos_recv[1] = ReadData[1];\par
+\tab\tab pos_recv[2] = ReadData[2];\par
+\par
+\par
+\tab\tab cVector3d force(0, 0, 0);\par
+\par
+\tab\tab double gripperForce = 0.0;\par
+\par
+\tab\tab // apply force field\par
+\tab\tab if (useForceField)\par
+\tab\tab\{\par
+\tab\tab\tab // compute linear force\par
+\tab\tab\tab double Kp = 40; //25; // [N/m]\par
+\tab\tab\tab cVector3d forceField = -Kp * position;\par
+\tab\tab\tab force.add(forceField);\par
+\par
+\tab\tab\tab for (int i = 0; i < DOF; i++)\par
+\tab\tab\tab\{\par
+\tab\tab\tab\tab Fd[i] = Kp * (pos_recv[i] - pos_curr[i]);\par
+\tab\tab\tab\tab force(i) = Fd[i];\par
+\tab\tab\tab\tab pos_prev[i] = pos_curr[i];\par
+\tab\tab\tab\}\par
+\tab\tab\}\par
+\par
+\tab\tab // send computed force\par
+\tab\tab hapticDevice->setForce(force);\par
+\par
+\tab\tab // update frequency counter\par
+\tab\tab freqCounterHaptics.signal(1);\par
+\tab\}\par
+\par
+\tab // exit haptics thread\par
+\tab simulationFinished = true;\par
+\}  // KP\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+\par
+\par
+\par
+\par
+\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height)\par
+\{\par
+\tab // update window size\par
+\tab width = a_width;\par
+\tab height = a_height;\par
+\par
+\tab // update position of label\par
+\tab labelHapticDevicePosition->setLocalPos(20, width - 60, 0);\par
+\par
+\tab // update position of label\par
+\tab labelHapticDeviceModel->setLocalPos(20, height - 40, 0);\par
+\par
+\tab // update position of scope\par
+\tab scope->setSize(width - 200, 260);\par
+\tab scope1->setSize(width - 200, 60);\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void errorCallback(int a_error, const char* a_description)\par
+\{\par
+\tab cout << "Error: " << a_description << endl;\par
+\}\par
+//////////////////////\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+\par
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods)\par
+\{\par
+\tab // filter calls that only include a key press\par
+\tab if ((a_action != GLFW_PRESS) && (a_action != GLFW_REPEAT))\par
+\tab\{\par
+\tab\tab return;\par
+\tab\}\par
+\par
+\tab // option - exit\par
+\tab if ((a_key == GLFW_KEY_ESCAPE) || (a_key == GLFW_KEY_Q))\par
+\tab\{\par
+\tab\tab glfwSetWindowShouldClose(a_window, GLFW_TRUE);\par
+\tab\}\par
+\par
+\tab // option - enable/disable force field\par
+\tab if (a_key == GLFW_KEY_1)\par
+\tab\{\par
+\tab\tab useForceField = !useForceField;\par
+\tab\tab if (useForceField)\par
+\tab\tab\tab cout << "> Enable force field     \\r";\par
+\tab\tab else\par
+\tab\tab\tab cout << "> Disable force field    \\r";\par
+\tab\}\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void close(void)\par
+\{\par
+\tab CloseUDP();\par
+\tab // stop the simulation\par
+\tab simulationRunning = false;\par
+\par
+\tab // wait for graphics and haptics loops to terminate\par
+\tab while (!simulationFinished)\par
+\tab\{\par
+\tab\tab cSleepMs(100);\par
+\tab\}\par
+\par
+\tab // close haptic device\par
+\tab hapticDevice->close();\par
+\par
+\tab // delete resources\par
+\tab delete hapticsThread;\par
+\tab delete world;\par
+\tab delete handler;\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+\par
+\par
+\par
+\par
+\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void InitUDP()\par
+\{\par
+\tab // \'c0\'a9\'bc\'d3 \'c3\'ca\'b1\'e2\'c8\par
+\tab if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)\par
+\tab\{\par
+\tab\tab MessageBox(NULL, "Socket Open Error!!", "UDP", MB_OK);\par
+\tab\}\par
+\par
+\par
+\tab // socket()\par
+\tab sock = socket(AF_INET, SOCK_DGRAM, 0);\par
+\tab if (sock == INVALID_SOCKET)\par
+\tab\{\par
+\tab\tab err_quit("socket()");\par
+\tab\}\par
+\par
+\tab // bind()\par
+\tab ZeroMemory(&serveraddr, sizeof(serveraddr));\par
+\tab serveraddr.sin_family = AF_INET;\par
+\tab serveraddr.sin_port = htons(UDP_PORT);\par
+\tab serveraddr.sin_addr.s_addr = inet_addr(SERVER_IP);\par
+\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void CloseUDP()\par
+\{\par
+\tab // closesocket()\par
+\tab closesocket(sock);\par
+\par
+\tab // \'c0\'a9\'bc\'d3 \'c1\'be\'b7\'e1\par
+\tab WSACleanup();\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void UDPSendData(float sData[SENDDATA_NUM])\par
+\{\par
+\tab Timer time;\par
+\tab //\tab sprintf(sbuf, "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f", sData[0], sData[1], sData[2], sData[3], sData[4], sData[5], sData[6], sData[7], sData[8], sData[9], sData[10], sData[11], sData[12], sData[13], sData[14], sData[15], sData[16], sData[17], sData[18], sData[19]);\par
+\tab sprintf(sbuf, "%f %f %f", sData[0], sData[1], sData[2]);\par
+\tab retval = sendto(sock, sbuf, strlen(sbuf), 0, (SOCKADDR*)&serveraddr, sizeof(serveraddr));\par
+\tab if (retval == SOCKET_ERROR)\par
+\tab\{\par
+\tab\tab err_display("sendto()");\par
+\tab\tab exit(-1);\par
+\tab\}\par
+\}\par
+\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+void UDPReadData()\par
+\{\par
+\tab Timer2 time;\par
+\tab addrlen = sizeof(clientaddr);\par
+\par
+\tab retval = recvfrom(sock, rbuf, BUFSIZE, 0, (SOCKADDR*)&clientaddr, &addrlen);\par
+\tab if (retval == SOCKET_ERROR)\par
+\tab\{\par
+\par
+\tab\tab err_display("recvfrom()");\par
+\tab\tab exit(-1);\par
+\tab\}\par
+\par
+\tab delayn = timeUDPS - timeUDPR;\par
+\tab countd = countd++;\par
+\tab cout << countd << " Delay calculated " << " " << delayn << " " << " milliseconds" << endl;\par
+\tab //\tab sscanf(rbuf, "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f", &ReadData[0], &ReadData[1], &ReadData[2], &ReadData[3], &ReadData[4], &ReadData[5], &ReadData[6], &ReadData[7], &ReadData[8], &ReadData[9], &ReadData[10], &ReadData[11], &ReadData[12], &ReadData[13], &ReadData[14], &ReadData[15], &ReadData[16], &ReadData[17], &ReadData[18], &ReadData[19]);\par
+\tab sscanf(rbuf, "%f %f %f", &ReadData[0], &ReadData[1], &ReadData[2]);\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+// \'bc\'d2\'c4\'cf \'c7\'d4\'bc\'f6 \'bf\'c0\'b7\'f9 \'c3\'e2\'b7\'c2 \'c8\'c4 \'c1\'be\'b7\'e1\par
+void err_quit(const char* msg)\par
+\{\par
+\tab LPVOID lpMsgBuf;\par
+\par
+\tab FormatMessage(\par
+\tab\tab FORMAT_MESSAGE_ALLOCATE_BUFFER |\par
+\tab\tab FORMAT_MESSAGE_FROM_SYSTEM,\par
+\tab\tab NULL, WSAGetLastError(),\par
+\tab\tab MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),\par
+\par
+\tab\tab (LPTSTR)&lpMsgBuf, 0, NULL);\par
+\tab MessageBox(NULL, (LPCTSTR)lpMsgBuf, msg, MB_ICONERROR);\par
+\tab LocalFree(lpMsgBuf);\par
+\tab exit(-1);\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+// \'bc\'d2\'c4\'cf \'c7\'d4\'bc\'f6 \'bf\'c0\'b7\'f9 \'c3\'e2\'b7\'c2\par
+void err_display(const char* msg)\par
+\{\par
+\tab LPVOID lpMsgBuf;\par
+\tab FormatMessage(\par
+\tab\tab FORMAT_MESSAGE_ALLOCATE_BUFFER |\par
+\tab\tab FORMAT_MESSAGE_FROM_SYSTEM,\par
+\tab\tab NULL, WSAGetLastError(),\par
+\tab\tab MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),\par
+\tab\tab (LPTSTR)&lpMsgBuf, 0, NULL);\par
+\par
+\tab printf("[%s] %s", msg, (LPCTSTR)lpMsgBuf);\par
+\tab LocalFree(lpMsgBuf);\par
+\}\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////\par
+\par
+}
+ 
