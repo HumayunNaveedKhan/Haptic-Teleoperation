@@ -1,0 +1,91 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <thread>
+#include <chrono>
+
+#pragma comment(lib, "ws2_32.lib") // Link Winsock library
+
+#define PACKET_SIZE 2 // Fixed packet size (2 bytes)
+
+void udpClient(const char* serverIP, int serverPort, int intervalMs) {
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        return;
+    }
+
+    // Create a socket
+    SOCKET clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (clientSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return;
+    }
+
+    // Server address setup
+    sockaddr_in serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(serverPort);
+    if (inet_pton(AF_INET, serverIP, &serverAddress.sin_addr) <= 0) {
+        std::cerr << "Invalid server IP address: " << serverIP << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return;
+    }
+
+    std::cout << "UDP client is sending packets to " << serverIP << ":" << serverPort << std::endl;
+
+    char buffer[PACKET_SIZE];
+    int packetNumber = 0;
+
+    // Main sending loop
+    while (true) {
+        // Prepare 2-byte packet
+        buffer[0] = static_cast<char>(packetNumber & 0xFF); // Lower byte
+        buffer[1] = static_cast<char>((packetNumber >> 8) & 0xFF); // Higher byte
+
+        // Send packet
+        int sentBytes = sendto(
+            clientSocket,
+            buffer,
+            PACKET_SIZE,
+            0,
+            reinterpret_cast<sockaddr*>(&serverAddress),
+            sizeof(serverAddress)
+        );
+
+        if (sentBytes == SOCKET_ERROR) {
+            std::cerr << "sendto failed: " << WSAGetLastError() << std::endl;
+            break;
+        }
+
+        std::cout << "Packet #" << packetNumber
+            << " sent - Data: "
+            << std::hex
+            << static_cast<int>(buffer[0]) << " "
+            << static_cast<int>(buffer[1])
+            << std::dec << std::endl;
+
+        ++packetNumber; // Increment packet number
+
+        // Wait for the specified interval
+        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+    }
+
+    // Clean up
+    closesocket(clientSocket);
+    WSACleanup();
+}
+
+int main() {
+    const char* serverIP = "127.0.0.1"; // Target server IP
+    int serverPort = 4000;             // Target server port
+    int intervalMs = 1000;             // Interval in milliseconds (adjustable)
+
+    udpClient(serverIP, serverPort, intervalMs);
+
+    return 0;
+}
