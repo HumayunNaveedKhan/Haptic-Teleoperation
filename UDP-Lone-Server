@@ -1,0 +1,104 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <cstring> // For memset
+
+#pragma comment(lib, "ws2_32.lib") // Link Winsock library
+
+#define BUFFER_SIZE 1024
+
+void startUDPServer(const char* serverIP, int port) {
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // Create a socket
+    SOCKET serverSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (serverSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    // Server address setup
+    sockaddr_in serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(port);
+    if (inet_pton(AF_INET, serverIP, &serverAddress.sin_addr) <= 0) {
+        std::cerr << "Invalid IP address: " << serverIP << std::endl;
+        closesocket(serverSocket);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind the socket to the IP and port
+    if (bind(serverSocket, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)) == SOCKET_ERROR) {
+        std::cerr << "Bind failed: " << WSAGetLastError() << std::endl;
+        closesocket(serverSocket);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    std::cout << "UDP server is running on " << serverIP << ":" << port << std::endl;
+
+    // Buffer for incoming data
+    char buffer[BUFFER_SIZE];
+    sockaddr_in clientAddress;
+    int clientAddressLen = sizeof(clientAddress);
+
+    while (true) {
+        // Receive data from client
+        int receivedBytes = recvfrom(
+            serverSocket,
+            buffer,
+            BUFFER_SIZE - 1, // Leave space for null terminator
+            0,
+            reinterpret_cast<sockaddr*>(&clientAddress),
+            &clientAddressLen
+        );
+
+        if (receivedBytes == SOCKET_ERROR) {
+            std::cerr << "recvfrom failed: " << WSAGetLastError() << std::endl;
+            break;
+        }
+
+        buffer[receivedBytes] = '\0'; // Null-terminate received data
+        char clientIP[INET_ADDRSTRLEN];
+        InetNtopA(AF_INET, &clientAddress.sin_addr, clientIP, INET_ADDRSTRLEN); // Convert binary IP to string
+        int clientPort = ntohs(clientAddress.sin_port);
+
+        std::cout << "Received message from " << clientIP << ":" << clientPort << " - " << buffer << std::endl;
+
+        // Echo the message back to the client
+        std::string response = "Server received: " + std::string(buffer);
+        int sentBytes = sendto(
+            serverSocket,
+            response.c_str(),
+            static_cast<int>(response.size()),
+            0,
+            reinterpret_cast<sockaddr*>(&clientAddress),
+            clientAddressLen
+        );
+
+        if (sentBytes == SOCKET_ERROR) {
+            std::cerr << "sendto failed: " << WSAGetLastError() << std::endl;
+        }
+    }
+
+    // Clean up
+    closesocket(serverSocket);
+    WSACleanup();
+}
+
+int main() {
+    const char* serverIP = "127.0.0.1"; // Localhost
+    int port = 4000;                   // Port number
+
+    startUDPServer(serverIP, port);
+
+    return 0;
+}
