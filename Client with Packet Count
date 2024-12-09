@@ -1,14 +1,18 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iostream>
-#include <thread>
 #include <chrono>
+#include <thread>
 
 #pragma comment(lib, "ws2_32.lib") // Link Winsock library
 
-#define PACKET_SIZE 2 // Fixed packet size (2 bytes)
+#define SERVER_IP "127.0.0.1" // Change to the server's IP address
+#define SERVER_PORT 4000
+#define PACKET_SIZE 500        // 2 bytes per packet
+#define NUM_PACKETS 10       // Number of packets to send
+#define SEND_INTERVAL 2000    // Interval between packets in milliseconds
 
-void udpClient(const char* serverIP, int serverPort, int intervalMs) {
+void udpClient(const char* serverIp, int serverPort) {
     // Initialize Winsock
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -24,33 +28,24 @@ void udpClient(const char* serverIP, int serverPort, int intervalMs) {
         return;
     }
 
-    // Server address setup
+    // Configure server address
     sockaddr_in serverAddress;
     memset(&serverAddress, 0, sizeof(serverAddress));
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(serverPort);
-    if (inet_pton(AF_INET, serverIP, &serverAddress.sin_addr) <= 0) {
-        std::cerr << "Invalid server IP address: " << serverIP << std::endl;
-        closesocket(clientSocket);
-        WSACleanup();
-        return;
-    }
+    inet_pton(AF_INET, serverIp, &serverAddress.sin_addr);
 
-    std::cout << "UDP client is sending packets to " << serverIP << ":" << serverPort << std::endl;
+    // Send packets
+    for (int i = 1; i <= NUM_PACKETS; ++i) {
+        // Prepare the packet
+        char packet[PACKET_SIZE];
+        packet[0] = i & 0xFF;         // Lower byte of packet number
+        packet[1] = (i >> 8) & 0xFF; // Higher byte of packet number
 
-    char buffer[PACKET_SIZE];
-    int packetNumber = 0;
-
-    // Main sending loop
-    while (true) {
-        // Prepare 2-byte packet
-        buffer[0] = static_cast<char>(packetNumber & 0xFF); // Lower byte
-        buffer[1] = static_cast<char>((packetNumber >> 8) & 0xFF); // Higher byte
-
-        // Send packet
+        // Send the packet
         int sentBytes = sendto(
             clientSocket,
-            buffer,
+            packet,
             PACKET_SIZE,
             0,
             reinterpret_cast<sockaddr*>(&serverAddress),
@@ -62,17 +57,10 @@ void udpClient(const char* serverIP, int serverPort, int intervalMs) {
             break;
         }
 
-        std::cout << "Packet #" << packetNumber
-            << " sent - Data: "
-            << std::hex
-            << static_cast<int>(buffer[0]) << " "
-            << static_cast<int>(buffer[1])
-            << std::dec << std::endl;
+        std::cout << "Packet #" << i << " sent." << std::endl;
 
-        ++packetNumber; // Increment packet number
-
-        // Wait for the specified interval
-        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+        // Wait before sending the next packet
+        std::this_thread::sleep_for(std::chrono::milliseconds(SEND_INTERVAL));
     }
 
     // Clean up
@@ -81,11 +69,6 @@ void udpClient(const char* serverIP, int serverPort, int intervalMs) {
 }
 
 int main() {
-    const char* serverIP = "127.0.0.1"; // Target server IP
-    int serverPort = 4000;             // Target server port
-    int intervalMs = 1000;             // Interval in milliseconds (adjustable)
-
-    udpClient(serverIP, serverPort, intervalMs);
-
+    udpClient(SERVER_IP, SERVER_PORT);
     return 0;
 }
