@@ -1,0 +1,124 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <cstring> // For memset
+
+#pragma comment(lib, "ws2_32.lib") // Link Winsock library
+
+#define BUFFER_SIZE 1024
+
+std::atomic<int> packetCount(0);
+
+void udpServerThread(const char* serverIP, int port) {
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // Create a socket
+    SOCKET serverSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (serverSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    // Server address setup
+    sockaddr_in serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(port);
+    if (inet_pton(AF_INET, serverIP, &serverAddress.sin_addr) <= 0) {
+        std::cerr << "Invalid IP address: " << serverIP << std::endl;
+        closesocket(serverSocket);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind the socket to the IP and port
+    if (bind(serverSocket, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)) == SOCKET_ERROR) {
+        std::cerr << "Bind failed: " << WSAGetLastError() << std::endl;
+        closesocket(serverSocket);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    std::cout << "UDP server is running on " << serverIP << ":" << port << std::endl;
+
+    // Buffer for incoming data
+    char buffer[BUFFER_SIZE];
+    sockaddr_in clientAddress;
+    int clientAddressLen = sizeof(clientAddress);
+
+    while (true) {
+        // Receive data in packets of 2 bytes
+        int receivedBytes = recvfrom(
+            serverSocket,
+            buffer,
+            2, // Fixed packet size
+            0,
+            reinterpret_cast<sockaddr*>(&clientAddress),
+            &clientAddressLen
+        );
+
+        if (receivedBytes == SOCKET_ERROR) {
+            std::cerr << "recvfrom failed: " << WSAGetLastError() << std::endl;
+            break;
+        }
+
+        if (receivedBytes == 2) { // Ensure only packets of 2 bytes are processed
+            ++packetCount;
+            char clientIP[INET_ADDRSTRLEN];
+            InetNtopA(AF_INET, &clientAddress.sin_addr, clientIP, INET_ADDRSTRLEN);
+            int clientPort = ntohs(clientAddress.sin_port);
+
+            std::cout << "Packet #" << packetCount
+                << " received from " << clientIP << ":" << clientPort
+                << " - Data: " << std::hex
+                << static_cast<int>(buffer[0]) << " "
+                << static_cast<int>(buffer[1]) << std::dec << std::endl;
+
+            // Echo the packet back to the client
+            int sentBytes = sendto(
+                serverSocket,
+                buffer,
+                receivedBytes,
+                0,
+                reinterpret_cast<sockaddr*>(&clientAddress),
+                clientAddressLen
+            );
+
+            if (sentBytes == SOCKET_ERROR) {
+                std::cerr << "sendto failed: " << WSAGetLastError() << std::endl;
+            }
+        }
+    }
+
+    // Clean up
+    closesocket(serverSocket);
+    WSACleanup();
+}
+
+int main() {
+    const char* serverIP = "127.0.0.1"; // Localhost
+    int port = 4000;                   // Port number
+
+    // Create a high-priority thread for the server
+    std::thread serverThread([=]() {
+        udpServerThread(serverIP, port);
+        });
+
+    // Set thread priority
+#ifdef _WIN32
+    SetThreadPriority(serverThread.native_handle(), THREAD_PRIORITY_HIGHEST);
+#endif
+
+    // Wait for the server thread to finish
+    serverThread.join();
+
+    return 0;
+}
