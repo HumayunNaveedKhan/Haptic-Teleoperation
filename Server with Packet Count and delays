@@ -1,0 +1,121 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <chrono>
+#include <random>
+
+#pragma comment(lib, "ws2_32.lib") // Link Winsock library
+
+#define PACKET_SIZE 5// Fixed packet size (2 bytes)
+#define BUFFER_SIZE 512
+
+// Simulate and calculate delays
+void calculateAndDisplayDelays(int packetNumber, int packetSize, int bandwidth, int distance, int propagationSpeed, double processingStartTime) {
+    // Transmission delay = packet size / bandwidth
+    double transmissionDelay = (packetSize * 8.0) / bandwidth; // in seconds
+
+    // Propagation delay = distance / propagation speed
+    double propagationDelay = static_cast<double>(distance) / propagationSpeed; // in seconds
+
+    // Queuing delay (simulated)
+    double queuingDelay = (rand() % 100) / 1000.0; // Random delay between 0 and 100ms
+
+    // Processing delay (measured)
+    double processingDelay = processingStartTime; // in seconds
+
+    // Total delay
+    double totalDelay = transmissionDelay + propagationDelay + queuingDelay + processingDelay;
+
+    // Display the delays
+    std::cout << "Packet #" << packetNumber << " Delay Details:" << std::endl;
+    std::cout << "  Transmission Delay: " << transmissionDelay * 1000 << " ms" << std::endl;
+    std::cout << "  Propagation Delay: " << propagationDelay * 1000 << " ms" << std::endl;
+    std::cout << "  Queuing Delay: " << queuingDelay * 1000 << " ms" << std::endl;
+    std::cout << "  Processing Delay: " << processingDelay * 1000 << " ms" << std::endl;
+    std::cout << "  Total Delay: " << totalDelay * 1000 << " ms" << std::endl;
+    std::cout << "---------------------------------" << std::endl;
+}
+
+void udpServer(int serverPort) {
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        return;
+    }
+
+    // Create a socket
+    SOCKET serverSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (serverSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return;
+    }
+
+    // Bind the socket to the specified port
+    sockaddr_in serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(serverPort);
+    serverAddress.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(serverSocket, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)) == SOCKET_ERROR) {
+        std::cerr << "Bind failed: " << WSAGetLastError() << std::endl;
+        closesocket(serverSocket);
+        WSACleanup();
+        return;
+    }
+
+    std::cout << "UDP server is running on port " << serverPort << std::endl;
+
+    char buffer[BUFFER_SIZE];
+    sockaddr_in clientAddress;
+    int clientAddressSize = sizeof(clientAddress);
+
+    const int bandwidth = 1000000; // Bandwidth in bits per second (1 Mbps)
+    const int distance = 1000;    // Distance in meters
+    const int propagationSpeed = 200000000; // Speed of signal propagation in m/s (2 x 10^8)
+
+    int packetNumber = 0;
+
+    while (true) {
+        // Receive packet
+        auto receiveStart = std::chrono::high_resolution_clock::now();
+        int receivedBytes = recvfrom(
+            serverSocket,
+            buffer,
+            BUFFER_SIZE,
+            0,
+            reinterpret_cast<sockaddr*>(&clientAddress),
+            &clientAddressSize
+        );
+
+        if (receivedBytes == SOCKET_ERROR) {
+            std::cerr << "recvfrom failed: " << WSAGetLastError() << std::endl;
+            break;
+        }
+
+        auto receiveEnd = std::chrono::high_resolution_clock::now();
+        double processingDelay = std::chrono::duration<double>(receiveEnd - receiveStart).count(); // in seconds
+
+        // Extract packet number from received data (assuming 2-byte packets)
+        int receivedPacketNumber = static_cast<unsigned char>(buffer[0]) | (static_cast<unsigned char>(buffer[1]) << 8);
+
+        // Calculate and display delays
+        calculateAndDisplayDelays(receivedPacketNumber, PACKET_SIZE, bandwidth, distance, propagationSpeed, processingDelay);
+
+        std::cout << "Packet #" << receivedPacketNumber << " received." << std::endl;
+        packetNumber++;
+    }
+
+    // Clean up
+    closesocket(serverSocket);
+    WSACleanup();
+}
+
+int main() {
+    int serverPort = 4000; // Port to listen on
+    udpServer(serverPort);
+
+    return 0;
+}
