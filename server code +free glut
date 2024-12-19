@@ -1,0 +1,137 @@
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <cmath>
+#include <winsock2.h>
+#include <glut.h> // OpenGL and GLUT headers
+
+#pragma comment(lib, "ws2_32.lib")
+
+#define UDP_PORT 4000
+#define BUFFER_SIZE 1024
+
+std::vector<int> magnitudes; // Stores packet magnitudes
+std::mutex magMutex;         // Mutex for thread-safe access to magnitudes
+
+void drawPlot() {
+    std::lock_guard<std::mutex> lock(magMutex);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // Set plot axis
+    glColor3f(1.0f, 1.0f, 1.0f); // White for axis
+    glBegin(GL_LINES);
+    glVertex2f(-1.0f, 0.0f);     // X-axis
+    glVertex2f(1.0f, 0.0f);
+    glVertex2f(0.0f, -1.0f);     // Y-axis
+    glVertex2f(0.0f, 1.0f);
+    glEnd();
+
+    // Plot magnitudes
+    glColor3f(1.0f, 0.0f, 0.0f); // Red for plot
+    glBegin(GL_LINE_STRIP);
+    for (size_t i = 0; i < magnitudes.size(); ++i) {
+        float x = -1.0f + 2.0f * (static_cast<float>(i) / 50.0f); // Normalize X to [-1, 1]
+        float y = -1.0f + 2.0f * (static_cast<float>(magnitudes[i]) / BUFFER_SIZE); // Normalize Y to [-1, 1]
+        glVertex2f(x, y);
+    }
+    glEnd();
+
+    glutSwapBuffers();
+}
+
+void udpServer() {
+    // Initialize UDP socket
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpSocket == INVALID_SOCKET) {
+        std::cerr << "Failed to create UDP socket: " << WSAGetLastError() << std::endl;
+        return;
+    }
+
+    sockaddr_in udpServerAddr{};
+    udpServerAddr.sin_family = AF_INET;
+    udpServerAddr.sin_port = htons(UDP_PORT);
+    udpServerAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(udpSocket, reinterpret_cast<sockaddr*>(&udpServerAddr), sizeof(udpServerAddr)) == SOCKET_ERROR) {
+        std::cerr << "Failed to bind UDP socket: " << WSAGetLastError() << std::endl;
+        closesocket(udpSocket);
+        return;
+    }
+
+    std::cout << "UDP server running on port " << UDP_PORT << "..." << std::endl;
+
+    char buffer[BUFFER_SIZE];
+    sockaddr_in clientAddr{};
+    int clientAddrLen = sizeof(clientAddr);
+
+    while (true) {
+        int receivedBytes = recvfrom(
+            udpSocket,
+            buffer,
+            BUFFER_SIZE,
+            0,
+            reinterpret_cast<sockaddr*>(&clientAddr),
+            &clientAddrLen
+        );
+
+        if (receivedBytes == SOCKET_ERROR) {
+            std::cerr << "Failed to receive UDP packet: " << WSAGetLastError() << std::endl;
+            break;
+        }
+
+        // Update magnitudes list
+        std::lock_guard<std::mutex> lock(magMutex);
+        magnitudes.push_back(receivedBytes);
+        if (magnitudes.size() > 50) { // Keep the last 50 packets
+            magnitudes.erase(magnitudes.begin());
+        }
+
+        std::cout << "Packet received. Magnitude: " << receivedBytes << " bytes" << std::endl;
+    }
+
+    closesocket(udpSocket);
+}
+
+void updatePlot(int value) {
+    glutPostRedisplay();
+    glutTimerFunc(100, updatePlot, 0); // Schedule the next update
+}
+
+int main(int argc, char** argv) {
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        return 1;
+    }
+
+    // Start UDP server in a separate thread
+    std::thread udpThread(udpServer);
+
+    // Initialize OpenGL and GLUT
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(800, 600);
+    glutCreateWindow("Packet Magnitudes");
+
+    // Set up OpenGL
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Black background
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0); // Orthographic projection
+
+    // Register callbacks
+    glutDisplayFunc(drawPlot);
+    glutTimerFunc(100, updatePlot, 0);
+
+    // Start the GLUT main loop
+    glutMainLoop();
+
+    udpThread.join();
+
+    // Cleanup Winsock
+    WSACleanup();
+    return 0;
+}
