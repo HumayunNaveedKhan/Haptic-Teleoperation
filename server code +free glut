@@ -3,43 +3,104 @@
 #include <thread>
 #include <mutex>
 #include <cmath>
-#include <winsock2.h>
+#include <sstream>
 #include <glut.h> // OpenGL and GLUT headers
-
+#include <winsock2.h>
+#include <ws2tcpip.h>  // Include for inet_ntop
 #pragma comment(lib, "ws2_32.lib")
+
+//#define _WINSOCK_DEPRECATED_NO_WARNINGS
 
 #define UDP_PORT 4000
 #define BUFFER_SIZE 1024
 
-std::vector<int> magnitudes; // Stores packet magnitudes
-std::mutex magMutex;         // Mutex for thread-safe access to magnitudes
+std::vector<int> magnitudes;  // Stores packet magnitudes
+std::vector<double> delays;   // Stores delay times between packets (in seconds)
+std::vector<std::string> packetInfos; // Stores packet information (IP, port, etc.)
+std::vector<double> timestamps;  // Timestamps of packet arrival
+std::mutex magMutex;  // Mutex for thread-safe access to magnitudes
+
+// Function to draw text on the screen
+void drawText(float x, float y, const std::string& text) {
+    glRasterPos2f(x, y);
+    for (char c : text) {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, c);
+    }
+}
+
+void drawAxes() {
+    // Draw X and Y axes with arrows and labels
+    glColor3f(1.0f, 1.0f, 1.0f); // White for axis
+    glBegin(GL_LINES);
+    // X axis
+    glVertex2f(0.0f, 0.0f);     // Origin
+    glVertex2f(1.0f, 0.0f);     // Positive X
+    // Y axis
+    glVertex2f(0.0f, 0.0f);     // Origin
+    glVertex2f(0.0f, 1.0f);     // Positive Y
+    glEnd();
+
+    // Arrows for axes
+    glBegin(GL_LINES);
+    glVertex2f(1.0f, 0.0f);
+    glVertex2f(0.95f, 0.05f); // X axis arrowhead
+    glVertex2f(1.0f, 0.0f);
+    glVertex2f(0.95f, -0.05f);
+
+    glVertex2f(0.0f, 1.0f);
+    glVertex2f(0.05f, 0.95f); // Y axis arrowhead
+    glVertex2f(0.0f, 1.0f);
+    glVertex2f(-0.05f, 0.95f);
+    glEnd();
+
+    // Draw axis labels
+    drawText(0.95f, -0.05f, "Time");
+    drawText(-0.05f, 0.95f, "Magnitude");
+
+    // Add scale labels for axes (showing values)
+    for (int i = 0; i <= 5; i++) {
+        drawText(i * 0.2f, -0.05f, std::to_string(i * 100));  // X-axis scale (0 to 500)
+        drawText(-0.05f, i * 0.2f, std::to_string(i * 100));  // Y-axis scale (0 to 500)
+    }
+}
 
 void drawPlot() {
     std::lock_guard<std::mutex> lock(magMutex);
 
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Set plot axis
-    glColor3f(1.0f, 1.0f, 1.0f); // White for axis
-    glBegin(GL_LINES);
-    glVertex2f(-1.0f, 0.0f);     // X-axis
-    glVertex2f(1.0f, 0.0f);
-    glVertex2f(0.0f, -1.0f);     // Y-axis
-    glVertex2f(0.0f, 1.0f);
-    glEnd();
+    // Draw axes with labels and scales
+    drawAxes();
 
-    // Plot magnitudes
-    glColor3f(1.0f, 0.0f, 0.0f); // Red for plot
-    glBegin(GL_LINE_STRIP);
+    // Plot magnitudes and delays
+    glBegin(GL_LINES);
     for (size_t i = 0; i < magnitudes.size(); ++i) {
-        float x = -1.0f + 2.0f * (static_cast<float>(i) / 50.0f); // Normalize X to [-1, 1]
-        float y = -1.0f + 2.0f * (static_cast<float>(magnitudes[i]) / BUFFER_SIZE); // Normalize Y to [-1, 1]
+        // Map the magnitude to the y-axis (normalized to [0,1])
+        float y = std::min(1.0f, static_cast<float>(magnitudes[i]) / 500.0f); // Normalize Y for magnitude (max 500)
+
+        // Normalize x-axis based on the packet timestamp (or index) for time-based plotting
+        float x = static_cast<float>(i) / magnitudes.size();  // Normalize x based on packet index
+
+        // Color the lines based on magnitude (Red to Green)
+        float red = std::min(1.0f, y);
+        float green = 1.0f - red;
+        glColor3f(red, green, 0.0f);
+
         glVertex2f(x, y);
     }
     glEnd();
 
+    // Draw packet info box in top-right corner
+    glColor3f(1.0f, 1.0f, 1.0f); // White text
+    drawText(0.6f, 0.8f, "Packet Info:");
+    for (size_t i = 0; i < packetInfos.size() && i < 5; ++i) {
+        drawText(0.6f, 0.75f - i * 0.05f, packetInfos[i]);  // Display last 5 packets
+    }
+
     glutSwapBuffers();
+    glFinish();  // Ensure all OpenGL commands are completed
 }
+
 
 void udpServer() {
     // Initialize UDP socket
@@ -65,6 +126,7 @@ void udpServer() {
     char buffer[BUFFER_SIZE];
     sockaddr_in clientAddr{};
     int clientAddrLen = sizeof(clientAddr);
+    double lastTimestamp = 0.0;
 
     while (true) {
         int receivedBytes = recvfrom(
@@ -81,14 +143,45 @@ void udpServer() {
             break;
         }
 
-        // Update magnitudes list
-        std::lock_guard<std::mutex> lock(magMutex);
-        magnitudes.push_back(receivedBytes);
-        if (magnitudes.size() > 50) { // Keep the last 50 packets
-            magnitudes.erase(magnitudes.begin());
+        // Get current timestamp
+        double currentTimestamp = static_cast<double>(clock()) / CLOCKS_PER_SEC;
+
+        // Calculate delay (difference between current and last packet timestamp)
+        double delay = (lastTimestamp == 0.0) ? 0.0 : currentTimestamp - lastTimestamp;
+        lastTimestamp = currentTimestamp;
+
+        // Extract packet info using inet_ntop
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, ip, INET_ADDRSTRLEN); // Use inet_ntop
+
+        unsigned short port = ntohs(clientAddr.sin_port);
+        std::string packetContent(buffer, receivedBytes);
+
+        std::stringstream packetInfoStream;
+        packetInfoStream << "IP: " << ip << ", Port: " << port
+            << ", Size: " << receivedBytes << " bytes, Content: " << packetContent;
+        std::string packetInfo = packetInfoStream.str();
+
+        // Update magnitudes, delays, timestamps, and packet info list
+        {
+            std::lock_guard<std::mutex> lock(magMutex);
+            magnitudes.push_back(receivedBytes);
+            delays.push_back(delay);
+            timestamps.push_back(currentTimestamp);
+
+            if (magnitudes.size() > 50) {
+                magnitudes.erase(magnitudes.begin());
+                delays.erase(delays.begin());
+                timestamps.erase(timestamps.begin());
+            }
+
+            packetInfos.push_back(packetInfo);
+            if (packetInfos.size() > 5) {
+                packetInfos.erase(packetInfos.begin());  // Keep last 5 packets
+            }
         }
 
-        std::cout << "Packet received. Magnitude: " << receivedBytes << " bytes" << std::endl;
+        std::cout << "Packet received. Magnitude: " << receivedBytes << " bytes, Delay: " << delay << "s, Info: " << packetInfo << std::endl;
     }
 
     closesocket(udpSocket);
@@ -114,24 +207,24 @@ int main(int argc, char** argv) {
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInitWindowSize(800, 600);
-    glutCreateWindow("Packet Magnitudes");
+    glutCreateWindow("Packet Magnitudes with Delay");
 
     // Set up OpenGL
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Black background
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0); // Orthographic projection
+    glOrtho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
 
-    // Register callbacks
+    // Set callback functions
     glutDisplayFunc(drawPlot);
-    glutTimerFunc(100, updatePlot, 0);
+    glutTimerFunc(100, updatePlot, 0);  // Update plot every 100 ms
 
-    // Start the GLUT main loop
+    // Start GLUT main loop
     glutMainLoop();
 
+    // Join UDP server thread
     udpThread.join();
 
-    // Cleanup Winsock
-    WSACleanup();
+    WSACleanup();  // Clean up Winsock
     return 0;
 }
