@@ -9,18 +9,18 @@
 #include <sstream>
 #include <cmath>
 #include <chrono>
+#include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")
 #define UDP_PORT 4000
+#define MAX_PACKET_SIZE 400
 
 // Common Packet Structure
 struct Packet {
     int packetNumber;  // Sequential packet number
     float x, y, z;     // 3D Vector components
     float delay;       // Processing delay in milliseconds
-    char timestamp[64]; // Timestamp of packet creation
-    char clientIP[INET_ADDRSTRLEN]; // IP address of the client
-    int port;          // Port number of the client
+    char timestamp[64];  // Timestamp of packet creation
 };
 
 std::vector<Packet> receivedPackets;
@@ -55,18 +55,18 @@ void udpServer() {
     while (true) {
         int bytesReceived = recvfrom(udpSocket, reinterpret_cast<char*>(&packet), sizeof(packet), 0, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
 
-        if (bytesReceived > 0) {
+        if (bytesReceived > 0 && bytesReceived <= MAX_PACKET_SIZE) {
             std::lock_guard<std::mutex> lock(dataMutex);
-            inet_ntop(AF_INET, &clientAddr.sin_addr, packet.clientIP, INET_ADDRSTRLEN);
-            packet.port = ntohs(clientAddr.sin_port);
-
             receivedPackets.push_back(packet);
             if (receivedPackets.size() > 100) {
                 receivedPackets.erase(receivedPackets.begin());
             }
 
+            char clientIP[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+
             std::stringstream ss;
-            ss << "Packet from " << packet.clientIP << ":" << packet.port << " - "
+            ss << "Packet from " << clientIP << " - "
                 << "#" << packet.packetNumber << " [x: " << packet.x
                 << ", y: " << packet.y << ", z: " << packet.z << "]"
                 << ", Delay: " << packet.delay << " ms, Timestamp: " << packet.timestamp;
@@ -113,32 +113,21 @@ void drawXYPlot() {
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
     }
 
-    // Draw scales on the axes
-    glColor3f(0.5f, 0.5f, 0.5f);
-    for (float i = 0.1f; i < 1.0f; i += 0.1f) {
-        glBegin(GL_LINES);
-        glVertex2f(0.05f, i);
-        glVertex2f(0.055f, i);
-        glVertex2f(i, 0.05f);
-        glVertex2f(i, 0.055f);
-        glEnd();
-    }
-
     // Draw bars representing packets
     glColor3f(0.0f, 1.0f, 0.0f);
     glBegin(GL_QUADS);
     {
         std::lock_guard<std::mutex> lock(dataMutex);
         for (size_t i = 0; i < receivedPackets.size(); ++i) {
-            float x = 0.1f + static_cast<float>(i) / 100.0f;
-            float magnitude = calculateMagnitude(receivedPackets[i]) / 100.0f;  // Normalize magnitude
+            float x = 0.1f + static_cast<float>(i) / 100.0f; // Adjusted for max 100 packets
+            float magnitude = calculateMagnitude(receivedPackets[i]) / 200.0f;  // Normalize magnitude for smaller heights
 
             // Ensure magnitude doesn't exceed plot height
-            magnitude = (magnitude, 0.9f);
+            magnitude = std::min<float>(magnitude, 0.9f);
 
             glVertex2f(x, 0.05f);
-            glVertex2f(x + 0.008f, 0.05f);
-            glVertex2f(x + 0.008f, 0.05f + magnitude);
+            glVertex2f(x + 0.01f, 0.05f); // Reduced bar width
+            glVertex2f(x + 0.01f, 0.05f + magnitude);
             glVertex2f(x, 0.05f + magnitude);
         }
     }
@@ -152,27 +141,27 @@ void displayPacketInfo() {
     gluOrtho2D(0.0, 1.0, 0.0, 1.0);
 
     glColor3f(1.0f, 1.0f, 1.0f);
+    glBegin(GL_QUADS);
+    glVertex2f(0.7f, 0.6f);
+    glVertex2f(0.99f, 0.6f);
+    glVertex2f(0.99f, 0.99f);
+    glVertex2f(0.7f, 0.99f);
+    glEnd();
 
-    // Draw static headers for packet info
-    glRasterPos2f(0.7f, 0.9f);
-    std::string headers = "Packet#  IP Address       Magnitude  Port#  Timestamp";
-    for (const char& c : headers) {
+    glColor3f(0.0f, 0.0f, 0.0f);
+    glRasterPos2f(0.72f, 0.95f);
+    for (const char& c : "Packet#  IP        Magnitude  Port#  Timestamp") {
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
     }
 
-    // Display dynamic packet information
     std::lock_guard<std::mutex> lock(dataMutex);
     for (size_t i = 0; i < receivedPackets.size(); ++i) {
-        std::stringstream packetInfo;
-        packetInfo << receivedPackets[i].packetNumber << "    "
-            << receivedPackets[i].clientIP << " "
-            << calculateMagnitude(receivedPackets[i]) << "    "
-            << receivedPackets[i].port << "    "
-            << receivedPackets[i].timestamp;
+        char buffer[128];
+        snprintf(buffer, sizeof(buffer), "%-7d %-10s %-9.2f %-5d %s",
+            receivedPackets[i].packetNumber, "127.0.0.1", calculateMagnitude(receivedPackets[i]), UDP_PORT, receivedPackets[i].timestamp);
 
-        glRasterPos2f(0.7f, 0.88f - 0.02f * (i + 1));
-        std::string info = packetInfo.str();
-        for (const char& c : info) {
+        glRasterPos2f(0.72f, 0.93f - 0.03f * i);
+        for (const char& c : buffer) {
             glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
         }
     }
