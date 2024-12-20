@@ -2,6 +2,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <deque>
 #include <cstring>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -23,13 +24,15 @@ struct Packet {
     char timestamp[64];  // Timestamp of packet creation
 };
 
-std::vector<Packet> receivedPackets;
+std::deque<Packet> receivedPackets;  // Use deque for FIFO handling
 std::mutex dataMutex;
 
 // Global variables for frame rate control
 std::chrono::time_point<std::chrono::steady_clock> lastRefreshTime;
 const std::chrono::milliseconds refreshInterval(33);  // ~30 FPS
+const size_t MAX_BARS = 30;  // Max number of packets to display
 
+// UDP server thread for receiving packets
 void udpServer() {
     SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udpSocket == INVALID_SOCKET) {
@@ -58,10 +61,11 @@ void udpServer() {
         if (bytesReceived > 0 && bytesReceived <= MAX_PACKET_SIZE) {
             std::lock_guard<std::mutex> lock(dataMutex);
             receivedPackets.push_back(packet);
-            if (receivedPackets.size() > 100) {
-                receivedPackets.erase(receivedPackets.begin());
+            if (receivedPackets.size() > MAX_BARS) {
+                receivedPackets.pop_front();  // Implement FIFO: remove oldest packet
             }
 
+            // Debugging information (optional)
             char clientIP[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
 
@@ -83,7 +87,7 @@ float calculateMagnitude(const Packet& packet) {
     return sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
 }
 
-// Function to draw the X-Y plot
+// OpenGL function to draw the XY plot for visualizing packet data
 void drawXYPlot() {
     glClear(GL_COLOR_BUFFER_BIT);
 
@@ -103,30 +107,22 @@ void drawXYPlot() {
     glVertex2f(0.05f, 0.95f);
     glEnd();
 
-    // Draw axis labels and scales
-    glRasterPos2f(0.95f, 0.02f);
-    for (const char& c : "Time (ms)") {
-        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
-    }
-    glRasterPos2f(0.01f, 0.95f);
-    for (const char& c : "Magnitude") {
-        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
-    }
-
     // Draw bars representing packets
     glColor3f(0.0f, 1.0f, 0.0f);
     glBegin(GL_QUADS);
     {
         std::lock_guard<std::mutex> lock(dataMutex);
+
+        // Draw the bars for the packets, ensuring only the latest MAX_BARS packets are displayed
         for (size_t i = 0; i < receivedPackets.size(); ++i) {
-            float x = 0.1f + static_cast<float>(i) / 100.0f; // Adjusted for max 100 packets
+            float x = 0.05f + static_cast<float>(i) / MAX_BARS;  // Adjust X position based on max bars
             float magnitude = calculateMagnitude(receivedPackets[i]) / 200.0f;  // Normalize magnitude for smaller heights
 
             // Ensure magnitude doesn't exceed plot height
             magnitude = std::min<float>(magnitude, 0.9f);
 
             glVertex2f(x, 0.05f);
-            glVertex2f(x + 0.01f, 0.05f); // Reduced bar width
+            glVertex2f(x + 0.01f, 0.05f);  // Adjusted bar width
             glVertex2f(x + 0.01f, 0.05f + magnitude);
             glVertex2f(x, 0.05f + magnitude);
         }
