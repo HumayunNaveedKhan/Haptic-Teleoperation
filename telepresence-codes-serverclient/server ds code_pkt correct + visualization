@@ -1,0 +1,187 @@
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <cstring>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <GL/glut.h>
+#include <sstream>
+#include <cmath>
+#include <chrono>
+
+#pragma comment(lib, "ws2_32.lib")
+#define UDP_PORT 4000
+
+// Common Packet Structure
+struct Packet {
+    int packetNumber;  // Sequential packet number
+    float x, y, z;     // 3D Vector components
+    float delay;       // Processing delay in milliseconds
+    char timestamp[64];  // Timestamp of packet creation
+};
+std::vector<Packet> receivedPackets;
+std::mutex dataMutex;
+
+// Global variable to control frame rate (time-based refreshing)
+std::chrono::time_point<std::chrono::steady_clock> lastRefreshTime;
+const std::chrono::milliseconds refreshInterval(33);  // ~30 FPS
+
+void udpServer() {
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(UDP_PORT);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    bind(udpSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
+
+    sockaddr_in clientAddr;
+    int clientAddrLen = sizeof(clientAddr);
+    Packet packet;
+
+    while (true) {
+        int bytesReceived = recvfrom(udpSocket, reinterpret_cast<char*>(&packet), sizeof(packet), 0, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
+
+        if (bytesReceived > 0) {
+            std::lock_guard<std::mutex> lock(dataMutex);
+            receivedPackets.push_back(packet);
+            if (receivedPackets.size() > 10) {
+                receivedPackets.erase(receivedPackets.begin());
+            }
+
+            char clientIP[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+
+            std::stringstream ss;
+            ss << "Packet from " << clientIP << " - "
+                << "#" << packet.packetNumber << " [x: " << packet.x
+                << ", y: " << packet.y << ", z: " << packet.z << "]"
+                << ", Delay: " << packet.delay << " ms, Timestamp: " << packet.timestamp;
+
+            std::cout << ss.str() << std::endl;
+        }
+    }
+
+    closesocket(udpSocket);
+}
+
+// Function to calculate the magnitude of a packet
+float calculateMagnitude(const Packet& packet) {
+    return sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
+}
+
+// Function to draw the X-Y plot (full screen)
+void drawXYPlot() {
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // Set up projection matrix for normalized coordinates (0 to 1)
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);  // Ortho projection for 2D
+
+    // Draw the packet data plot (full screen)
+    glColor3f(1.0f, 1.0f, 1.0f);  // White color for axes
+    glBegin(GL_LINES);
+    // X-axis (for packet sequence)
+    glVertex2f(0.05f, 0.05f);
+    glVertex2f(0.95f, 0.05f);
+    // Y-axis (for magnitude)
+    glVertex2f(0.05f, 0.05f);
+    glVertex2f(0.05f, 0.95f);
+    glEnd();
+
+    // Label X and Y axes
+    glRasterPos2f(0.95f, 0.05f);
+    for (const char& c : "Time") {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+    }
+    glRasterPos2f(0.05f, 0.95f);
+    for (const char& c : "Magnitude") {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+    }
+
+    // Draw the data bars (packets)
+    glColor3f(0.0f, 1.0f, 0.0f);  // Green color for packets (bars)
+    glBegin(GL_QUADS);
+    {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        for (size_t i = 0; i < receivedPackets.size(); ++i) {
+            float x = static_cast<float>(i) / receivedPackets.size();  // x-position (based on packet order)
+            float magnitude = calculateMagnitude(receivedPackets[i]); // y-position (magnitude)
+
+            // Draw bars to represent packets
+            glVertex2f(x, 0.05f);  // Bottom left of the bar
+            glVertex2f(x + 0.05f, 0.05f);  // Bottom right of the bar
+            glVertex2f(x + 0.05f, magnitude / 100.0f); // Top right of the bar
+            glVertex2f(x, magnitude / 100.0f);  // Top left of the bar
+        }
+    }
+    glEnd();
+
+    glutSwapBuffers();
+}
+
+// Function to display packet info in the top-right corner
+void displayPacketInfo() {
+    // Draw packet info box at the top-right corner
+    glColor3f(1.0f, 1.0f, 1.0f);  // White color for text
+    glBegin(GL_POLYGON);
+    glVertex2f(0.75f, 0.9f);
+    glVertex2f(0.95f, 0.9f);
+    glVertex2f(0.95f, 1.0f);
+    glVertex2f(0.75f, 1.0f);
+    glEnd();
+
+    // Display packet info in the box
+    glRasterPos2f(0.76f, 0.95f);
+    std::lock_guard<std::mutex> lock(dataMutex);
+    for (size_t i = 0; i < receivedPackets.size(); ++i) {
+        std::stringstream packetInfo;
+        packetInfo << "#" << receivedPackets[i].packetNumber << " x: " << receivedPackets[i].x
+            << " y: " << receivedPackets[i].y << " z: " << receivedPackets[i].z
+            << " Delay: " << receivedPackets[i].delay << " ms";
+        std::string info = packetInfo.str();
+        for (const char& c : info) {
+            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+        }
+    }
+
+    glutSwapBuffers();
+}
+
+// Function to handle screen refreshing with frame rate control
+void idleFunction() {
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastRefreshTime >= refreshInterval) {
+        lastRefreshTime = now;
+        glutPostRedisplay();  // Trigger a redraw of the window
+    }
+}
+
+int main(int argc, char** argv) {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    std::thread udpThread(udpServer);
+
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(1920, 1080);  // Fullscreen or desired resolution
+    glutCreateWindow("Packet Visualization");
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);  // Dark grey background
+
+    // Set display function to draw the plot
+    glutDisplayFunc([]() {
+        drawXYPlot();
+        displayPacketInfo();
+        });
+
+    // Set idle function with frame rate control
+    glutIdleFunc(idleFunction);
+
+    glutMainLoop();
+
+    udpThread.join();
+    WSACleanup();
+    return 0;
+}
