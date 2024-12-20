@@ -1,161 +1,221 @@
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <cstring>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <iostream>
+#include <GL/glut.h>
+#include <sstream>
+#include <cmath>
 #include <chrono>
-#include <random>
-#include <vector>
-#include <iomanip> // For timestamp formatting
-#include <sstream> // For stringstream
 
-#pragma comment(lib, "ws2_32.lib") // Link Winsock library
+#pragma comment(lib, "ws2_32.lib")
+#define UDP_PORT 4000
 
-#define PACKET_SIZE 1  // Fixed packet size (2 bytes for packet number)
-#define BUFFER_SIZE 64
+// Common Packet Structure
+struct Packet {
+    int packetNumber;  // Sequential packet number
+    float x, y, z;     // 3D Vector components
+    float delay;       // Processing delay in milliseconds
+    char timestamp[64]; // Timestamp of packet creation
+    char clientIP[INET_ADDRSTRLEN]; // IP address of the client
+    int port;          // Port number of the client
+};
 
-// Simulate and calculate delays
-void calculateAndDisplayDelays(int packetNumber, int packetSize, int bandwidth, int distance, int propagationSpeed, double processingStartTime) {
-    // Transmission delay = packet size / bandwidth
-    double transmissionDelay = (packetSize * 8.0) / bandwidth; // in seconds
+std::vector<Packet> receivedPackets;
+std::mutex dataMutex;
 
-    // Propagation delay = distance / propagation speed
-    double propagationDelay = static_cast<double>(distance) / propagationSpeed; // in seconds
+// Global variables for frame rate control
+std::chrono::time_point<std::chrono::steady_clock> lastRefreshTime;
+const std::chrono::milliseconds refreshInterval(33);  // ~30 FPS
 
-    // Queuing delay (simulated)
-    double queuingDelay = (rand() % 100) / 1000.0; // Random delay between 0 and 100ms
-
-    // Processing delay (measured)
-    double processingDelay = processingStartTime; // in seconds
-
-    // Total delay
-    double totalDelay = transmissionDelay + propagationDelay + queuingDelay + processingDelay;
-
-    // Display the delays
-    std::cout << "Packet #" << packetNumber << " Delay Details:" << std::endl;
-    std::cout << "  Transmission Delay: " << transmissionDelay * 1000 << " ms" << std::endl;
-    std::cout << "  Propagation Delay: " << propagationDelay * 1000 << " ms" << std::endl;
-    std::cout << "  Queuing Delay: " << queuingDelay * 1000 << " ms" << std::endl;
-    std::cout << "  Processing Delay: " << processingDelay * 1000 << " ms" << std::endl;
-    std::cout << "  Total Delay: " << totalDelay * 1000 << " ms" << std::endl;
-    std::cout << "---------------------------------" << std::endl;
-}
-
-// Get current timestamp as a string
-std::string getCurrentTimestamp() {
-    auto now = std::chrono::system_clock::now();
-    auto now_c = std::chrono::system_clock::to_time_t(now);
-    std::tm timeinfo;
-    if (localtime_s(&timeinfo, &now_c) == 0) {
-        std::stringstream ss;
-        ss << std::put_time(&timeinfo, "%Y-%m-%d %H:%M:%S");
-        return ss.str();
-    }
-    else {
-        return "";  // Handle error
-    }
-}
-
-// Display the content of the packet
-void displayPacketContent(const std::vector<char>& packet, int packetNumber) {
-    std::cout << "Packet #" << packetNumber << " Content: ";
-    for (size_t i = 0; i < packet.size(); ++i) {
-        std::cout << std::hex << (static_cast<unsigned char>(packet[i]) & 0xFF) << " ";  // Print hex values of packet data
-    }
-    std::cout << std::dec << std::endl;  // Reset back to decimal
-}
-
-void udpServer(int serverPort) {
-    // Initialize Winsock
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
-        return;
-    }
-
-    // Create a socket
-    SOCKET serverSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (serverSocket == INVALID_SOCKET) {
+void udpServer() {
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpSocket == INVALID_SOCKET) {
         std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
-        WSACleanup();
         return;
     }
 
-    // Bind the socket to the specified port
-    sockaddr_in serverAddress;
-    memset(&serverAddress, 0, sizeof(serverAddress));
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(serverPort);
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    sockaddr_in serverAddr = {};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(UDP_PORT);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(serverSocket, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)) == SOCKET_ERROR) {
-        std::cerr << "Bind failed: " << WSAGetLastError() << std::endl;
-        closesocket(serverSocket);
-        WSACleanup();
+    if (bind(udpSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "Socket binding failed: " << WSAGetLastError() << std::endl;
+        closesocket(udpSocket);
         return;
     }
 
-    std::cout << "UDP server is running on port " << serverPort << std::endl;
-
-    std::vector<char> buffer(BUFFER_SIZE);
-    sockaddr_in clientAddress;
-    int clientAddressSize = sizeof(clientAddress);
-
-    const int bandwidth = 1000000; // Bandwidth in bits per second (1 Mbps)
-    const int distance = 1000;    // Distance in meters
-    const int propagationSpeed = 200000000; // Speed of signal propagation in m/s (2 x 10^8)
-
-    int packetNumber = 0;
-    int totalDataReceived = 0;  // To keep track of the total data received
+    sockaddr_in clientAddr = {};
+    int clientAddrLen = sizeof(clientAddr);
+    Packet packet;
 
     while (true) {
-        // Receive packet
-        auto receiveStart = std::chrono::high_resolution_clock::now();
-        int receivedBytes = recvfrom(
-            serverSocket,
-            buffer.data(),
-            BUFFER_SIZE,
-            0,
-            reinterpret_cast<sockaddr*>(&clientAddress),
-            &clientAddressSize
-        );
+        int bytesReceived = recvfrom(udpSocket, reinterpret_cast<char*>(&packet), sizeof(packet), 0, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
 
-        if (receivedBytes == SOCKET_ERROR) {
-            std::cerr << "recvfrom failed: " << WSAGetLastError() << std::endl;
-            break;
+        if (bytesReceived > 0) {
+            std::lock_guard<std::mutex> lock(dataMutex);
+            inet_ntop(AF_INET, &clientAddr.sin_addr, packet.clientIP, INET_ADDRSTRLEN);
+            packet.port = ntohs(clientAddr.sin_port);
+
+            receivedPackets.push_back(packet);
+            if (receivedPackets.size() > 100) {
+                receivedPackets.erase(receivedPackets.begin());
+            }
+
+            std::stringstream ss;
+            ss << "Packet from " << packet.clientIP << ":" << packet.port << " - "
+                << "#" << packet.packetNumber << " [x: " << packet.x
+                << ", y: " << packet.y << ", z: " << packet.z << "]"
+                << ", Delay: " << packet.delay << " ms, Timestamp: " << packet.timestamp;
+
+            std::cout << ss.str() << std::endl;
         }
-
-        auto receiveEnd = std::chrono::high_resolution_clock::now();
-        double processingDelay = std::chrono::duration<double>(receiveEnd - receiveStart).count(); // in seconds
-
-        // Extract packet number from received data (assuming 2-byte packets)
-        int receivedPacketNumber = static_cast<unsigned char>(buffer[0]) | (static_cast<unsigned char>(buffer[1]) << 8);
-
-        // Update total data received
-        totalDataReceived += receivedBytes;
-
-        // Calculate and display delays
-        calculateAndDisplayDelays(receivedPacketNumber, PACKET_SIZE, bandwidth, distance, propagationSpeed, processingDelay);
-
-        // Display received packet details
-        std::cout << "Received Packet #" << receivedPacketNumber << " at " << getCurrentTimestamp() << std::endl;
-        std::cout << "Packet Size: " << receivedBytes << " bytes" << std::endl;
-
-        // Display the content of the packet
-        displayPacketContent(buffer, receivedPacketNumber);
-
-        // Display total data received so far
-        std::cout << "Total Data Received: " << totalDataReceived << " bytes." << std::endl;
-        std::cout << "---------------------------------" << std::endl;
-        packetNumber++;
     }
 
-    // Clean up
-    closesocket(serverSocket);
-    WSACleanup();
+    closesocket(udpSocket);
 }
 
-int main() {
-    int serverPort = 4000; // Port to listen on
-    udpServer(serverPort);
+// Function to calculate the magnitude of a packet
+float calculateMagnitude(const Packet& packet) {
+    return sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
+}
 
+// Function to draw the X-Y plot
+void drawXYPlot() {
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // Set up projection matrix for normalized coordinates
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);
+
+    // Draw axes
+    glColor3f(1.0f, 1.0f, 1.0f);
+    glBegin(GL_LINES);
+    // X-axis
+    glVertex2f(0.05f, 0.05f);
+    glVertex2f(0.95f, 0.05f);
+    // Y-axis
+    glVertex2f(0.05f, 0.05f);
+    glVertex2f(0.05f, 0.95f);
+    glEnd();
+
+    // Draw axis labels and scales
+    glRasterPos2f(0.95f, 0.02f);
+    for (const char& c : "Time (ms)") {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+    }
+    glRasterPos2f(0.01f, 0.95f);
+    for (const char& c : "Magnitude") {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+    }
+
+    // Draw scales on the axes
+    glColor3f(0.5f, 0.5f, 0.5f);
+    for (float i = 0.1f; i < 1.0f; i += 0.1f) {
+        glBegin(GL_LINES);
+        glVertex2f(0.05f, i);
+        glVertex2f(0.055f, i);
+        glVertex2f(i, 0.05f);
+        glVertex2f(i, 0.055f);
+        glEnd();
+    }
+
+    // Draw bars representing packets
+    glColor3f(0.0f, 1.0f, 0.0f);
+    glBegin(GL_QUADS);
+    {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        for (size_t i = 0; i < receivedPackets.size(); ++i) {
+            float x = 0.1f + static_cast<float>(i) / 100.0f;
+            float magnitude = calculateMagnitude(receivedPackets[i]) / 100.0f;  // Normalize magnitude
+
+            // Ensure magnitude doesn't exceed plot height
+            magnitude = (magnitude, 0.9f);
+
+            glVertex2f(x, 0.05f);
+            glVertex2f(x + 0.008f, 0.05f);
+            glVertex2f(x + 0.008f, 0.05f + magnitude);
+            glVertex2f(x, 0.05f + magnitude);
+        }
+    }
+    glEnd();
+}
+
+// Function to display packet info in the top-right corner
+void displayPacketInfo() {
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);
+
+    glColor3f(1.0f, 1.0f, 1.0f);
+
+    // Draw static headers for packet info
+    glRasterPos2f(0.7f, 0.9f);
+    std::string headers = "Packet#  IP Address       Magnitude  Port#  Timestamp";
+    for (const char& c : headers) {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+    }
+
+    // Display dynamic packet information
+    std::lock_guard<std::mutex> lock(dataMutex);
+    for (size_t i = 0; i < receivedPackets.size(); ++i) {
+        std::stringstream packetInfo;
+        packetInfo << receivedPackets[i].packetNumber << "    "
+            << receivedPackets[i].clientIP << " "
+            << calculateMagnitude(receivedPackets[i]) << "    "
+            << receivedPackets[i].port << "    "
+            << receivedPackets[i].timestamp;
+
+        glRasterPos2f(0.7f, 0.88f - 0.02f * (i + 1));
+        std::string info = packetInfo.str();
+        for (const char& c : info) {
+            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+        }
+    }
+}
+
+// Combined display function
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    drawXYPlot();
+    displayPacketInfo();
+    glutSwapBuffers();
+}
+
+// Function to handle frame rate control
+void idleFunction() {
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastRefreshTime >= refreshInterval) {
+        lastRefreshTime = now;
+        glutPostRedisplay();
+    }
+}
+
+int main(int argc, char** argv) {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return -1;
+    }
+
+    std::thread udpThread(udpServer);
+
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(1920, 1080);
+    glutCreateWindow("Packet Visualization");
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+
+    glutDisplayFunc(display);
+    glutIdleFunc(idleFunction);
+
+    glutMainLoop();
+
+    udpThread.join();
+    WSACleanup();
     return 0;
 }
