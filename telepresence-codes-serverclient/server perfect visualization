@@ -1,0 +1,158 @@
+// Updated Visualization Code
+#include <glut.h>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <mutex>
+#include <thread>
+#include <chrono>
+#include <queue>
+#include <winsock2.h>
+
+#define MAX_PACKETS 100
+
+struct Packet {
+    int packetNumber;
+    std::string ip;
+    float magnitude;
+    int port;
+    std::string timestamp;
+};
+
+std::deque<Packet> receivedPackets;
+std::mutex dataMutex;
+std::chrono::steady_clock::time_point lastRefreshTime = std::chrono::steady_clock::now();
+std::chrono::milliseconds refreshInterval(16); // ~60 FPS
+
+void drawXYPlot() {
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);
+
+    // Draw axes
+    glColor3f(1.0f, 1.0f, 1.0f);
+    glBegin(GL_LINES);
+    glVertex2f(0.1f, 0.1f); // X-axis
+    glVertex2f(0.9f, 0.1f);
+    glVertex2f(0.1f, 0.1f); // Y-axis
+    glVertex2f(0.1f, 0.9f);
+    glEnd();
+
+    // Label axes
+    glRasterPos2f(0.9f, 0.08f);
+    for (const char& c : "Time (ms)")
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+
+    glRasterPos2f(0.05f, 0.9f);
+    for (const char& c : "Magnitude")
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+
+    // Draw data points
+    glColor3f(0.0f, 1.0f, 0.0f);
+    {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        size_t packetCount = receivedPackets.size();
+        if (packetCount > 0) {
+            float step = 0.8f / MAX_PACKETS; // Normalize spacing for up to 100 packets
+            size_t start = (packetCount > MAX_PACKETS) ? packetCount - MAX_PACKETS : 0;
+
+            for (size_t i = start; i < packetCount; ++i) {
+                float x = 0.1f + (i - start) * step;
+                float y = 0.1f + receivedPackets[i].magnitude / 100.0f; // Normalize magnitude
+
+                glBegin(GL_QUADS);
+                glVertex2f(x, 0.1f);
+                glVertex2f(x + step * 0.8f, 0.1f);
+                glVertex2f(x + step * 0.8f, y);
+                glVertex2f(x, y);
+                glEnd();
+            }
+        }
+    }
+}
+
+void displayPacketInfo() {
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);
+
+    // Draw info box background
+    glColor3f(0.2f, 0.2f, 0.2f); // Dark grey
+    glBegin(GL_QUADS);
+    glVertex2f(0.75f, 0.75f);
+    glVertex2f(0.99f, 0.75f);
+    glVertex2f(0.99f, 0.99f);
+    glVertex2f(0.75f, 0.99f);
+    glEnd();
+
+    // Draw headers
+    glColor3f(1.0f, 1.0f, 1.0f); // White text
+    glRasterPos2f(0.76f, 0.95f);
+    const char* headers = "#   IP         Mag   Port    Time";
+    for (const char& c : std::string(headers))
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+
+    // Draw packet details
+    glColor3f(0.0f, 1.0f, 0.0f); // Green text
+    {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        size_t start = (receivedPackets.size() > MAX_PACKETS) ? receivedPackets.size() - MAX_PACKETS : 0;
+        for (size_t i = start; i < receivedPackets.size(); ++i) {
+            float y = 0.90f - 0.02f * (i - start + 1);
+            glRasterPos2f(0.76f, y);
+            std::stringstream info;
+            info << receivedPackets[i].packetNumber << " "
+                << receivedPackets[i].ip << " "
+                << receivedPackets[i].magnitude << " "
+                << receivedPackets[i].port << " "
+                << receivedPackets[i].timestamp;
+
+            for (const char& c : info.str())
+                glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+        }
+    }
+}
+
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    drawXYPlot();
+    displayPacketInfo();
+
+    glutSwapBuffers();
+}
+
+void idleFunction() {
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastRefreshTime >= refreshInterval) {
+        lastRefreshTime = now;
+        glutPostRedisplay();
+    }
+}
+
+int main(int argc, char** argv) {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    // Example packet initialization
+    for (int i = 1; i <= 10; ++i) {
+        Packet packet = { i, "192.168.1.1", 20.0f + i, 8080, "12:00:00" };
+        receivedPackets.push_back(packet);
+    }
+
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(1024, 768);
+    glutCreateWindow("Packet Visualization");
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+
+    glutDisplayFunc(display);
+    glutIdleFunc(idleFunction);
+
+    glutMainLoop();
+
+    WSACleanup();
+    return 0;
+}
