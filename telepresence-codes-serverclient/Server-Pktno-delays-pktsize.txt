@@ -22,6 +22,10 @@ struct Packet {
     float x, y, z;     // 3D Vector components
     float delay;       // Processing delay in milliseconds
     char timestamp[64];  // Timestamp of packet creation
+    char srcIP[INET_ADDRSTRLEN]; // Source IP address
+    char dstIP[INET_ADDRSTRLEN]; // Destination IP address
+    int srcPort;       // Source port
+    int dstPort;       // Destination port
 };
 
 std::deque<Packet> receivedPackets;  // Use deque for FIFO handling
@@ -59,6 +63,12 @@ void udpServer() {
         int bytesReceived = recvfrom(udpSocket, reinterpret_cast<char*>(&packet), sizeof(packet), 0, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
 
         if (bytesReceived > 0 && bytesReceived <= MAX_PACKET_SIZE) {
+            // Capture source and destination IPs and ports
+            inet_ntop(AF_INET, &clientAddr.sin_addr, packet.srcIP, INET_ADDRSTRLEN);
+            inet_ntop(AF_INET, &serverAddr.sin_addr, packet.dstIP, INET_ADDRSTRLEN);
+            packet.srcPort = ntohs(clientAddr.sin_port);
+            packet.dstPort = ntohs(serverAddr.sin_port);
+
             std::lock_guard<std::mutex> lock(dataMutex);
             receivedPackets.push_back(packet);
             if (receivedPackets.size() > MAX_BARS) {
@@ -99,13 +109,25 @@ void drawXYPlot() {
     // Draw axes
     glColor3f(1.0f, 1.0f, 1.0f);
     glBegin(GL_LINES);
-    // X-axis
+    // X-axis (time scale)
     glVertex2f(0.05f, 0.05f);
     glVertex2f(0.95f, 0.05f);
-    // Y-axis
+    // Y-axis (magnitude scale)
     glVertex2f(0.05f, 0.05f);
     glVertex2f(0.05f, 0.95f);
     glEnd();
+
+    // Draw time scale on X-axis
+    glColor3f(1.0f, 1.0f, 1.0f);
+    for (size_t i = 0; i < receivedPackets.size(); ++i) {
+        float x = 0.05f + static_cast<float>(i) / MAX_BARS;  // Adjust X position based on max bars
+        glRasterPos2f(x, 0.04f);
+        std::stringstream timeLabel;
+        timeLabel << "T" << receivedPackets[i].packetNumber; // Using packet number as time scale label
+        for (const char& c : timeLabel.str()) {
+            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_10, c);
+        }
+    }
 
     // Draw bars representing packets
     glColor3f(0.0f, 1.0f, 0.0f);
@@ -128,6 +150,17 @@ void drawXYPlot() {
         }
     }
     glEnd();
+
+    // Draw magnitude scale on Y-axis
+    glRasterPos2f(0.02f, 0.05f);
+    for (float i = 0.0f; i <= 1.0f; i += 0.2f) {
+        std::stringstream magnitudeLabel;
+        magnitudeLabel << (int)(i * 200); // Scaled magnitude values
+        for (const char& c : magnitudeLabel.str()) {
+            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_10, c);
+        }
+        glRasterPos2f(0.02f, 0.05f + i);
+    }
 }
 
 // Function to display packet info in the top-right corner
@@ -136,6 +169,7 @@ void displayPacketInfo() {
     glLoadIdentity();
     gluOrtho2D(0.0, 1.0, 0.0, 1.0);
 
+    // Draw the background of the info box
     glColor3f(1.0f, 1.0f, 1.0f);
     glBegin(GL_QUADS);
     glVertex2f(0.7f, 0.6f);
@@ -144,18 +178,29 @@ void displayPacketInfo() {
     glVertex2f(0.7f, 0.99f);
     glEnd();
 
+    // Draw the header for packet info
     glColor3f(0.0f, 0.0f, 0.0f);
     glRasterPos2f(0.72f, 0.95f);
-    for (const char& c : "Packet#  IP        Magnitude  Port#  Timestamp") {
+    for (const char& c : "Pkt# Info   Data (x, y, z)    Src IP          Dst IP          Src Port Dst Port") {
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
     }
 
     std::lock_guard<std::mutex> lock(dataMutex);
-    for (size_t i = 0; i < receivedPackets.size(); ++i) {
-        char buffer[128];
-        snprintf(buffer, sizeof(buffer), "%-7d %-10s %-9.2f %-5d %s",
-            receivedPackets[i].packetNumber, "127.0.0.1", calculateMagnitude(receivedPackets[i]), UDP_PORT, receivedPackets[i].timestamp);
 
+    // Display packet data with alignment
+    for (size_t i = 0; i < receivedPackets.size(); ++i) {
+        char buffer[512];
+        snprintf(buffer, sizeof(buffer),
+            "%-7d %-12s %-15s %-10s %-10s %-9d %-9d",
+            receivedPackets[i].packetNumber,
+            "Packet",  // Placeholder
+            "[" + std::to_string(receivedPackets[i].x) + ", " + std::to_string(receivedPackets[i].y) + ", " + std::to_string(receivedPackets[i].z) + "]",
+            receivedPackets[i].srcIP,
+            receivedPackets[i].dstIP,
+            receivedPackets[i].srcPort,
+            receivedPackets[i].dstPort);
+
+        // Position for the packet info display
         glRasterPos2f(0.72f, 0.93f - 0.03f * i);
         for (const char& c : buffer) {
             glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
@@ -191,7 +236,7 @@ int main(int argc, char** argv) {
 
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
-    glutInitWindowSize(1920, 1080);
+    glutInitWindowSize(600, 400);
     glutCreateWindow("Packet Visualization");
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
 
