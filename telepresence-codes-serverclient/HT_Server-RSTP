@@ -1,0 +1,64 @@
+#include <iostream>
+#include <string>
+#include <thread>
+#include <asio.hpp>
+
+using asio::ip::tcp;
+
+class RTSPServer {
+public:
+    RTSPServer(const std::string& host, int port)
+        : acceptor(io_context, tcp::endpoint(asio::ip::make_address(host), port)) {}
+
+    void start() {
+        std::cout << "RTSP Server started on port " << acceptor.local_endpoint().port() << std::endl;
+        acceptConnections();
+        io_context.run();
+    }
+
+private:
+    asio::io_context io_context;
+    tcp::acceptor acceptor;
+
+    void acceptConnections() {
+        auto socket = std::make_shared<tcp::socket>(io_context);
+        acceptor.async_accept(*socket, [this, socket](const asio::error_code& error) {
+            if (!error) {
+                std::cout << "New client connected: " << socket->remote_endpoint() << std::endl;
+                std::thread(&RTSPServer::handleClient, this, socket).detach();
+            }
+            acceptConnections();
+        });
+    }
+
+    void handleClient(std::shared_ptr<tcp::socket> socket) {
+        try {
+            char buffer[1024];
+            for (;;) {
+                size_t length = socket->read_some(asio::buffer(buffer));
+                std::string request(buffer, length);
+                std::cout << "Request received: " << request << std::endl;
+
+                // Respond to basic RTSP commands
+                if (request.find("OPTIONS") != std::string::npos) {
+                    std::string response = "RTSP/1.0 200 OK\nCSeq: 1\nPublic: DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE\n\n";
+                    asio::write(*socket, asio::buffer(response));
+                } else if (request.find("DESCRIBE") != std::string::npos) {
+                    std::string response = "RTSP/1.0 200 OK\nCSeq: 2\nContent-Base: rtsp://127.0.0.1/\n\n";
+                    asio::write(*socket, asio::buffer(response));
+                } else if (request.find("TEARDOWN") != std::string::npos) {
+                    std::cout << "Client disconnected.\n";
+                    break;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error handling client: " << e.what() << std::endl;
+        }
+    }
+};
+
+int main() {
+    RTSPServer server("127.0.0.1", 8554);
+    server.start();
+    return 0;
+}
