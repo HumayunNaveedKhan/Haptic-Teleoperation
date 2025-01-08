@@ -1,0 +1,54 @@
+#include <iostream>
+#include <string>
+#include <asio.hpp>
+
+using asio::ip::tcp;
+
+class RTSPClient {
+public:
+    RTSPClient(const std::string& host, int port)
+        : socket(io_context), server_host(host), server_port(port) {}
+
+    void connect() {
+        tcp::resolver resolver(io_context);
+        asio::connect(socket, resolver.resolve(server_host, std::to_string(server_port)));
+        std::cout << "Connected to RTSP server at " << server_host << ":" << server_port << std::endl;
+    }
+
+    void sendRequest(const std::string& request) {
+        asio::write(socket, asio::buffer(request));
+        std::cout << "Request sent: " << request << std::endl;
+
+        char response[1024];
+        size_t length = socket.read_some(asio::buffer(response));
+        std::cout << "Response received: " << std::string(response, length) << std::endl;
+    }
+
+    void close() {
+        socket.close();
+        std::cout << "Connection closed." << std::endl;
+    }
+
+private:
+    asio::io_context io_context;
+    tcp::socket socket;
+    std::string server_host;
+    int server_port;
+};
+
+int main() {
+    try {
+        RTSPClient client("127.0.0.1", 8554);
+        client.connect();
+
+        client.sendRequest("OPTIONS rtsp://127.0.0.1/ RTSP/1.0\nCSeq: 1\n\n");
+        client.sendRequest("DESCRIBE rtsp://127.0.0.1/ RTSP/1.0\nCSeq: 2\n\n");
+        client.sendRequest("TEARDOWN rtsp://127.0.0.1/ RTSP/1.0\nCSeq: 3\n\n");
+
+        client.close();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+
+    return 0;
+}
