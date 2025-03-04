@@ -5,6 +5,7 @@
 #include <ctime>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include "C:\Program Files\Force Dimension\sdk-3.17.1\include\dhdc.h"  // Force Dimension SDK
 #pragma comment(lib, "ws2_32.lib")
 
@@ -20,28 +21,70 @@ struct Packet {
     int dstPort;
 };
 
+// Global delay control variable
+std::atomic<float> globalDelay(1.0f);
+
 // Function to get current timestamp in a specific format
 void getTimestamp(char* timestamp) {
     time_t now = time(0);
     struct tm tstruct;
-    localtime_s(&tstruct, &now);  // Use localtime_s instead of localtime
+    localtime_s(&tstruct, &now);
     strftime(timestamp, 64, "%Y-%m-%d %X", &tstruct);
+}
+
+// Haptic data transmission function (High-priority thread)
+void sendHapticData(SOCKET clientSocket, sockaddr_in serverAddr, char* srcIP, char* dstIP, int srcPort, int dstPort) {
+    Packet packet;
+    int packetCount = 0;
+    constexpr int packetSize = sizeof(Packet);
+
+    // Set thread priority to high
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    while (true) {
+        double hx, hy, hz;
+
+        // Get haptic device position
+        if (dhdGetPosition(&hx, &hy, &hz) < 0) {
+            std::cerr << "Error getting haptic position: " << dhdErrorGetLastStr() << std::endl;
+            break;
+        }
+
+        // Set up the packet data
+        packet.packetNumber = ++packetCount;
+        packet.x = static_cast<float>(hx);
+        packet.y = static_cast<float>(hy);
+        packet.z = static_cast<float>(hz);
+        packet.delay = globalDelay.load();
+        getTimestamp(packet.timestamp);
+        strcpy_s(packet.srcIP, srcIP);
+        strcpy_s(packet.dstIP, dstIP);
+        packet.srcPort = srcPort;
+        packet.dstPort = dstPort;
+
+        // Send the packet to the server
+        int sendResult = sendto(clientSocket, reinterpret_cast<char*>(&packet), packetSize, 0,
+            (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+        if (sendResult == SOCKET_ERROR) {
+            std::cerr << "Send failed with error: " << WSAGetLastError() << std::endl;
+        }
+
+        // Enforce 1000 Hz rate (1 ms delay)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 int main() {
     // Configurable parameters
-    char srcIP[] = "127.0.0.1";  // Source IP address
-    char dstIP[] = "192.168.168.136"; // Destination IP address (Correct format)
-    int srcPort = 1000;  // Source port
-    int dstPort = 4000;  // Destination port
-    int numPackets = 100;  // Number of packets to send
-    int delayBetweenPackets = 1000;  // Delay in milliseconds between packets
-    int packetSize = sizeof(Packet);  // Size of the packet structure
+    char srcIP[] = "127.0.0.1";
+    char dstIP[] = "192.168.168.136";
+    int srcPort = 1000;
+    int dstPort = 4000;
 
     WSADATA wsaData;
     SOCKET clientSocket;
     sockaddr_in serverAddr;
-    Packet packet;
 
     // Initialize Winsock
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -77,58 +120,20 @@ int main() {
 
     std::cout << "Haptic device initialized successfully!" << std::endl;
 
-    // Loop to create and send packets
-    for (int i = 1; i <= numPackets; ++i) {
-        double hx, hy, hz;
+    // Start the high-priority haptic data transmission thread
+    std::thread hapticThread(sendHapticData, clientSocket, serverAddr, srcIP, dstIP, srcPort, dstPort);
 
-        // Get haptic device position
-        if (dhdGetPosition(&hx, &hy, &hz) < 0) {
-            std::cerr << "Error getting haptic position: " << dhdErrorGetLastStr() << std::endl;
-            break;
-        }
+    // Wait for user input to terminate
+    std::cout << "Press Enter to stop..." << std::endl;
+    std::cin.get();
 
-        // Set up the packet data
-        packet.packetNumber = i;
-        packet.x = static_cast<float>(hx);  // Haptic X position
-        packet.y = static_cast<float>(hy);  // Haptic Y position
-        packet.z = static_cast<float>(hz);  // Haptic Z position
-        packet.delay = 1.0f;
-        getTimestamp(packet.timestamp);
-        strcpy_s(packet.srcIP, srcIP);
-        strcpy_s(packet.dstIP, dstIP);
-        packet.srcPort = srcPort;
-        packet.dstPort = dstPort;
-
-        // Print packet details
-        std::cout << "Sending Packet #" << i << std::endl;
-        std::cout << "Source IP: " << packet.srcIP << ", Source Port: " << packet.srcPort << std::endl;
-        std::cout << "Destination IP: " << packet.dstIP << ", Destination Port: " << packet.dstPort << std::endl;
-        std::cout << "Packet Number: " << packet.packetNumber << std::endl;
-        std::cout << "Haptic Position -> x: " << packet.x << ", y: " << packet.y << ", z: " << packet.z << std::endl;
-        std::cout << "Timestamp: " << packet.timestamp << std::endl;
-        std::cout << "----------------------------------------" << std::endl;
-
-        // Send the packet to the server
-        int sendResult = sendto(clientSocket, reinterpret_cast<char*>(&packet), packetSize, 0,
-            (sockaddr*)&serverAddr, sizeof(serverAddr));
-
-        if (sendResult == SOCKET_ERROR) {
-            std::cerr << "Send failed with error: " << WSAGetLastError() << std::endl;
-        }
-        else {
-            std::cout << "Packet " << i << " sent successfully!" << std::endl;
-        }
-
-        // Delay between packets
-        std::this_thread::sleep_for(std::chrono::milliseconds(delayBetweenPackets));
-    }
-
-    // Close the haptic device
+    // Clean up
     dhdClose();
-
-    // Clean up and close the socket
     closesocket(clientSocket);
     WSACleanup();
+
+    // Join the thread before exiting
+    hapticThread.join();
 
     return 0;
 }
