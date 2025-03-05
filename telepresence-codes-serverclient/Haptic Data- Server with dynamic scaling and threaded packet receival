@@ -1,0 +1,274 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <GL/glut.h>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <thread>
+#include <vector>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib")
+#define UDP_PORT 4000
+#define MAX_PACKET_SIZE 400
+#define MAX_BUFFER_SIZE 1000  // Increase buffer size to hold 1000 packets
+
+// Common Packet Structure
+struct Packet {
+    int packetNumber;  // Sequential packet number
+    float x, y, z;     // 3D Vector components
+    float delay;       // Processing delay in milliseconds
+    char timestamp[64];  // Timestamp of packet creation
+    char srcIP[INET_ADDRSTRLEN]; // Source IP address
+    char dstIP[INET_ADDRSTRLEN]; // Destination IP address
+    int srcPort;       // Source port
+    int dstPort;       // Destination port
+};
+
+std::deque<Packet> receivedPackets;  // Use deque for FIFO handling
+std::mutex dataMutex;
+
+// Global variables for frame rate control
+std::chrono::time_point<std::chrono::steady_clock> lastRefreshTime;
+const std::chrono::milliseconds refreshInterval(33);  // ~30 FPS
+const size_t MAX_BARS = 30;  // Max number of packets to display
+
+// Control Parameters
+const int bufferSize = MAX_BUFFER_SIZE;
+const int udpPort = UDP_PORT;
+const float packetScale = 200.0f;  // Scaling factor for packet magnitude
+
+// UDP server thread for receiving packets with highest priority
+void udpServer() {
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        return;
+    }
+
+    sockaddr_in serverAddr = {};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(udpPort);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(udpSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "Socket binding failed: " << WSAGetLastError() << std::endl;
+        closesocket(udpSocket);
+        return;
+    }
+
+    sockaddr_in clientAddr = {};
+    int clientAddrLen = sizeof(clientAddr);
+    Packet packet;
+
+    while (true) {
+        int bytesReceived = recvfrom(udpSocket, reinterpret_cast<char*>(&packet), sizeof(packet), 0, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
+
+        if (bytesReceived > 0 && bytesReceived <= MAX_PACKET_SIZE) {
+            // Capture source and destination IPs and ports
+            inet_ntop(AF_INET, &clientAddr.sin_addr, packet.srcIP, INET_ADDRSTRLEN);
+            inet_ntop(AF_INET, &serverAddr.sin_addr, packet.dstIP, INET_ADDRSTRLEN);
+            packet.srcPort = ntohs(clientAddr.sin_port);
+            packet.dstPort = ntohs(serverAddr.sin_port);
+
+            std::lock_guard<std::mutex> lock(dataMutex);
+            receivedPackets.push_back(packet);
+            if (receivedPackets.size() > bufferSize) {
+                receivedPackets.pop_front();  // Implement FIFO: remove oldest packet
+            }
+
+            // Debugging information (optional)
+            char clientIP[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+
+            std::stringstream ss;
+            ss << "Packet from " << clientIP << " - "
+                << "#" << packet.packetNumber << " [x: " << packet.x
+                << ", y: " << packet.y << ", z: " << packet.z << "]"
+                << ", Delay: " << packet.delay << " ms, Timestamp: " << packet.timestamp;
+
+            std::cout << ss.str() << std::endl;
+        }
+    }
+
+    closesocket(udpSocket);
+}
+
+// Function to calculate the magnitude of a packet
+float calculateMagnitude(const Packet& packet) {
+    return sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
+}
+
+// OpenGL function to draw the XY plot for visualizing packet data
+void drawXYPlot() {
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // Set up projection matrix for normalized coordinates
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);
+
+    // Draw axes
+    glColor3f(1.0f, 1.0f, 1.0f);
+    glBegin(GL_LINES);
+    // X-axis (time scale)
+    glVertex2f(0.05f, 0.05f);
+    glVertex2f(0.95f, 0.05f);
+    // Y-axis (magnitude scale)
+    glVertex2f(0.05f, 0.05f);
+    glVertex2f(0.05f, 0.95f);
+    glEnd();
+
+    // Draw bars representing packets
+    std::lock_guard<std::mutex> lock(dataMutex);
+
+    // Find the maximum magnitude to scale the bars
+    float maxMagnitude = 0.0f;
+    for (const Packet& packet : receivedPackets) {
+        float magnitude = calculateMagnitude(packet);
+        maxMagnitude = std::max(maxMagnitude, magnitude);
+    }
+
+    // Draw the bars for the packets, ensuring only the latest MAX_BARS packets are displayed
+    glColor3f(0.0f, 1.0f, 0.0f);
+    glBegin(GL_QUADS);
+    {
+        for (size_t i = 0; i < std::min(receivedPackets.size(), static_cast<size_t>(MAX_BARS)); ++i) {
+            float x = 0.05f + static_cast<float>(i) / MAX_BARS;  // Adjust X position based on max bars
+            float magnitude = calculateMagnitude(receivedPackets[i]) / maxMagnitude;  // Normalize magnitude for smaller heights
+
+            // Ensure magnitude doesn't exceed plot height
+            magnitude = std::min<float>(magnitude, 0.9f);
+
+            glVertex2f(x, 0.05f);
+            glVertex2f(x + 0.01f, 0.05f);  // Adjusted bar width
+            glVertex2f(x + 0.01f, 0.05f + magnitude);
+            glVertex2f(x, 0.05f + magnitude);
+        }
+    }
+    glEnd();
+
+    // Draw magnitude scale on Y-axis
+    glRasterPos2f(0.02f, 0.05f);
+    for (float i = 0.0f; i <= 1.0f; i += 0.2f) {
+        std::stringstream magnitudeLabel;
+        magnitudeLabel << (int)(i * maxMagnitude); // Scaled magnitude values
+        for (const char& c : magnitudeLabel.str()) {
+            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_10, c);
+        }
+        glRasterPos2f(0.02f, 0.05f + i);
+    }
+}
+
+// Function to display packet info and control parameters
+void displayPacketInfo() {
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);
+
+    // Draw the background of the info box
+    glColor3f(1.0f, 1.0f, 1.0f);
+    glBegin(GL_QUADS);
+    glVertex2f(0.7f, 0.6f);
+    glVertex2f(0.99f, 0.6f);
+    glVertex2f(0.99f, 0.99f);
+    glVertex2f(0.7f, 0.99f);
+    glEnd();
+
+    // Draw the header for control parameters
+    glColor3f(0.0f, 0.0f, 0.0f);
+    glRasterPos2f(0.72f, 0.95f);
+    for (const char& c : "Control Parameters:") {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+    }
+
+    // Display control parameters
+    std::stringstream controlParams;
+    controlParams << "Buffer Size: " << bufferSize << " pkts";
+    glRasterPos2f(0.72f, 0.92f);
+    for (const char& c : controlParams.str()) {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+    }
+
+    controlParams.str("");  // Clear the stringstream
+    controlParams << "UDP Port: " << udpPort;
+    glRasterPos2f(0.72f, 0.89f);
+    for (const char& c : controlParams.str()) {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+    }
+
+    // Display packet data with alignment
+    std::lock_guard<std::mutex> lock(dataMutex);
+    for (size_t i = 0; i < receivedPackets.size(); ++i) {
+        char buffer[512];
+        snprintf(buffer, sizeof(buffer),
+            "%-7d %-12s %-15s %-10s %-10s %-9d %-9d",
+            receivedPackets[i].packetNumber,
+            "Packet",  // Placeholder
+            "[" + std::to_string(receivedPackets[i].x) + ", " + std::to_string(receivedPackets[i].y) + ", " + std::to_string(receivedPackets[i].z) + "]",
+            receivedPackets[i].srcIP,
+            receivedPackets[i].dstIP,
+            receivedPackets[i].srcPort,
+            receivedPackets[i].dstPort);
+
+        // Position for the packet info display
+        glRasterPos2f(0.72f, 0.93f - 0.03f * i);
+        for (const char& c : buffer) {
+            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+        }
+    }
+}
+
+// Combined display function
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    drawXYPlot();
+    displayPacketInfo();
+    glutSwapBuffers();
+}
+
+// Function to handle frame rate control
+void idleFunction() {
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastRefreshTime >= refreshInterval) {
+        lastRefreshTime = now;
+        glutPostRedisplay();
+    }
+}
+
+// Function to set high priority for the UDP server thread
+void setThreadHighPriority() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+}
+
+int main(int argc, char** argv) {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return -1;
+    }
+
+    std::thread udpThread(udpServer);
+
+    // Set high priority for the UDP server thread
+    SetThreadPriority(udpThread.native_handle(), THREAD_PRIORITY_HIGHEST);
+
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(600, 400);
+    glutCreateWindow("Packet Visualization");
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+
+    glutDisplayFunc(display);
+    glutIdleFunc(idleFunction);
+
+    glutMainLoop();
+
+    udpThread.join();
+    WSACleanup();
+    return 0;
+}
