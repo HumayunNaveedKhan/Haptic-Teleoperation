@@ -1,15 +1,79 @@
 #include <iostream>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <cstring>
 #include <ctime>
 #include <chrono>
 #include <thread>
-#include <atomic>
-#include "C:\Program Files\Force Dimension\sdk-3.17.1\include\dhdc.h"  // Force Dimension SDK
-#pragma comment(lib, "ws2_32.lib")
+#include "C:\Program Files\Force Dimension\sdk-3.17.1\include\dhdc.h"  
 
-// Packet structure definition
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+
+// ========================= CONFIGURABLE PARAMETERS =========================
+
+// Network settings
+char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";  // Will be fetched dynamically
+const char DST_IP[] = "192.168.19.136";   // Destination IP (Receiver)
+const int SRC_PORT = 1000;                 // Source UDP Port
+const int DST_PORT = 4000;                 // Destination UDP Port
+
+// Transmission settings
+const int BUFFER_SIZE = 1024;        // Packet buffer size
+const int PACKET_DELAY_US = 1000000;   // Delay in microseconds for 1000 Hz (1 ms per packet)
+const bool IS_SERVER = false;        // Set to true if running as a server
+const int THREAD_PRIORITY_OPTION = THREAD_PRIORITY_TIME_CRITICAL;  // Set priority (e.g., NORMAL, HIGH, TIME_CRITICAL)
+//REALTIME_PRIORITY_CLASS (Highest----BUT IT CAN BLOCK KEYBOARD AND MOUSE)
+//THREAD_PRIORITY_TIME_CRITICAL (+15) → Highest priority
+//THREAD_PRIORITY_HIGHEST(+2)
+//THREAD_PRIORITY_ABOVE_NORMAL(+1)
+//THREAD_PRIORITY_NORMAL(0) → Default priority
+//THREAD_PRIORITY_BELOW_NORMAL(-1)
+//THREAD_PRIORITY_LOWEST(-2)
+//THREAD_PRIORITY_IDLE(-15) → Lowest priority
+
+// Global control variables
+volatile bool keepRunning = true;  // Flag to stop the thread safely
+int globalDelay = PACKET_DELAY_US;  // Transmission delay in microseconds
+
+// ========================= FUNCTION TO FETCH SOURCE IP =========================
+void getLocalIP(char* ipBuffer) {
+    char hostname[256];
+    struct addrinfo hints {}, * info, * p;
+    struct sockaddr_in* sockaddr_ipv4;
+
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_PASSIVE;
+
+        if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
+            for (p = info; p != NULL; p = p->ai_next) {
+                sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
+                inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, INET_ADDRSTRLEN);
+                break;
+            }
+            freeaddrinfo(info);
+        }
+    }
+}
+
+// ========================= FUNCTION TO DISPLAY PARAMETERS =========================
+void displayParameters() {
+    std::cout << "========== SYSTEM CONFIGURATION ==========\n";
+    std::cout << "Source IP:         " << SRC_IP << "\n";
+    std::cout << "Destination IP:    " << DST_IP << "\n";
+    std::cout << "Source Port:       " << SRC_PORT << "\n";
+    std::cout << "Destination Port:  " << DST_PORT << "\n";
+    std::cout << "Buffer Size:       " << BUFFER_SIZE << "\n";
+    std::cout << "Packet Delay:      " << globalDelay << " µs (" << 1000000 / globalDelay << " Hz)\n";
+    std::cout << "Is Server:         " << (IS_SERVER ? "True" : "False") << "\n";
+    std::cout << "Thread Priority:   " << THREAD_PRIORITY_OPTION << "\n";
+    std::cout << "===========================================\n";
+}
+
+// ========================= PACKET STRUCTURE =========================
 struct Packet {
     int packetNumber;
     float x, y, z;
@@ -21,9 +85,6 @@ struct Packet {
     int dstPort;
 };
 
-// Global delay control variable
-std::atomic<float> globalDelay(1.0f);
-
 // Function to get current timestamp in a specific format
 void getTimestamp(char* timestamp) {
     time_t now = time(0);
@@ -32,16 +93,53 @@ void getTimestamp(char* timestamp) {
     strftime(timestamp, 64, "%Y-%m-%d %X", &tstruct);
 }
 
-// Haptic data transmission function (High-priority thread)
-void sendHapticData(SOCKET clientSocket, sockaddr_in serverAddr, char* srcIP, char* dstIP, int srcPort, int dstPort) {
+// ========================= HAPTIC DATA SENDER THREAD =========================
+void hapticDataSender() {
+    WSADATA wsaData;
+    SOCKET clientSocket;
+    sockaddr_in serverAddr;
     Packet packet;
-    int packetCount = 0;
-    constexpr int packetSize = sizeof(Packet);
+    int packetNumber = 0;
 
-    // Set thread priority to high
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    // Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        return;
+    }
 
-    while (true) {
+    // Create the UDP socket
+    clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (clientSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return;
+    }
+
+    // Set up the server address
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(DST_PORT);
+    if (inet_pton(AF_INET, DST_IP, &serverAddr.sin_addr) <= 0) {
+        std::cerr << "Invalid destination IP" << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return;
+    }
+
+    // Initialize the haptic device
+    if (dhdOpen() < 0) {
+        std::cerr << "Cannot open haptic device: " << dhdErrorGetLastStr() << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return;
+    }
+
+    std::cout << "Haptic device initialized!" << std::endl;
+
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_OPTION);
+
+    // Sending loop at 1000 Hz
+    while (keepRunning) {
         double hx, hy, hz;
 
         // Get haptic device position
@@ -50,90 +148,52 @@ void sendHapticData(SOCKET clientSocket, sockaddr_in serverAddr, char* srcIP, ch
             break;
         }
 
-        // Set up the packet data
-        packet.packetNumber = ++packetCount;
+        // Fill packet data
+        packet.packetNumber = ++packetNumber;
         packet.x = static_cast<float>(hx);
         packet.y = static_cast<float>(hy);
         packet.z = static_cast<float>(hz);
-        packet.delay = globalDelay.load();
+        packet.delay = 1.0f;
         getTimestamp(packet.timestamp);
-        strcpy_s(packet.srcIP, srcIP);
-        strcpy_s(packet.dstIP, dstIP);
-        packet.srcPort = srcPort;
-        packet.dstPort = dstPort;
+        strcpy_s(packet.srcIP, SRC_IP);
+        strcpy_s(packet.dstIP, DST_IP);
+        packet.srcPort = SRC_PORT;
+        packet.dstPort = DST_PORT;
 
-        // Send the packet to the server
-        int sendResult = sendto(clientSocket, reinterpret_cast<char*>(&packet), packetSize, 0,
+        // Send packet over UDP
+        int sendResult = sendto(clientSocket, reinterpret_cast<char*>(&packet), sizeof(Packet), 0,
             (sockaddr*)&serverAddr, sizeof(serverAddr));
 
         if (sendResult == SOCKET_ERROR) {
-            std::cerr << "Send failed with error: " << WSAGetLastError() << std::endl;
+            std::cerr << "Send failed: " << WSAGetLastError() << std::endl;
         }
 
-        // Enforce 1000 Hz rate (1 ms delay)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-
-int main() {
-    // Configurable parameters
-    char srcIP[] = "127.0.0.1";
-    char dstIP[] = "192.168.168.136";
-    int srcPort = 1000;
-    int dstPort = 4000;
-
-    WSADATA wsaData;
-    SOCKET clientSocket;
-    sockaddr_in serverAddr;
-
-    // Initialize Winsock
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "WSAStartup failed with error: " << WSAGetLastError() << std::endl;
-        return 1;
+        // Enforce 1000 Hz loop rate
+        std::this_thread::sleep_for(std::chrono::microseconds(globalDelay));
     }
 
-    // Create the UDP client socket
-    clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (clientSocket == INVALID_SOCKET) {
-        std::cerr << "Socket creation failed with error: " << WSAGetLastError() << std::endl;
-        WSACleanup();
-        return 1;
-    }
-
-    // Set up the server address structure
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(dstPort);
-    if (inet_pton(AF_INET, dstIP, &serverAddr.sin_addr) <= 0) {
-        std::cerr << "Invalid address or address not supported" << std::endl;
-        closesocket(clientSocket);
-        WSACleanup();
-        return 1;
-    }
-
-    // Initialize the haptic device
-    if (dhdOpen() < 0) {
-        std::cerr << "Error: Cannot open haptic device (" << dhdErrorGetLastStr() << ")" << std::endl;
-        closesocket(clientSocket);
-        WSACleanup();
-        return 1;
-    }
-
-    std::cout << "Haptic device initialized successfully!" << std::endl;
-
-    // Start the high-priority haptic data transmission thread
-    std::thread hapticThread(sendHapticData, clientSocket, serverAddr, srcIP, dstIP, srcPort, dstPort);
-
-    // Wait for user input to terminate
-    std::cout << "Press Enter to stop..." << std::endl;
-    std::cin.get();
-
-    // Clean up
+    // Cleanup
     dhdClose();
     closesocket(clientSocket);
     WSACleanup();
+}
 
-    // Join the thread before exiting
-    hapticThread.join();
+int main() {
+    // Fetch local IP before starting
+    getLocalIP(SRC_IP);
+
+    // Display parameters on console
+    displayParameters();
+
+    // Start the haptic data sender thread
+    std::thread senderThread(hapticDataSender);
+
+    std::cout << "Press Enter to stop..." << std::endl;
+    std::cin.get();
+
+    // Stop the thread and exit
+    keepRunning = false;
+    senderThread.join();
 
     return 0;
 }
