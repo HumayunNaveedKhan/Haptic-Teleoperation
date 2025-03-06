@@ -2,24 +2,24 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <vector>
-#include <fstream>
-#include <string>
-#include <sstream>
 #include <thread>
 #include <chrono>
 #include <mutex>
-#include <windows.h>
 #include <cmath>
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\external\glew\include\GL\glew.h>
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\freeglut\include\GL\freeglut.h>
 #include "G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\src\chai3d.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
 #define SERVER_PORT 4000
 #define BUFFER_SIZE 1024
-using namespace chai3d;
+
 std::mutex data_mutex;
 double force_feedback = 0.0;
 bool running = true;
+std::vector<double> dataPoints;
+using namespace chai3d;
 
 cHapticDeviceHandler* handler;
 cGenericHapticDevicePtr hapticDevice;
@@ -69,13 +69,57 @@ void receive_data(SOCKET sock)
         {
             buffer[bytesReceived] = '\0';
             std::lock_guard<std::mutex> lock(data_mutex);
-            force_feedback = atof(buffer);
-            std::cout << "Received Force Feedback: " << force_feedback << "\n";
+
+            double x, y, z;
+            sscanf(buffer, "%lf %lf %lf", &x, &y, &z);
+            force_feedback = sqrt(x * x + y * y + z * z);
+
+            std::cout << "Received: X=" << x << " Y=" << y << " Z=" << z << " | Magnitude=" << force_feedback << "\n";
+
+            dataPoints.push_back(force_feedback);
+            if (dataPoints.size() > 50) dataPoints.erase(dataPoints.begin());
+            glutPostRedisplay();
         }
     }
 }
 
-int main()
+void display()
+{
+    glClear(GL_COLOR_BUFFER_BIT);
+    glColor3f(1.0, 1.0, 1.0);
+    glBegin(GL_LINES);
+    glVertex2f(-1.0, -0.9);
+    glVertex2f(1.0, -0.9);
+    glEnd();
+
+    glColor3f(0.0, 1.0, 0.0);
+    float xStep = 2.0 / 50;
+    for (size_t i = 0; i < dataPoints.size(); ++i)
+    {
+        float x = -1.0 + i * xStep;
+        float barHeight = dataPoints[i] / 10.0;
+        glBegin(GL_QUADS);
+        glVertex2f(x, -0.9);
+        glVertex2f(x + xStep * 0.8, -0.9);
+        glVertex2f(x + xStep * 0.8, -0.9 + barHeight);
+        glVertex2f(x, -0.9 + barHeight);
+        glEnd();
+    }
+    glutSwapBuffers();
+}
+
+void initializeGraphics(int argc, char** argv)
+{
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(800, 600);
+    glutCreateWindow("Haptic Data Visualization");
+    glClearColor(0.0, 0.0, 0.0, 1.0);
+    glutDisplayFunc(display);
+    glutMainLoop();
+}
+
+int main(int argc, char** argv)
 {
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
@@ -110,13 +154,11 @@ int main()
     std::thread receiver(receive_data, sock);
     std::thread hapticThread(hapticFeedbackLoop);
 
-    receiver.detach();
-    hapticThread.detach();
+    initializeGraphics(argc, argv);
 
-    while (running)
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
+    running = false;
+    receiver.join();
+    hapticThread.join();
 
     hapticDevice->close();
     delete handler;
