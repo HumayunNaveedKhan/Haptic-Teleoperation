@@ -1,0 +1,113 @@
+#include <iostream>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <vector>
+#include <fstream>
+#include <string>
+#include <sstream>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <windows.h>
+#include <cmath>
+#include "G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\src\chai3d.h"
+
+#pragma comment(lib, "ws2_32.lib")
+
+#define SERVER_PORT 4000
+#define BUFFER_SIZE 1024
+
+std::mutex data_mutex;
+double force_feedback = 0.0;
+bool running = true;
+using namespace chai3d;
+cHapticDeviceHandler* handler;
+cGenericHapticDevicePtr hapticDevice;
+
+void initializeHapticDevice()
+{
+    handler = new cHapticDeviceHandler();
+    handler->getDevice(hapticDevice, 0);
+    if (hapticDevice)
+    {
+        hapticDevice->open();
+        hapticDevice->calibrate();
+    }
+    else
+    {
+        std::cerr << "No haptic device found!" << std::endl;
+        exit(1);
+    }
+}
+
+void receive_data(SOCKET sock)
+{
+    char buffer[BUFFER_SIZE];
+    sockaddr_in senderAddr;
+    int senderAddrSize = sizeof(senderAddr);
+
+    while (running)
+    {
+        int bytesReceived = recvfrom(sock, buffer, BUFFER_SIZE, 0, (sockaddr*)&senderAddr, &senderAddrSize);
+        if (bytesReceived > 0)
+        {
+            buffer[bytesReceived] = '\0';
+            std::lock_guard<std::mutex> lock(data_mutex);
+            force_feedback = atof(buffer);
+            std::cout << "Received Force Feedback: " << force_feedback << "\n";
+
+            if (hapticDevice)
+            {
+                cVector3d force(0.0, 0.0, force_feedback);
+                hapticDevice->setForce(force);
+            }
+        }
+    }
+}
+
+int main()
+{
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        std::cerr << "WSAStartup failed!\n";
+        return 1;
+    }
+
+    initializeHapticDevice();
+
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == INVALID_SOCKET)
+    {
+        std::cerr << "Socket creation failed!\n";
+        WSACleanup();
+        return 1;
+    }
+
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(SERVER_PORT);
+
+    if (bind(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
+    {
+        std::cerr << "Bind failed!\n";
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    std::thread receiver(receive_data, sock);
+    receiver.detach();
+
+    while (running)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    hapticDevice->close();
+    delete handler;
+    closesocket(sock);
+    WSACleanup();
+    return 0;
+}
