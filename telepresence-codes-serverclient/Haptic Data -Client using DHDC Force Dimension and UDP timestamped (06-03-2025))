@@ -15,7 +15,7 @@
 
 // Network settings
 char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";  // Will be fetched dynamically
-const char DST_IP[] = "192.168.19.136";   // Destination IP (Receiver)
+const char DST_IP[] = "192.168.121.136";   // Destination IP (Receiver)
 const int SRC_PORT = 1000;                 // Source UDP Port
 const int DST_PORT = 4000;                 // Destination UDP Port
 
@@ -153,7 +153,7 @@ void hapticDataSender() {
         packet.x = static_cast<float>(hx);
         packet.y = static_cast<float>(hy);
         packet.z = static_cast<float>(hz);
-        packet.delay = 1.0f;
+        packet.delay = PACKET_DELAY_US/1000;
         getTimestamp(packet.timestamp);
         strcpy_s(packet.srcIP, SRC_IP);
         strcpy_s(packet.dstIP, DST_IP);
