@@ -16,11 +16,11 @@
 
 #define SERVER_PORT 4000
 #define BUFFER_SIZE 1024
-
+using namespace chai3d;
 std::mutex data_mutex;
 double force_feedback = 0.0;
 bool running = true;
-using namespace chai3d;
+
 cHapticDeviceHandler* handler;
 cGenericHapticDevicePtr hapticDevice;
 
@@ -40,6 +40,22 @@ void initializeHapticDevice()
     }
 }
 
+void hapticFeedbackLoop()
+{
+    while (running)
+    {
+        {
+            std::lock_guard<std::mutex> lock(data_mutex);
+            if (hapticDevice)
+            {
+                cVector3d force(0.0, 0.0, force_feedback);
+                hapticDevice->setForce(force);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 void receive_data(SOCKET sock)
 {
     char buffer[BUFFER_SIZE];
@@ -55,12 +71,6 @@ void receive_data(SOCKET sock)
             std::lock_guard<std::mutex> lock(data_mutex);
             force_feedback = atof(buffer);
             std::cout << "Received Force Feedback: " << force_feedback << "\n";
-
-            if (hapticDevice)
-            {
-                cVector3d force(0.0, 0.0, force_feedback);
-                hapticDevice->setForce(force);
-            }
         }
     }
 }
@@ -98,7 +108,10 @@ int main()
     }
 
     std::thread receiver(receive_data, sock);
+    std::thread hapticThread(hapticFeedbackLoop);
+
     receiver.detach();
+    hapticThread.detach();
 
     while (running)
     {
