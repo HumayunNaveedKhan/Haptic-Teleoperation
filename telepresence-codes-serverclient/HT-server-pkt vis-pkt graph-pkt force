@@ -1,0 +1,164 @@
+#include <iostream>
+#include <deque>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <cmath>
+#include <string>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <GL/glut.h>
+
+#pragma comment(lib, "ws2_32.lib") // Link Winsock library
+
+#define PORT 4000
+#define MAX_PACKETS 5000  // Store last 5000 packets
+
+std::mutex dataMutex;
+std::deque<float> packetMagnitudes;
+std::deque<std::string> packetTimestamps;
+int receivedPackets = 0, lostPackets = 0, lastSequenceNumber = -1;
+float zoomFactor = 1.0f;
+
+struct Packet {
+    int sequenceNumber;
+    float x, y, z;
+    float delay;
+    char timestamp[32];
+};
+
+// ✅ **UDP Receiver Thread (Uses Winsock)**
+void udpReceiver() {
+    WSADATA wsaData;
+    SOCKET sockfd;
+    struct sockaddr_in servaddr, cliaddr;
+    int cliLen = sizeof(cliaddr);
+
+    // Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "[ERROR] WSAStartup failed!\n";
+        return;
+    }
+
+    // Create UDP socket
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd == INVALID_SOCKET) {
+        std::cerr << "[ERROR] Socket creation failed: " << WSAGetLastError() << "\n";
+        WSACleanup();
+        return;
+    }
+
+    // Configure server address
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+    servaddr.sin_port = htons(PORT);
+
+    // Bind socket
+    if (bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) == SOCKET_ERROR) {
+        std::cerr << "[ERROR] Bind failed: " << WSAGetLastError() << "\n";
+        closesocket(sockfd);
+        WSACleanup();
+        return;
+    }
+
+    while (true) {
+        Packet packet;
+        int n = recvfrom(sockfd, (char*)&packet, sizeof(packet), 0, (struct sockaddr*)&cliaddr, &cliLen);
+        if (n > 0) {
+            std::lock_guard<std::mutex> lock(dataMutex);
+
+            // Compute packet magnitude
+            float magnitude = sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
+
+            // ✅ **Packet Loss Detection**
+            if (lastSequenceNumber != -1 && packet.sequenceNumber != lastSequenceNumber + 1) {
+                lostPackets += (packet.sequenceNumber - lastSequenceNumber - 1);
+                std::cout << "[WARNING] Packet Loss: " << lostPackets << " packets lost so far.\n";
+            }
+            lastSequenceNumber = packet.sequenceNumber;
+
+            // Store Data
+            packetMagnitudes.push_back(magnitude);
+            packetTimestamps.push_back(std::string(packet.timestamp));
+            receivedPackets++;
+
+            // Maintain a fixed-size buffer
+            if (packetMagnitudes.size() > MAX_PACKETS) {
+                packetMagnitudes.pop_front();
+                packetTimestamps.pop_front();
+            }
+        }
+    }
+
+    // Cleanup
+    closesocket(sockfd);
+    WSACleanup();
+}
+
+// ✅ **OpenGL Display Function**
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLoadIdentity();
+    glScalef(zoomFactor, zoomFactor, 1.0f);
+
+    std::lock_guard<std::mutex> lock(dataMutex);
+
+    // Draw Packet Magnitude Graph
+    glColor3f(0.0, 1.0, 0.0);
+    glBegin(GL_LINE_STRIP);
+    for (size_t i = 0; i < packetMagnitudes.size(); i++) {
+        float x = (i / (float)MAX_PACKETS) * 2.0f - 1.0f;
+        float y = (packetMagnitudes[i] / 100.0f) * 2.0f - 1.0f;
+        glVertex2f(x, y);
+    }
+    glEnd();
+
+    // Display Stats
+    glColor3f(1.0, 1.0, 1.0);
+    glRasterPos2f(-0.9f, 0.9f);
+    std::string stats = "Packets: " + std::to_string(receivedPackets) + " | Lost: " + std::to_string(lostPackets);
+    for (char c : stats) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, c);
+
+    glutSwapBuffers();
+}
+
+// ✅ **OpenGL Reshape Function**
+void reshape(int w, int h) {
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(-1, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+}
+
+// ✅ **OpenGL Keyboard Input**
+void keyboard(unsigned char key, int, int) {
+    if (key == '+') zoomFactor *= 1.1f;
+    if (key == '-') zoomFactor /= 1.1f;
+    glutPostRedisplay();
+}
+
+// ✅ **Timer Function for Refresh**
+void timer(int) {
+    glutPostRedisplay();
+    glutTimerFunc(33, timer, 0); // ~30 FPS
+}
+
+// ✅ **Main Function (Windows-Compatible)**
+int main(int argc, char** argv) {
+    std::thread udpThread(udpReceiver); // Start UDP Receiver
+
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(800, 600);
+    glutCreateWindow("UDP Packet Visualizer");
+    glutDisplayFunc(display);
+    glutReshapeFunc(reshape);
+    glutKeyboardFunc(keyboard);
+    glutTimerFunc(33, timer, 0);
+    glutMainLoop();
+
+    udpThread.join();
+    return 0;
+}
