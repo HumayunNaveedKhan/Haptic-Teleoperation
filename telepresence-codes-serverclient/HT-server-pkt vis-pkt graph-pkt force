@@ -1,3 +1,5 @@
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\external\glew\include\GL\glew.h>  // GLEW should be included before any OpenGL headers
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\extras\freeglut\include\GL\glut.h>  // OpenGL Utility Toolkit
 #include <iostream>
 #include <deque>
 #include <vector>
@@ -5,22 +7,32 @@
 #include <mutex>
 #include <chrono>
 #include <cmath>
-#include <string>
+#include <cstring>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <GL/glut.h>
+#include "G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\src\chai3d.h"
 
 #pragma comment(lib, "ws2_32.lib") // Link Winsock library
 
 #define PORT 4000
 #define MAX_PACKETS 5000  // Store last 5000 packets
+using namespace chai3d;
 
 std::mutex dataMutex;
 std::deque<float> packetMagnitudes;
 std::deque<std::string> packetTimestamps;
 int receivedPackets = 0, lostPackets = 0, lastSequenceNumber = -1;
 float zoomFactor = 1.0f;
+bool running = true;
 
+// Chai3D variables
+chai3d::cWorld* world;
+chai3d::cCamera* camera;
+chai3d::cShapeSphere* hapticCursor;
+chai3d::cVector3d toolPos(0.0, 0.0, 0.0);
+cSpotLight* light;
+
+// UDP packet structure
 struct Packet {
     int sequenceNumber;
     float x, y, z;
@@ -28,20 +40,18 @@ struct Packet {
     char timestamp[32];
 };
 
-// ✅ **UDP Receiver Thread (Uses Winsock)**
+// ✅ **UDP Receiver Thread**
 void udpReceiver() {
     WSADATA wsaData;
     SOCKET sockfd;
     struct sockaddr_in servaddr, cliaddr;
     int cliLen = sizeof(cliaddr);
 
-    // Initialize Winsock
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         std::cerr << "[ERROR] WSAStartup failed!\n";
         return;
     }
 
-    // Create UDP socket
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd == INVALID_SOCKET) {
         std::cerr << "[ERROR] Socket creation failed: " << WSAGetLastError() << "\n";
@@ -49,12 +59,10 @@ void udpReceiver() {
         return;
     }
 
-    // Configure server address
     servaddr.sin_family = AF_INET;
     servaddr.sin_addr.s_addr = INADDR_ANY;
     servaddr.sin_port = htons(PORT);
 
-    // Bind socket
     if (bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) == SOCKET_ERROR) {
         std::cerr << "[ERROR] Bind failed: " << WSAGetLastError() << "\n";
         closesocket(sockfd);
@@ -62,41 +70,51 @@ void udpReceiver() {
         return;
     }
 
-    while (true) {
+    std::cout << "[INFO] UDP server listening on port " << PORT << "...\n";
+
+    while (running) {
         Packet packet;
         int n = recvfrom(sockfd, (char*)&packet, sizeof(packet), 0, (struct sockaddr*)&cliaddr, &cliLen);
         if (n > 0) {
             std::lock_guard<std::mutex> lock(dataMutex);
 
-            // Compute packet magnitude
+            // ✅ Print received data for debugging
+            std::cout << "[RECEIVED] Seq: " << packet.sequenceNumber
+                << " | X: " << packet.x
+                << " | Y: " << packet.y
+                << " | Z: " << packet.z
+                << " | Delay: " << packet.delay
+                << " | Timestamp: " << packet.timestamp << "\n";
+
             float magnitude = sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
 
-            // ✅ **Packet Loss Detection**
             if (lastSequenceNumber != -1 && packet.sequenceNumber != lastSequenceNumber + 1) {
                 lostPackets += (packet.sequenceNumber - lastSequenceNumber - 1);
-                std::cout << "[WARNING] Packet Loss: " << lostPackets << " packets lost so far.\n";
             }
             lastSequenceNumber = packet.sequenceNumber;
 
-            // Store Data
             packetMagnitudes.push_back(magnitude);
             packetTimestamps.push_back(std::string(packet.timestamp));
             receivedPackets++;
 
-            // Maintain a fixed-size buffer
+            toolPos = chai3d::cVector3d(packet.x, packet.y, packet.z);
+
             if (packetMagnitudes.size() > MAX_PACKETS) {
                 packetMagnitudes.pop_front();
                 packetTimestamps.pop_front();
             }
         }
+        else {
+            std::cerr << "[WARNING] No data received. Error: " << WSAGetLastError() << "\n";
+        }
     }
 
-    // Cleanup
     closesocket(sockfd);
     WSACleanup();
 }
 
-// ✅ **OpenGL Display Function**
+
+// ✅ **OpenGL Display Function (Packet Graph)**
 void display() {
     glClear(GL_COLOR_BUFFER_BIT);
     glLoadIdentity();
@@ -104,7 +122,6 @@ void display() {
 
     std::lock_guard<std::mutex> lock(dataMutex);
 
-    // Draw Packet Magnitude Graph
     glColor3f(0.0, 1.0, 0.0);
     glBegin(GL_LINE_STRIP);
     for (size_t i = 0; i < packetMagnitudes.size(); i++) {
@@ -114,7 +131,6 @@ void display() {
     }
     glEnd();
 
-    // Display Stats
     glColor3f(1.0, 1.0, 1.0);
     glRasterPos2f(-0.9f, 0.9f);
     std::string stats = "Packets: " + std::to_string(receivedPackets) + " | Lost: " + std::to_string(lostPackets);
@@ -132,33 +148,61 @@ void reshape(int w, int h) {
     glMatrixMode(GL_MODELVIEW);
 }
 
-// ✅ **OpenGL Keyboard Input**
-void keyboard(unsigned char key, int, int) {
-    if (key == '+') zoomFactor *= 1.1f;
-    if (key == '-') zoomFactor /= 1.1f;
-    glutPostRedisplay();
-}
-
-// ✅ **Timer Function for Refresh**
+// ✅ **OpenGL Timer Function for Refresh**
 void timer(int) {
     glutPostRedisplay();
-    glutTimerFunc(33, timer, 0); // ~30 FPS
+    glutTimerFunc(33, timer, 0);
 }
 
-// ✅ **Main Function (Windows-Compatible)**
+// ✅ **Chai3D Render Function**
+void chaiRender() {
+    while (running) {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        hapticCursor->setLocalPos(toolPos);
+        world->computeGlobalPositions();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// ✅ **Initialize Chai3D Scene**
+void initChai3D() {
+    world = new chai3d::cWorld();
+    camera = new chai3d::cCamera(world);
+    world->addChild(camera);
+    camera->set(chai3d::cVector3d(0.0, 0.0, 2.0), chai3d::cVector3d(0.0, 0.0, 0.0), chai3d::cVector3d(0.0, 1.0, 0.0));
+
+    light = new cSpotLight(world);
+    camera->addChild(light);
+    light->setEnabled(true);
+
+    hapticCursor = new chai3d::cShapeSphere(0.05);
+    world->addChild(hapticCursor);
+    hapticCursor->setLocalPos(0.0, 0.0, 0.0);
+}
+
+// ✅ **Main Function**
 int main(int argc, char** argv) {
-    std::thread udpThread(udpReceiver); // Start UDP Receiver
+    std::thread udpThread(udpReceiver);
 
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInitWindowSize(800, 600);
-    glutCreateWindow("UDP Packet Visualizer");
+    glutCreateWindow("UDP Packet Graph");
+
+    glewInit();  // Initialize GLEW after creating the OpenGL context
+
     glutDisplayFunc(display);
     glutReshapeFunc(reshape);
-    glutKeyboardFunc(keyboard);
     glutTimerFunc(33, timer, 0);
+
+    initChai3D();
+    std::thread chaiThread(chaiRender);
+
     glutMainLoop();
 
+    running = false;  // Stop threads gracefully
     udpThread.join();
+    chaiThread.join();
+
     return 0;
 }
