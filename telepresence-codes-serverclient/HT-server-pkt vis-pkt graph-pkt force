@@ -8,201 +8,601 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\src\chai3d.h"
 
 #pragma comment(lib, "ws2_32.lib") // Link Winsock library
 
-#define PORT 4000
-#define MAX_PACKETS 5000  // Store last 5000 packets
-using namespace chai3d;
-
-std::mutex dataMutex;
-std::deque<float> packetMagnitudes;
-std::deque<std::string> packetTimestamps;
-int receivedPackets = 0, lostPackets = 0, lastSequenceNumber = -1;
-float zoomFactor = 1.0f;
-bool running = true;
-
-// Chai3D variables
+#define UDP_PORT 4000
+#define MAX_PACKET_SIZE 400
+#define MAX_BUFFER_SIZE 1000  // Buffer size to hold 1000 packets
+std::ostringstream ss;
+//------------------------------------------------------------------------------
+// CHAI3D GLOBALS
+//------------------------------------------------------------------------------
+// a world that contains all objects of the virtual environment
 chai3d::cWorld* world;
-chai3d::cCamera* camera;
-chai3d::cShapeSphere* hapticCursor;
-chai3d::cVector3d toolPos(0.0, 0.0, 0.0);
-cSpotLight* light;
 
-// UDP packet structure
+// a camera to render the world in the window display
+chai3d::cCamera* camera;
+
+// a light source to illuminate the objects in the world
+chai3d::cDirectionalLight* light;
+
+// a haptic device handler
+chai3d::cHapticDeviceHandler* handler;
+
+// a pointer to the current haptic device
+chai3d::cGenericHapticDevicePtr hapticDevice;
+
+// a virtual tool representing the haptic device in the scene
+chai3d::cToolCursor* tool;
+
+// a font for rendering text
+chai3d::cFontPtr font;
+
+// a label to display the rate [Hz] at which the simulation is running
+chai3d::cLabel* labelRates;
+
+// a label to display packet information
+chai3d::cLabel* labelPacketInfo;
+
+// a flag to indicate if the haptic simulation currently running
+bool simulationRunning = false;
+
+// a flag to indicate if the haptic simulation has terminated
+bool simulationFinished = false;
+
+// display size of the window
+int displayW = 8000;
+int displayH = 6000;
+
+// haptic thread frequency counter
+double hapticFrequency = 0.0;
+int hapticFrequencyCounter = 0;
+chai3d::cPrecisionClock hapticFrequencyClock;
+
+// graphic thread frequency counter
+double graphicFrequency = 0.0;
+int graphicFrequencyCounter = 0;
+chai3d::cPrecisionClock graphicFrequencyClock;
+
+
+// update rate for haptic rendering
+double hapticRate = 1000.0;
+
+// visualization objects
+std::vector<chai3d::cShapeSphere*> packetSpheres;
+const int MAX_VISIBLE_PACKETS = 100;
+const double PACKET_SPHERE_RADIUS = 0.02;
+
+//------------------------------------------------------------------------------
+// PACKET STRUCTURE & GLOBALS
+//------------------------------------------------------------------------------
+// Common Packet Structure
 struct Packet {
-    int sequenceNumber;
-    float x, y, z;
-    float delay;
-    char timestamp[32];
+    int packetNumber;  // Sequential packet number
+    float x, y, z;     // 3D Vector components
+    float delay;       // Processing delay in milliseconds
+    char timestamp[64];  // Timestamp of packet creation
+    char srcIP[INET_ADDRSTRLEN]; // Source IP address
+    char dstIP[INET_ADDRSTRLEN]; // Destination IP address
+    int srcPort;       // Source port
+    int dstPort;       // Destination port
 };
 
-// ✅ **UDP Receiver Thread**
-void udpReceiver() {
-    WSADATA wsaData;
-    SOCKET sockfd;
-    struct sockaddr_in servaddr, cliaddr;
-    int cliLen = sizeof(cliaddr);
+std::deque<Packet> receivedPackets;  // Use deque for FIFO handling
+std::mutex dataMutex;
 
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "[ERROR] WSAStartup failed!\n";
+// Control Parameters
+const int bufferSize = MAX_BUFFER_SIZE;
+const int udpPort = UDP_PORT;
+const float packetScale = 0.1f;  // Scaling factor for packet magnitude
+
+//------------------------------------------------------------------------------
+// DECLARED FUNCTIONS
+//------------------------------------------------------------------------------
+
+// Function to initialize CHAI3D world and objects
+void initializeWorld();
+
+// Function to handle window resize
+void resizeWindow(int w, int h);
+
+// Function to render scene
+void updateGraphics(void);
+
+// Function to handle key press
+void keySelect(unsigned char key, int x, int y);
+
+// Function for haptic rendering
+void updateHaptics(void);
+
+// Function to close the application
+void close(void);
+
+// UDP server thread for receiving packets
+void udpServer();
+
+// Function to create a packet visualization sphere
+chai3d::cShapeSphere* createPacketSphere(const Packet& packet);
+
+// Function to update packet visualization
+void updatePacketVisualization();
+
+//------------------------------------------------------------------------------
+// UDP SERVER IMPLEMENTATION
+//------------------------------------------------------------------------------
+void udpServer() {
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
         return;
     }
 
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd == INVALID_SOCKET) {
-        std::cerr << "[ERROR] Socket creation failed: " << WSAGetLastError() << "\n";
-        WSACleanup();
+    sockaddr_in serverAddr = {};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(udpPort);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(udpSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "Socket binding failed: " << WSAGetLastError() << std::endl;
+        closesocket(udpSocket);
         return;
     }
 
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(PORT);
+    sockaddr_in clientAddr = {};
+    int clientAddrLen = sizeof(clientAddr);
+    Packet packet;
 
-    if (bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) == SOCKET_ERROR) {
-        std::cerr << "[ERROR] Bind failed: " << WSAGetLastError() << "\n";
-        closesocket(sockfd);
-        WSACleanup();
-        return;
-    }
+    while (simulationRunning) {
+        int bytesReceived = recvfrom(udpSocket, reinterpret_cast<char*>(&packet), sizeof(packet), 0,
+            reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
 
-    std::cout << "[INFO] UDP server listening on port " << PORT << "...\n";
+        if (bytesReceived > 0 && bytesReceived <= MAX_PACKET_SIZE) {
+            inet_ntop(AF_INET, &clientAddr.sin_addr, packet.srcIP, INET_ADDRSTRLEN);
+            inet_ntop(AF_INET, &serverAddr.sin_addr, packet.dstIP, INET_ADDRSTRLEN);
+            packet.srcPort = ntohs(clientAddr.sin_port);
+            packet.dstPort = ntohs(serverAddr.sin_port);
 
-    while (running) {
-        Packet packet;
-        int n = recvfrom(sockfd, (char*)&packet, sizeof(packet), 0, (struct sockaddr*)&cliaddr, &cliLen);
-        if (n > 0) {
+            // Print packet details in a single line
+            std::cout << "Pkt #" << packet.packetNumber << " | "
+                << "Pos: (" << packet.x << ", " << packet.y << ", " << packet.z << ") | "
+                << "Delay: " << packet.delay << " ms | "
+                << "Timestamp: " << packet.timestamp << " | "
+                << "Src: " << packet.srcIP << ":" << packet.srcPort << " -> "
+                << "Dst: " << packet.dstIP << ":" << packet.dstPort << std::endl;
+
+            // Add packet to deque for visualization
             std::lock_guard<std::mutex> lock(dataMutex);
-
-            // ✅ Print received data for debugging
-            std::cout << "[RECEIVED] Seq: " << packet.sequenceNumber
-                << " | X: " << packet.x
-                << " | Y: " << packet.y
-                << " | Z: " << packet.z
-                << " | Delay: " << packet.delay
-                << " | Timestamp: " << packet.timestamp << "\n";
-
-            float magnitude = sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
-
-            if (lastSequenceNumber != -1 && packet.sequenceNumber != lastSequenceNumber + 1) {
-                lostPackets += (packet.sequenceNumber - lastSequenceNumber - 1);
+            receivedPackets.push_back(packet);
+            if (receivedPackets.size() > bufferSize) {
+                receivedPackets.pop_front();
             }
-            lastSequenceNumber = packet.sequenceNumber;
-
-            packetMagnitudes.push_back(magnitude);
-            packetTimestamps.push_back(std::string(packet.timestamp));
-            receivedPackets++;
-
-            toolPos = chai3d::cVector3d(packet.x, packet.y, packet.z);
-
-            if (packetMagnitudes.size() > MAX_PACKETS) {
-                packetMagnitudes.pop_front();
-                packetTimestamps.pop_front();
-            }
-        }
-        else {
-            std::cerr << "[WARNING] No data received. Error: " << WSAGetLastError() << "\n";
         }
     }
 
-    closesocket(sockfd);
-    WSACleanup();
+    closesocket(udpSocket);
 }
 
+//------------------------------------------------------------------------------
+// VISUALIZATION FUNCTIONS
+//------------------------------------------------------------------------------
+chai3d::cShapeSphere* createPacketSphere(const Packet& packet) {
+    // Create a new sphere for the packet
+    chai3d::cShapeSphere* sphere = new chai3d::cShapeSphere(PACKET_SPHERE_RADIUS);
 
-// ✅ **OpenGL Display Function (Packet Graph)**
-void display() {
-    glClear(GL_COLOR_BUFFER_BIT);
-    glLoadIdentity();
-    glScalef(zoomFactor, zoomFactor, 1.0f);
+    // Set position based on packet data (scaled)
+    sphere->setLocalPos(packet.x * packetScale, packet.y * packetScale, packet.z * packetScale);
 
+    // Color based on packet number (create a rainbow effect)
+    double hue = fmod(packet.packetNumber * 0.01, 1.0);
+    chai3d::cColorf color;
+    //color(1.0, 1.0, 1.0);
+    sphere->m_material->setColor(color);
+
+    // Set transparency based on age (older packets are more transparent)
+    sphere->m_material->setTransparencyLevel(0.7);
+
+    return sphere;
+}
+
+void updatePacketVisualization() {
     std::lock_guard<std::mutex> lock(dataMutex);
 
-    glColor3f(0.0, 1.0, 0.0);
-    glBegin(GL_LINE_STRIP);
-    for (size_t i = 0; i < packetMagnitudes.size(); i++) {
-        float x = (i / (float)MAX_PACKETS) * 2.0f - 1.0f;
-        float y = (packetMagnitudes[i] / 100.0f) * 2.0f - 1.0f;
-        glVertex2f(x, y);
+    // Remove old packet spheres if we have too many
+    while (packetSpheres.size() > MAX_VISIBLE_PACKETS) {
+        if (packetSpheres[0] != nullptr) {
+            world->removeChild(packetSpheres[0]);
+            delete packetSpheres[0];
+        }
+        packetSpheres.erase(packetSpheres.begin());
     }
-    glEnd();
 
-    glColor3f(1.0, 1.0, 1.0);
-    glRasterPos2f(-0.9f, 0.9f);
-    std::string stats = "Packets: " + std::to_string(receivedPackets) + " | Lost: " + std::to_string(lostPackets);
-    for (char c : stats) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, c);
+    // Add any new packets that have been received
+    while (packetSpheres.size() < std::min(static_cast<size_t>(MAX_VISIBLE_PACKETS), receivedPackets.size())) {
+        size_t index = receivedPackets.size() - packetSpheres.size() - 1;
+        chai3d::cShapeSphere* sphere = createPacketSphere(receivedPackets[index]);
+        world->addChild(sphere);
+        packetSpheres.push_back(sphere);
+    }
 
-    glutSwapBuffers();
-}
-
-// ✅ **OpenGL Reshape Function**
-void reshape(int w, int h) {
-    glViewport(0, 0, w, h);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    gluOrtho2D(-1, 1, -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-}
-
-// ✅ **OpenGL Timer Function for Refresh**
-void timer(int) {
-    glutPostRedisplay();
-    glutTimerFunc(33, timer, 0);
-}
-
-// ✅ **Chai3D Render Function**
-void chaiRender() {
-    while (running) {
-        std::lock_guard<std::mutex> lock(dataMutex);
-        hapticCursor->setLocalPos(toolPos);
-        world->computeGlobalPositions();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Update packet info label with latest packet data
+    if (!receivedPackets.empty()) {
+        const Packet& packet = receivedPackets.back();
+        std::stringstream ss;
+        ss << "Packet #" << packet.packetNumber
+            << " | Pos: (" << packet.x << ", " << packet.y << ", " << packet.z << ")"
+            << " | Delay: " << packet.delay << " ms"
+            << " | " << packet.srcIP << ":" << packet.srcPort
+            << " -> " << packet.dstIP << ":" << packet.dstPort;
+        labelPacketInfo->setText(ss.str());
     }
 }
 
-// ✅ **Initialize Chai3D Scene**
-void initChai3D() {
+//------------------------------------------------------------------------------
+// CHAI3D FUNCTIONS
+//------------------------------------------------------------------------------
+void initializeWorld() {
+    // Create a new world
     world = new chai3d::cWorld();
+
+    // Set background color
+    world->m_backgroundColor.setBlack();
+
+    // Create a camera and insert it into the virtual world
     camera = new chai3d::cCamera(world);
-    world->addChild(camera);
-    camera->set(chai3d::cVector3d(0.0, 0.0, 2.0), chai3d::cVector3d(0.0, 0.0, 0.0), chai3d::cVector3d(0.0, 1.0, 0.0));
 
-    light = new cSpotLight(world);
-    camera->addChild(light);
-    light->setEnabled(true);
+    // Set the camera position
+    camera->set(chai3d::cVector3d(0.0, 0.0, 0.5),    // Camera position
+        chai3d::cVector3d(0.0, 0.0, 0.0),     // Look at position
+        chai3d::cVector3d(0.0, 1.0, 0.0));    // Up direction vector
 
-    hapticCursor = new chai3d::cShapeSphere(0.05);
-    world->addChild(hapticCursor);
-    hapticCursor->setLocalPos(0.0, 0.0, 0.0);
+    // Set the near and far clipping planes
+    camera->setClippingPlanes(0.01, 10.0);
+
+    // Set field of view
+    camera->setFieldViewAngleDeg(45);
+
+    // Optional: set camera properties as needed
+    camera->setUseMultipassTransparency(true);
+
+    // If you're using a cWorld object, add the camera to it
+    if (world != nullptr) {
+        world->addChild(camera);
+
+        // Create a light source and attach it to the camera
+        light = new chai3d::cDirectionalLight(world);
+        world->addChild(light);
+
+        // Enable light source
+        light->setEnabled(true);
+
+        // Define the direction of the light beam
+        light->setDir(-1.0, 0.0, -0.4);
+
+        // Create a font
+        font = chai3d::NEW_CFONTCALIBRI20();
+
+        // Create a label to display the haptic and graphic rate
+        labelRates = new chai3d::cLabel(font);
+        camera->m_frontLayer->addChild(labelRates);
+
+        // Create a label for packet information
+        labelPacketInfo = new chai3d::cLabel(font);
+        labelPacketInfo->setLocalPos(10, 30, 0);
+        camera->m_frontLayer->addChild(labelPacketInfo);
+
+        // Create a ground plane
+        chai3d::cMesh* ground = new chai3d::cMesh();
+        world->addChild(ground);
+
+        // Create plane
+        chai3d::cCreatePlane(ground, 1.0, 1.0),
+            chai3d::cVector3d(0.0, 0.0, 0.0),
+            chai3d::cVector3d(0.0, 0.0, 1.0);
+
+        // Create some texture
+        chai3d::cTexture2dPtr texture = chai3d::cTexture2d::create();
+        bool fileLoaded = texture->loadFromFile("G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\bin\resources\images\canvas.jpg");
+        if (!fileLoaded) {
+            std::cout << "Warning: Failed to load texture file!" << std::endl;
+            ground->m_material->setBlue();
+        }
+        else {
+            ground->setTexture(texture);
+            ground->setUseTexture(true);
+            ground->m_material->setWhite();
+        }
+
+        // Create display axes
+        chai3d::cMesh* axes = new chai3d::cMesh();
+        world->addChild(axes);
+
+        // X axis (red)
+        chai3d::cCreateArrow(axes, 0.3, 0.003, 0.02, 0.05),
+            chai3d::cVector3d(0, 0, 0),
+            chai3d::cVector3d(0.3, 0, 0),
+            chai3d::cColorf(1, 0, 0);
+
+        // Y axis (green)
+        chai3d::cCreateArrow(axes, 0.3, 0.003, 0.02, 0.05),
+            chai3d::cVector3d(0, 0, 0),
+            chai3d::cVector3d(0, 0.3, 0),
+            chai3d::cColorf(0, 1, 0);
+
+        // Z axis (blue)
+        chai3d::cCreateArrow(axes, 0.3, 0.003, 0.02, 0.05),
+            chai3d::cVector3d(0, 0, 0),
+            chai3d::cVector3d(0, 0, 0.3),
+            chai3d::cColorf(0, 0, 1);
+
+        // Create haptic device handler
+        handler = new chai3d::cHapticDeviceHandler();
+
+        // Get access to the first available haptic device
+        handler->getDevice(hapticDevice, 0);
+
+        // Retrieve information about the haptic device
+        chai3d::cHapticDeviceInfo hapticDeviceInfo = hapticDevice->getSpecifications();
+
+        // Create a tool (cursor) and insert into the world
+        tool = new chai3d::cToolCursor(world);
+        world->addChild(tool);
+
+        // Connect the haptic device to the virtual tool
+        tool->setHapticDevice(hapticDevice);
+
+        // Define a radius for the tool
+        double toolRadius = 0.03;
+
+        // Define a scale factor between the physical workspace of the haptic
+        // device and the virtual workspace
+        tool->setWorkspaceRadius(0.7);
+
+        // Define a scale factor between the physical workspace of the haptic
+        // device and the virtual workspace
+        tool->setWorkspaceScaleFactor(2.0);
+
+        // Create a spherical tool tip with haptic effects
+        chai3d::cShapeSphere* sphereTool = new chai3d::cShapeSphere(toolRadius);
+        tool->addChild(sphereTool);
+        tool->setLocalPos(0.0, 0.0, 0.0);
+
+        // Set material properties for the tool
+        sphereTool->m_material->setWhite();
+        sphereTool->m_material->setStiffness(0.3 * hapticDeviceInfo.m_maxLinearStiffness);
+        sphereTool->m_material->setViscosity(0.1 * hapticDeviceInfo.m_maxLinearDamping);
+
+        // Set force rendering algorithm
+        //tool->setUseForceField(true);
+
+        // Start haptic device
+        hapticDevice->open();
+
+        // Initialize haptic rate calculation
+        hapticFrequencyClock.reset();
+        hapticFrequencyCounter = 0;
+    }
+
+    void updateGraphics(void) {
+        // Update frequency counter
+        graphicFrequencyCounter++;
+        double time = graphicFrequencyClock.getCurrentTimeSeconds();
+        if (time >= 1.0) {
+            graphicFrequency = (double)graphicFrequencyCounter / time;
+            graphicFrequencyCounter = 0;
+            graphicFrequencyClock.reset();
+        }
+
+        // Update packet visualization
+        updatePacketVisualization();
+
+        else if (camera != nullptr) {
+            camera->renderView(displayW, displayH);
+        }
+        else {
+            std::cerr << "Error: Camera not initialized!" << std::endl;
+            // Handle error appropriately
+        }
+
+        // Update stats
+        ss << "Haptic Rate: " << hapticFrequency << " Hz | "
+            << "Graphic Rate: " << graphicFrequency << " Hz | "
+            << "Packets: " << static_cast<int>(receivedPackets.size());
+        std::string rateInfo = ss.str();
+        labelRates->setText(rateInfo);
+
+        // Update position of label based on window size
+        labelRates->setLocalPos((displayW - labelRates->getWidth()) / 2, 15);
+
+        // Swap buffers
+        glutSwapBuffers();
+
+        // Wait until all OpenGL commands are completed
+        glFinish();
+
+        // Check for errors
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            std::cout << "Error: " << gluErrorString(err) << std::endl;
+        }
+    }
 }
 
-// ✅ **Main Function**
-int main(int argc, char** argv) {
-    std::thread udpThread(udpReceiver);
+void resizeWindow(int w, int h) {
+    // Update window size
+    displayW = w;
+    displayH = h;
 
+    // Update display viewport
+    glViewport(0, 0, displayW, displayH);
+
+    // Set camera's aspect ratio - fixed the method call
+    double aspectRatio = static_cast<double>(displayW) / static_cast<double>(displayH);
+    //camera->m_fieldViewAngleRad = 2.0 * atan(tan(camera->m_fieldViewAngleRad / 2.0) * aspectRatio);
+}
+
+void keySelect(unsigned char key, int x, int y) {
+    // Handle key press
+    switch (key) {
+        // Exit
+    case 27:
+        close();
+        break;
+
+        // Reset camera view
+    case 'r':
+        camera->set(chai3d::cVector3d(0.5, 0.0, 0.2),    // Camera position
+            chai3d::cVector3d(0.0, 0.0, 0.0),    // Look at position
+            chai3d::cVector3d(0.0, 0.0, 1.0));   // Up direction
+        break;
+
+        // Toggle wireframe rendering
+    case 'w':
+        camera->setWireMode(!camera->getWireMode());
+        break;
+    }
+}
+
+void close(void) {
+    // Stop simulation
+    simulationRunning = false;
+
+    // Wait for haptic thread to finish
+    while (!simulationFinished) {
+        chai3d::cSleepMs(100);
+    }
+
+    // Close haptic device
+    hapticDevice->close();
+
+    // Exit GLUT
+    exit(0);
+}
+
+void updateHaptics(void) {
+    // Simulation clock initialization
+    chai3d::cPrecisionClock simulationClock;
+    simulationClock.reset();
+
+    // Main haptic simulation loop
+    while (simulationRunning) {
+        // Update frequency counter
+        hapticFrequencyCounter++;
+        double time = hapticFrequencyClock.getCurrentTimeSeconds();
+        if (time >= 1.0) {
+            hapticFrequency = (double)hapticFrequencyCounter / time;
+            hapticFrequencyCounter = 0;
+            hapticFrequencyClock.reset();
+        }
+
+        // Read position from haptic device
+        chai3d::cVector3d position;
+        hapticDevice->getPosition(position);
+
+        // Update tool position and orientation
+        tool->updateFromDevice();
+
+        // Calculate interaction forces between tool and latest packet
+        tool->computeInteractionForces();
+
+        // Check for force feedback with the latest packet
+        {
+            std::lock_guard<std::mutex> lock(dataMutex);
+            if (!receivedPackets.empty()) {
+                const Packet& latestPacket = receivedPackets.back();
+
+                // Calculate force based on distance to latest packet
+                chai3d::cVector3d packetPos(
+                    latestPacket.x * packetScale,
+                    latestPacket.y * packetScale,
+                    latestPacket.z * packetScale
+                );
+
+                chai3d::cVector3d forceDirection = packetPos - tool->getLocalPos();
+                double distance = forceDirection.length();
+
+                // If close enough, apply attraction force
+                if (distance < 0.15 && distance > 0.001) {
+                    forceDirection.normalize();
+                    double forceMagnitude = 1.0 * (0.15 - distance);
+                    chai3d::cVector3d force = forceMagnitude * forceDirection;
+
+                    // Apply force to haptic device
+                    tool->addDeviceLocalForce(force);
+                }
+            }
+        }
+
+        // Send forces to haptic device
+        tool->applyToDevice();
+
+        // Sleep to reduce CPU usage
+        chai3d::cSleepMs(1);
+    }
+
+    // Report that simulation has ended
+    simulationFinished = true;
+}
+
+//------------------------------------------------------------------------------
+// MAIN FUNCTION
+//------------------------------------------------------------------------------
+int main(int argc, char* argv[]) {
+    // Initialize WSOCK
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return -1;
+    }
+
+    // Initialize GLUT
     glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
-    glutInitWindowSize(800, 600);
-    glutCreateWindow("UDP Packet Graph");
 
-    glewInit();  // Initialize GLEW after creating the OpenGL context
+    // Display properties
+    glutInitDisplayMode(GLUT_RGB | GLUT_DEPTH | GLUT_DOUBLE);
 
-    glutDisplayFunc(display);
-    glutReshapeFunc(reshape);
-    glutTimerFunc(33, timer, 0);
+    // Set window position and size
+    glutInitWindowPosition(100, 100);
+    glutInitWindowSize(displayW, displayH);
 
-    initChai3D();
-    std::thread chaiThread(chaiRender);
+    // Create window
+    glutCreateWindow("CHAI3D Haptic Packet Visualizer");
 
+    // Register callback functions
+    glutDisplayFunc(updateGraphics);
+    glutReshapeFunc(resizeWindow);
+    glutKeyboardFunc(keySelect);
+    glutIdleFunc(updateGraphics);
+
+    // Setup OpenGL
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_NORMALIZE);
+    glShadeModel(GL_SMOOTH);
+
+    // Initialize CHAI3D world
+    initializeWorld();
+
+    // Set simulation running flag
+    simulationRunning = true;
+
+    // Create threads for haptic rendering and UDP server
+    std::thread hapticThread(updateHaptics);
+    std::thread networkThread(udpServer);
+
+    // Start the GLUT main loop
     glutMainLoop();
 
-    running = false;  // Stop threads gracefully
-    udpThread.join();
-    chaiThread.join();
+    // Close everything
+    simulationRunning = false;
+    hapticThread.join();
+    networkThread.join();
+    WSACleanup();
 
+    // Exit
     return 0;
 }
