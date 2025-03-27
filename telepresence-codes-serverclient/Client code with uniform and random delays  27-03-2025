@@ -1,0 +1,241 @@
+#include <iostream>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <cstring>
+#include <ctime>
+#include <chrono>
+#include <thread>
+#include <random>
+#include "C:\Program Files\Force Dimension\sdk-3.17.1\include\dhdc.h"  
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+
+// ========================= CONFIGURABLE PARAMETERS =========================
+
+// Network settings
+char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";  // Will be fetched dynamically
+const char DST_IP[] = "169.254.213.206";   // Destination IP (Receiver)
+const int SRC_PORT = 1000;                 // Source UDP Port
+const int DST_PORT = 4000;                 // Destination UDP Port
+
+// Transmission settings
+const int BUFFER_SIZE = 1024;        // Packet buffer size
+const bool IS_SERVER = false;        // Set to true if running as a server
+const int THREAD_PRIORITY_OPTION = THREAD_PRIORITY_TIME_CRITICAL;  // Set priority
+
+// Delay mode settings
+enum DelayMode {
+    UNIFORM_DELAY,    // Constant delay based on haptic rate
+    RANDOM_DELAY      // Variable delay within a range
+};
+const DelayMode DELAY_MODE = RANDOM_DELAY;  // Choose delay mode
+
+// Haptic device rate settings
+const int HAPTIC_RATE_HZ = 1000;  // Haptic device update rate in Hz
+const int HAPTIC_DELAY_US = 1000000 / HAPTIC_RATE_HZ;  // Delay in microseconds
+
+// Random delay settings
+const int RANDOM_DELAY_MIN_HZ = 1;     // Minimum random rate
+const int RANDOM_DELAY_MAX_HZ = 50;    // Maximum random rate
+const int RANDOM_DELAY_MIN_US = 1000000 / RANDOM_DELAY_MAX_HZ;  // Minimum delay
+const int RANDOM_DELAY_MAX_US = 1000000 / RANDOM_DELAY_MIN_HZ;  // Maximum delay
+
+// Global control variables
+volatile bool keepRunning = true;  // Flag to stop the thread safely
+
+// Random number generator for delay
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_int_distribution<> rateDistribution(RANDOM_DELAY_MIN_HZ, RANDOM_DELAY_MAX_HZ);
+
+// ========================= FUNCTION TO FETCH SOURCE IP =========================
+void getLocalIP(char* ipBuffer) {
+    char hostname[256];
+    struct addrinfo hints {}, * info, * p;
+    struct sockaddr_in* sockaddr_ipv4;
+
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_PASSIVE;
+
+        if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
+            for (p = info; p != NULL; p = p->ai_next) {
+                sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
+                inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, INET_ADDRSTRLEN);
+                break;
+            }
+            freeaddrinfo(info);
+        }
+    }
+}
+
+// Updated display parameters to show rate and delay settings
+void displayParameters() {
+    std::cout << "========== SYSTEM CONFIGURATION ==========\n";
+    std::cout << "Source IP:         " << SRC_IP << "\n";
+    std::cout << "Destination IP:    " << DST_IP << "\n";
+    std::cout << "Source Port:       " << SRC_PORT << "\n";
+    std::cout << "Destination Port:  " << DST_PORT << "\n";
+    std::cout << "Buffer Size:       " << BUFFER_SIZE << "\n";
+
+    switch (DELAY_MODE) {
+    case UNIFORM_DELAY:
+        std::cout << "Delay Mode:        Uniform\n";
+        std::cout << "Haptic Rate:       " << HAPTIC_RATE_HZ << " Hz\n";
+        std::cout << "Uniform Delay:     " << HAPTIC_DELAY_US << " µs\n";
+        break;
+    case RANDOM_DELAY:
+        std::cout << "Delay Mode:        Random\n";
+        std::cout << "Random Rate Range: " << RANDOM_DELAY_MIN_HZ
+            << " - " << RANDOM_DELAY_MAX_HZ << " Hz\n";
+        std::cout << "Random Delay Range: " << RANDOM_DELAY_MIN_US
+            << " - " << RANDOM_DELAY_MAX_US << " µs\n";
+        break;
+    }
+
+    std::cout << "Is Server:         " << (IS_SERVER ? "True" : "False") << "\n";
+    std::cout << "Thread Priority:   " << THREAD_PRIORITY_OPTION << "\n";
+    std::cout << "===========================================\n";
+}
+// ========================= PACKET STRUCTURE =========================
+struct Packet {
+    int packetNumber;
+    float x, y, z;
+    float delay;
+    char timestamp[64];
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int srcPort;
+    int dstPort;
+};
+
+// Function to get current timestamp in a specific format
+void getTimestamp(char* timestamp) {
+    time_t now = time(0);
+    struct tm tstruct;
+    localtime_s(&tstruct, &now);
+    strftime(timestamp, 64, "%Y-%m-%d %X", &tstruct);
+}
+
+// ========================= HAPTIC DATA SENDER THREAD =========================
+void hapticDataSender() {
+    WSADATA wsaData;
+    SOCKET clientSocket;
+    sockaddr_in serverAddr;
+    Packet packet;
+    int packetNumber = 0;
+
+    // Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        return;
+    }
+
+    // Create the UDP socket
+    clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (clientSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return;
+    }
+
+    // Set up the server address
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(DST_PORT);
+    if (inet_pton(AF_INET, DST_IP, &serverAddr.sin_addr) <= 0) {
+        std::cerr << "Invalid destination IP" << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return;
+    }
+
+    // Initialize the haptic device
+    if (dhdOpen() < 0) {
+        std::cerr << "Cannot open haptic device: " << dhdErrorGetLastStr() << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return;
+    }
+
+    std::cout << "Haptic device initialized!" << std::endl;
+
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_OPTION);
+
+    // Sending loop based on selected delay mode
+    while (keepRunning) {
+        double hx, hy, hz;
+
+        // Get haptic device position
+        if (dhdGetPosition(&hx, &hy, &hz) < 0) {
+            std::cerr << "Error getting haptic position: " << dhdErrorGetLastStr() << std::endl;
+            break;
+        }
+
+        // Fill packet data
+        packet.packetNumber = ++packetNumber;
+        packet.x = static_cast<float>(hx);
+        packet.y = static_cast<float>(hy);
+        packet.z = static_cast<float>(hz);
+
+        // Choose delay based on DELAY_MODE
+        int currentDelay, currentRate;
+        switch (DELAY_MODE) {
+        case UNIFORM_DELAY:
+            currentDelay = HAPTIC_DELAY_US;
+            currentRate = HAPTIC_RATE_HZ;
+            packet.delay = HAPTIC_DELAY_US / 1000.0f;
+            break;
+        case RANDOM_DELAY:
+            currentRate = rateDistribution(gen);
+            currentDelay = 1000000 / currentRate;
+            packet.delay = currentDelay / 1000.0f;
+            break;
+        }
+
+        getTimestamp(packet.timestamp);
+        strcpy_s(packet.srcIP, SRC_IP);
+        strcpy_s(packet.dstIP, DST_IP);
+        packet.srcPort = SRC_PORT;
+        packet.dstPort = DST_PORT;
+
+        // Send packet over UDP
+        int sendResult = sendto(clientSocket, reinterpret_cast<char*>(&packet), sizeof(Packet), 0,
+            (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+        if (sendResult == SOCKET_ERROR) {
+            std::cerr << "Send failed: " << WSAGetLastError() << std::endl;
+        }
+
+        // Use the current delay for thread sleep
+        std::this_thread::sleep_for(std::chrono::microseconds(currentDelay));
+    }
+
+    // Cleanup
+    dhdClose();
+    closesocket(clientSocket);
+    WSACleanup();
+}
+
+int main() {
+    // Fetch local IP before starting
+    getLocalIP(SRC_IP);
+
+    // Display parameters on console
+    displayParameters();
+
+    // Start the haptic data sender thread
+    std::thread senderThread(hapticDataSender);
+
+    std::cout << "Press Enter to stop..." << std::endl;
+    std::cin.get();
+
+    // Stop the thread and exit
+    keepRunning = false;
+    senderThread.join();
+
+    return 0;
+}
