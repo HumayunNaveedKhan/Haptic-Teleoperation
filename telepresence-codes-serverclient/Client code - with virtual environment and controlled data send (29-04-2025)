@@ -13,10 +13,8 @@
 #include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\chai3d-3.2.0\external\glew\include\GL\glew.h>
 #include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\freeglut\include\GL\freeglut.h>
 #include "C:\Program Files\Force Dimension\sdk-3.17.1\include\dhdc.h"  
-
 #include <string>
 #include <sstream>
-#include <iostream>
 #define _USE_MATH_DEFINES
 #include <cmath>
 #ifndef M_PI
