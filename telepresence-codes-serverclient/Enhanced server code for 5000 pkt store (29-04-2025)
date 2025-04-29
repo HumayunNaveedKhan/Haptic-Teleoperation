@@ -1,0 +1,473 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <GL/glut.h>
+#include <iostream>
+#include <iomanip>
+#include <mutex>
+#include <sstream>
+#include <thread>
+#include <vector>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <map>
+
+#pragma comment(lib, "ws2_32.lib")
+#define UDP_PORT 4000
+#define MAX_PACKET_SIZE 400
+#define MAX_BUFFER_SIZE 5000  // Increased for secure packet storage
+
+// Enhanced Visualization Parameters
+const std::chrono::milliseconds UNIFORM_PACKET_INTERVAL(2000);  // 2 seconds between packets
+const int MAX_DISPLAY_BARS = 15;
+const float BAR_WIDTH = 0.02f;    // Narrower bars to prevent overlap
+const float BAR_MAX_HEIGHT = 0.3f;  // Reduced vertical height
+const int TIMESTAMP_DISPLAY_INTERVAL = 3; // Display every nth timestamp to avoid crowding
+
+// Packet and Distribution Tracking
+struct PacketStats {
+    double avgReceiveRate = 0.0;
+    int totalPacketsReceived = 0;
+    std::chrono::steady_clock::time_point firstPacketTime;
+    std::chrono::steady_clock::time_point lastPacketTime;
+    double avgInterPacketTime = 0.0; // Average time between packets in ms
+};
+PacketStats globalPacketStats;
+
+// Common Packet Structure
+struct Packet {
+    int packetNumber;  // Sequential packet number
+    float x, y, z;     // 3D Vector components
+    float delay;       // Processing delay in milliseconds
+    char timestamp[64];  // Timestamp of packet creation
+    char srcIP[INET_ADDRSTRLEN]; // Source IP address
+    char dstIP[INET_ADDRSTRLEN]; // Destination IP address
+    int srcPort;       // Source port
+    int dstPort;       // Destination port
+    std::chrono::steady_clock::time_point receiveTime;  // Time of packet reception
+};
+
+// Secure Packet Buffer with Time-Aware Distribution
+class TimeAwarePacketDistributor {
+private:
+    std::deque<Packet> packetBuffer;       // Main secure buffer for all received packets
+    std::deque<Packet> processedPackets;   // Packets that have been processed/released
+    std::mutex bufferMutex;
+    std::mutex processedMutex;
+    std::chrono::steady_clock::time_point lastReleaseTime;
+    std::map<int, double> packetTimeGaps;  // Stores time gaps between consecutive packets
+
+public:
+    TimeAwarePacketDistributor() : lastReleaseTime(std::chrono::steady_clock::now()) {}
+
+    void addPacket(const Packet& packet) {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+        
+        // Calculate and store time gap if not the first packet
+        if (!packetBuffer.empty()) {
+            auto prevPacket = packetBuffer.back();
+            double timeGapMs = std::chrono::duration<double, std::milli>(
+                packet.receiveTime - prevPacket.receiveTime).count();
+            packetTimeGaps[packet.packetNumber] = timeGapMs;
+        }
+        
+        // Add to secure buffer
+        packetBuffer.push_back(packet);
+        
+        // Ensure buffer doesn't exceed maximum size
+        if (packetBuffer.size() > MAX_BUFFER_SIZE) {
+            std::cerr << "Warning: Buffer approaching capacity, removing oldest packet" << std::endl;
+            packetBuffer.pop_front();
+        }
+    }
+
+    // Process packets based on their programmed delay
+    void processPackets() {
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> bufferLock(bufferMutex);
+        std::lock_guard<std::mutex> processedLock(processedMutex);
+
+        // Check if it's time to release a packet
+        if (!packetBuffer.empty()) {
+            // Find the oldest packet
+            auto oldestPacket = std::min_element(packetBuffer.begin(), packetBuffer.end(),
+                [](const Packet& a, const Packet& b) {
+                    return a.packetNumber < b.packetNumber;
+                });
+
+            // Calculate if enough time has passed based on the packet's delay value
+            double packetDelayMs = oldestPacket->delay;
+            auto timeSinceLastRelease = std::chrono::duration<double, std::milli>(
+                now - lastReleaseTime).count();
+            
+            if (timeSinceLastRelease >= packetDelayMs) {
+                // Copy to processed queue
+                processedPackets.push_back(*oldestPacket);
+                
+                // Limit processed queue size while maintaining time gap visualization
+                if (processedPackets.size() > MAX_DISPLAY_BARS) {
+                    processedPackets.pop_front();
+                }
+                
+                // Remove from buffer
+                packetBuffer.erase(oldestPacket);
+                
+                // Update last release time
+                lastReleaseTime = now;
+            }
+        }
+    }
+
+    // Get all packets in buffer (for visualization of waiting packets)
+    std::deque<Packet> getBufferedPackets() {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+        return packetBuffer;
+    }
+
+    // Get processed/released packets
+    std::deque<Packet> getProcessedPackets() {
+        std::lock_guard<std::mutex> lock(processedMutex);
+        return processedPackets;
+    }
+
+    // Get time gap for a specific packet
+    double getPacketTimeGap(int packetNumber) {
+        auto it = packetTimeGaps.find(packetNumber);
+        if (it != packetTimeGaps.end()) {
+            return it->second;
+        }
+        return 0.0; // No gap for first packet or if not found
+    }
+
+    size_t getBufferSize() {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+        return packetBuffer.size();
+    }
+    
+    size_t getProcessedSize() {
+        std::lock_guard<std::mutex> lock(processedMutex);
+        return processedPackets.size();
+    }
+};
+
+// Global packet distributor
+TimeAwarePacketDistributor packetDistributor;
+
+// Function to calculate packet magnitude
+float calculateMagnitude(const Packet& packet) {
+    return sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
+}
+
+void renderSmallText(float x, float y, void* font, const char* string,
+    float r = 0.7f, float g = 0.7f, float b = 0.7f) {
+    glColor3f(r, g, b);
+    glRasterPos2f(x, y);
+    for (const char* c = string; *c != '\0'; c++) {
+        glutBitmapCharacter(font, *c);
+    }
+}
+
+// Convert timestamp string to more compact format for display
+std::string formatTimestampForDisplay(const char* timestamp) {
+    // Extract just the time portion (assuming format "YYYY-MM-DD HH:MM:SS")
+    std::string ts(timestamp);
+    size_t spacePos = ts.find(' ');
+    if (spacePos != std::string::npos && spacePos + 1 < ts.length()) {
+        return ts.substr(spacePos + 1); // Return just the time part
+    }
+    return ts;
+}
+
+// Draw time-aware packet visualization with gaps representing actual time differences
+void drawTimeAwareGraph(const std::deque<Packet>& packets, float xOffset, const char* title,
+    const PacketStats& stats, bool showTimeGaps = true) {
+    
+    // Background with subtle gradient
+    glBegin(GL_QUADS);
+    glColor3f(0.1f, 0.1f, 0.15f);
+    glVertex2f(xOffset, 0.1f);
+    glColor3f(0.15f, 0.15f, 0.2f);
+    glVertex2f(xOffset + 0.45f, 0.1f);
+    glVertex2f(xOffset + 0.45f, 0.9f);
+    glColor3f(0.1f, 0.1f, 0.15f);
+    glVertex2f(xOffset, 0.9f);
+    glEnd();
+
+    // Soft grid lines
+    glColor3f(0.3f, 0.3f, 0.4f);
+    glLineStipple(1, 0xAAAA);
+    glEnable(GL_LINE_STIPPLE);
+    glBegin(GL_LINES);
+    for (int i = 1; i <= 5; ++i) {
+        float y = 0.15f + i * 0.15f;
+        glVertex2f(xOffset + 0.05f, y);
+        glVertex2f(xOffset + 0.4f, y);
+    }
+    glEnd();
+    glDisable(GL_LINE_STIPPLE);
+
+    // Title with statistics
+    std::stringstream titleStream;
+    titleStream << title << " (" << packets.size() << " packets, Avg: "
+        << std::fixed << std::setprecision(2)
+        << stats.avgReceiveRate << " pkt/s)";
+    renderSmallText(xOffset + 0.05f, 0.95f, GLUT_BITMAP_HELVETICA_12,
+        titleStream.str().c_str(), 0.8f, 0.8f, 1.0f);
+
+    // Add inter-packet time info
+    std::stringstream gapStream;
+    gapStream << "Avg Time Between Packets: " 
+              << std::fixed << std::setprecision(2) << stats.avgInterPacketTime << " ms";
+    renderSmallText(xOffset + 0.05f, 0.91f, GLUT_BITMAP_HELVETICA_10,
+        gapStream.str().c_str(), 0.7f, 0.9f, 0.7f);
+
+    // Find max magnitude for scaling
+    float maxMagnitude = 0.0f;
+    for (const Packet& packet : packets) {
+        float magnitude = calculateMagnitude(packet);
+        maxMagnitude = std::max(maxMagnitude, magnitude);
+    }
+
+    // If we have packets to visualize
+    if (!packets.empty()) {
+        // Calculate position scaling for time-based visualization
+        float totalTimeSpan = 0;
+        float baseX = xOffset + 0.05f;
+        float availableWidth = 0.35f;
+        
+        // Draw bars with time-based positioning
+        glBegin(GL_QUADS);
+        float prevX = baseX;
+        
+        for (size_t i = 0; i < packets.size(); ++i) {
+            const Packet& packet = packets[i];
+            float magnitude = calculateMagnitude(packet);
+            float normalizedMagnitude = magnitude / (maxMagnitude > 0 ? maxMagnitude : 1.0f);
+            normalizedMagnitude = std::min<float>(normalizedMagnitude, 1.0f);
+
+            // Calculate position based on packet number or time gap
+            float x;
+            if (showTimeGaps && i > 0) {
+                // Get time gap from packet distributor
+                double timeGap = packetDistributor.getPacketTimeGap(packet.packetNumber);
+                
+                // Scale time gap to screen space (adjust factor as needed)
+                float scaleFactor = 0.001f; // ms to screen units
+                float gapWidth = std::min<float>(timeGap * scaleFactor, 0.1f); // Cap max gap
+                
+                // Position based on previous X plus gap
+                x = prevX + gapWidth;
+                
+                // Don't go beyond graph boundaries
+                if (x > xOffset + 0.4f) {
+                    x = xOffset + 0.4f - (packets.size() - i) * BAR_WIDTH;
+                }
+            } else {
+                // Fallback to uniform spacing if not showing time gaps
+                x = baseX + (i + 1) * (availableWidth / (packets.size() + 1));
+            }
+            
+            prevX = x;
+
+            // Bar gradient with depth effect
+            glColor3f(0.2f, 0.6f, 0.8f);  // Base color
+            glVertex2f(x - BAR_WIDTH / 2, 0.15f);
+            glVertex2f(x + BAR_WIDTH / 2, 0.15f);
+
+            glColor3f(0.3f, 0.7f, 0.9f);  // Lighter top
+            glVertex2f(x + BAR_WIDTH / 2, 0.15f + normalizedMagnitude * BAR_MAX_HEIGHT);
+            glVertex2f(x - BAR_WIDTH / 2, 0.15f + normalizedMagnitude * BAR_MAX_HEIGHT);
+            
+            // Draw time gap indicator line
+            if (showTimeGaps && i > 0) {
+                glColor3f(0.5f, 0.5f, 0.5f);
+                glVertex2f(prevX - BAR_WIDTH / 2 - 0.01f, 0.145f);
+                glVertex2f(x - BAR_WIDTH / 2, 0.145f);
+                glVertex2f(x - BAR_WIDTH / 2, 0.155f);
+                glVertex2f(prevX - BAR_WIDTH / 2 - 0.01f, 0.155f);
+            }
+        }
+        glEnd();
+
+        // Draw X-axis labels with timestamps - only draw some to avoid overlap
+        for (size_t i = 0; i < packets.size(); ++i) {
+            // Display timestamps with consistent spacing
+            if (i % TIMESTAMP_DISPLAY_INTERVAL == 0) {
+                float x = baseX + (i + 1) * (availableWidth / (packets.size() + 1));
+                
+                // Packet number
+                std::stringstream ssNum;
+                ssNum << packets[i].packetNumber;
+                renderSmallText(x - 0.01f, 0.08f, GLUT_BITMAP_HELVETICA_10, ssNum.str().c_str());
+                
+                // Compact timestamp
+                std::string formattedTime = formatTimestampForDisplay(packets[i].timestamp);
+                renderSmallText(x - 0.02f, 0.05f, GLUT_BITMAP_HELVETICA_10, formattedTime.c_str());
+                
+                // Show delay value
+                std::stringstream ssDelay;
+                ssDelay << packets[i].delay << "ms";
+                renderSmallText(x - 0.015f, 0.02f, GLUT_BITMAP_HELVETICA_10, ssDelay.str().c_str(), 0.9f, 0.7f, 0.7f);
+            }
+        }
+    }
+
+    // Buffer status info
+    std::stringstream bufferStream;
+    bufferStream << "Buffer: " << packetDistributor.getBufferSize() 
+                 << " / Processed: " << packetDistributor.getProcessedSize();
+    renderSmallText(xOffset + 0.25f, 0.02f, GLUT_BITMAP_HELVETICA_10,
+        bufferStream.str().c_str(), 0.7f, 0.7f, 0.7f);
+}
+
+// Modified display function
+void display() {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);
+
+    // Get packets
+    std::deque<Packet> bufferedPackets = packetDistributor.getBufferedPackets();
+    std::deque<Packet> processedPackets = packetDistributor.getProcessedPackets();
+
+    // Draw enhanced time-aware graphs
+    drawTimeAwareGraph(bufferedPackets, 0.0f, "Buffered Packets", globalPacketStats, false);
+    drawTimeAwareGraph(processedPackets, 0.5f, "Processed Packets", globalPacketStats, true);
+
+    glutSwapBuffers();
+}
+
+// Update packet statistics in UDP server
+void updatePacketStats(const Packet& packet) {
+    static std::mutex statsMutex;
+    std::lock_guard<std::mutex> lock(statsMutex);
+
+    auto currentTime = std::chrono::steady_clock::now();
+    
+    if (globalPacketStats.totalPacketsReceived == 0) {
+        globalPacketStats.firstPacketTime = currentTime;
+        globalPacketStats.lastPacketTime = currentTime;
+    } else {
+        // Calculate time between packets
+        double interPacketTimeMs = std::chrono::duration<double, std::milli>(
+            currentTime - globalPacketStats.lastPacketTime).count();
+            
+        // Update average inter-packet time with exponential moving average
+        if (globalPacketStats.avgInterPacketTime == 0) {
+            globalPacketStats.avgInterPacketTime = interPacketTimeMs;
+        } else {
+            double alpha = 0.1; // Smoothing factor
+            globalPacketStats.avgInterPacketTime = 
+                (1 - alpha) * globalPacketStats.avgInterPacketTime + alpha * interPacketTimeMs;
+        }
+        
+        globalPacketStats.lastPacketTime = currentTime;
+    }
+
+    globalPacketStats.totalPacketsReceived++;
+
+    // Calculate average receive rate
+    auto duration = std::chrono::duration<double>(currentTime - globalPacketStats.firstPacketTime).count();
+    if (duration > 0) {
+        globalPacketStats.avgReceiveRate = globalPacketStats.totalPacketsReceived / duration;
+    }
+}
+
+// UDP server thread for receiving packets
+void udpServer() {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in serverAddr = {};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(UDP_PORT);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+    bind(udpSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
+
+    sockaddr_in clientAddr = {};
+    int clientAddrLen = sizeof(clientAddr);
+    Packet packet;
+
+    while (true) {
+        int bytesReceived = recvfrom(udpSocket, reinterpret_cast<char*>(&packet), sizeof(packet), 0,
+            reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
+
+        if (bytesReceived > 0 && bytesReceived <= MAX_PACKET_SIZE) {
+            // Capture network details and add to distributor
+            inet_ntop(AF_INET, &clientAddr.sin_addr, packet.srcIP, INET_ADDRSTRLEN);
+            inet_ntop(AF_INET, &serverAddr.sin_addr, packet.dstIP, INET_ADDRSTRLEN);
+            packet.srcPort = ntohs(clientAddr.sin_port);
+            packet.dstPort = ntohs(serverAddr.sin_port);
+            packet.receiveTime = std::chrono::steady_clock::now();
+
+            // Update global packet statistics
+            updatePacketStats(packet);
+
+            // Add to secure buffer
+            packetDistributor.addPacket(packet);
+
+            // Console output
+            std::cout << std::fixed << std::setprecision(3)
+                << "Pkt #" << packet.packetNumber
+                << " | Pos: (" << packet.x << "," << packet.y << "," << packet.z << ")"
+                << " | Delay: " << packet.delay << "ms"
+                << " | Avg Rate: " << globalPacketStats.avgReceiveRate << " pkt/s"
+                << " | Avg Gap: " << globalPacketStats.avgInterPacketTime << " ms"
+                << std::endl;
+        }
+    }
+
+    closesocket(udpSocket);
+    WSACleanup();
+}
+
+// Packet processing thread
+void packetProcessingThread() {
+    while (true) {
+        packetDistributor.processPackets();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// Frame rate control
+std::chrono::time_point<std::chrono::steady_clock> lastRefreshTime;
+const std::chrono::milliseconds refreshInterval(33);  // ~30 FPS
+
+void idleFunction() {
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastRefreshTime >= refreshInterval) {
+        lastRefreshTime = now;
+        glutPostRedisplay();
+    }
+}
+
+int main(int argc, char** argv) {
+    // Start UDP server thread
+    std::thread udpThread(udpServer);
+
+    // Start packet processing thread
+    std::thread processingThread(packetProcessingThread);
+
+    // OpenGL initialization
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(800, 600);
+    glutCreateWindow("Time-Aware Haptic Teleoperation Packet Visualization");
+
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+
+    glutDisplayFunc(display);
+    glutIdleFunc(idleFunction);
+
+    glutMainLoop();
+
+    udpThread.join();
+    processingThread.join();
+    return 0;
+}
