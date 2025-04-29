@@ -9,11 +9,18 @@
 #include <random>
 #include <vector>
 #include <mutex>
+#include <algorithm> // For std::min and std::max
+#include <GL/glew.h>
+#include <GL/freeglut.h>
 #include "C:\Program Files\Force Dimension\sdk-3.17.1\include\dhdc.h"  
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "opengl32.lib")
+#pragma comment(lib, "glew32.lib")
+#pragma comment(lib, "freeglut.lib")
 
+using namespace std;
 // ========================= CONFIGURABLE PARAMETERS =========================
 
 // Network settings
@@ -61,6 +68,8 @@ struct VirtualPlane {
     double damping;       // Damping coefficient (0.0 - 1.0)
     double friction;      // Surface friction (0.0 - 1.0)
     bool enabled;         // Enable/disable the plane
+    float color[4];       // RGBA color of the plane
+    float size;           // Size of the plane (width and height)
 };
 
 // Tool/cursor parameters
@@ -71,24 +80,28 @@ struct HapticTool {
     double force[3];      // Force to be applied
     double size;          // Size of the cursor (radius in m)
     double mass;          // Mass of the cursor (kg)
+    float color[4];       // RGBA color of the tool
 };
 
 // Environment parameters
 VirtualPlane virtualPlane = {
-    0.0,    // Position at z=0
-    0.5,    // Medium stiffness
-    0.3,    // Medium damping
-    0.2,    // Medium friction
-    true    // Enabled by default
+    0.0,                   // Position at z=0
+    0.5,                   // Medium stiffness
+    0.3,                   // Medium damping
+    0.2,                   // Medium friction
+    true,                  // Enabled by default
+    {0.2f, 0.7f, 0.9f, 0.8f}, // Light blue semi-transparent color
+    0.2f                   // 20cm plane size
 };
 
 HapticTool hapticTool = {
-    {0.0, 0.0, 0.0},  // Position
-    {0.0, 0.0, 0.0},  // Last position
-    {0.0, 0.0, 0.0},  // Velocity
-    {0.0, 0.0, 0.0},  // Force
-    0.005,            // 5mm radius tool
-    0.1               // 100g mass
+    {0.0, 0.0, 0.0},       // Position
+    {0.0, 0.0, 0.0},       // Last position
+    {0.0, 0.0, 0.0},       // Velocity
+    {0.0, 0.0, 0.0},       // Force
+    0.005,                 // 5mm radius tool
+    0.1,                   // 100g mass
+    {1.0f, 0.3f, 0.3f, 1.0f} // Red color
 };
 
 // Mutex for thread safety when updating parameters
@@ -98,6 +111,22 @@ std::mutex environmentMutex;
 const double ENV_SIZE_X = 0.1;  // ±10cm in X
 const double ENV_SIZE_Y = 0.1;  // ±10cm in Y
 const double ENV_SIZE_Z = 0.1;  // ±10cm in Z
+
+// OpenGL visualization parameters
+int windowWidth = 800;
+int windowHeight = 600;
+float cameraDistance = 0.3f;
+float cameraAngleX = 30.0f;
+float cameraAngleY = 45.0f;
+bool showAxes = true;
+bool showWireframe = false;
+bool showForceVector = true;
+
+// For mouse interaction with the OpenGL window
+int mouseX = 0, mouseY = 0;
+bool mouseLeftDown = false;
+bool mouseRightDown = false;
+bool mouseMiddleDown = false;
 
 // ========================= FUNCTION TO FETCH SOURCE IP =========================
 void getLocalIP(char* ipBuffer) {
@@ -154,8 +183,8 @@ void displayParameters() {
     std::cout << "Plane Friction:    " << virtualPlane.friction << "\n";
     std::cout << "Tool Size:         " << hapticTool.size * 1000 << " mm\n";
     std::cout << "Tool Mass:         " << hapticTool.mass * 1000 << " g\n";
-    std::cout << "Environment Size:  ±" << ENV_SIZE_X * 100 << " cm (X), ±" 
-              << ENV_SIZE_Y * 100 << " cm (Y), ±" << ENV_SIZE_Z * 100 << " cm (Z)\n";
+    std::cout << "Environment Size:  ±" << ENV_SIZE_X * 100 << " cm (X), ±"
+        << ENV_SIZE_Y * 100 << " cm (Y), ±" << ENV_SIZE_Z * 100 << " cm (Z)\n";
     std::cout << "===========================================\n";
 }
 
@@ -188,26 +217,26 @@ void calculateVirtualPlaneForce(double pos[3], double vel[3], double force[3]) {
     force[0] = 0.0;
     force[1] = 0.0;
     force[2] = 0.0;
-    
+
     if (!virtualPlane.enabled) return;
-    
+
     // Check if tool is penetrating the plane (tool is below plane)
     double penetrationDepth = virtualPlane.position - pos[2];
-    
+
     if (penetrationDepth > 0.0) {
         // Calculate normal force based on penetration depth (spring) and velocity (damping)
         double normalForce = virtualPlane.stiffness * penetrationDepth - virtualPlane.damping * vel[2];
         force[2] = normalForce;
-        
+
         // Calculate friction force tangent to the plane (X and Y directions)
         // Friction is proportional to normal force and depends on tool movement in X-Y plane
         double frictionFactor = virtualPlane.friction * normalForce;
-        
+
         // Simple viscous friction model - friction opposes velocity
         if (vel[0] != 0.0 || vel[1] != 0.0) {
             // Calculate velocity magnitude in XY plane
-            double velXYMag = sqrt(vel[0]*vel[0] + vel[1]*vel[1]);
-            
+            double velXYMag = sqrt(vel[0] * vel[0] + vel[1] * vel[1]);
+
             if (velXYMag > 0.0001) {  // Avoid division by very small numbers
                 // Normalize and apply friction
                 force[0] = -frictionFactor * vel[0] / velXYMag;
@@ -227,12 +256,332 @@ void calculateVelocity(double pos[3], double lastPos[3], double vel[3], double t
 // Update tool position and store last position
 void updateToolPosition(double pos[3]) {
     std::lock_guard<std::mutex> lock(environmentMutex);
-    
+
     // Store current position as last position
     for (int i = 0; i < 3; i++) {
         hapticTool.lastPosition[i] = hapticTool.position[i];
         hapticTool.position[i] = pos[i];
     }
+}
+
+// ========================= OPENGL RENDERING FUNCTIONS =========================
+
+// Initialize OpenGL
+void initGL() {
+    // Initialize GLEW
+    GLenum err = glewInit();
+    if (GLEW_OK != err) {
+        std::cerr << "GLEW initialization error: " << glewGetErrorString(err) << std::endl;
+        exit(1);
+    }
+
+    // Enable depth testing
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+
+    // Enable blending for transparency
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Set up lighting
+    glEnable(GL_LIGHTING);
+    glEnable(GL_LIGHT0);
+
+    GLfloat lightPos[] = { 1.0f, 1.0f, 1.0f, 0.0f };
+    GLfloat lightAmbient[] = { 0.2f, 0.2f, 0.2f, 1.0f };
+    GLfloat lightDiffuse[] = { 0.8f, 0.8f, 0.8f, 1.0f };
+    GLfloat lightSpecular[] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+    glLightfv(GL_LIGHT0, GL_POSITION, lightPos);
+    glLightfv(GL_LIGHT0, GL_AMBIENT, lightAmbient);
+    glLightfv(GL_LIGHT0, GL_DIFFUSE, lightDiffuse);
+    glLightfv(GL_LIGHT0, GL_SPECULAR, lightSpecular);
+
+    // Set up material properties
+    GLfloat matSpecular[] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    GLfloat matShininess[] = { 50.0f };
+
+    glMaterialfv(GL_FRONT, GL_SPECULAR, matSpecular);
+    glMaterialfv(GL_FRONT, GL_SHININESS, matShininess);
+
+    // Set background color
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+}
+
+// Draw coordinate axes
+void drawAxes(float scale) {
+    glDisable(GL_LIGHTING);
+
+    glBegin(GL_LINES);
+    // X-axis (red)
+    glColor3f(1.0f, 0.0f, 0.0f);
+    glVertex3f(0.0f, 0.0f, 0.0f);
+    glVertex3f(scale, 0.0f, 0.0f);
+
+    // Y-axis (green)
+    glColor3f(0.0f, 1.0f, 0.0f);
+    glVertex3f(0.0f, 0.0f, 0.0f);
+    glVertex3f(0.0f, scale, 0.0f);
+
+    // Z-axis (blue)
+    glColor3f(0.0f, 0.0f, 1.0f);
+    glVertex3f(0.0f, 0.0f, 0.0f);
+    glVertex3f(0.0f, 0.0f, scale);
+    glEnd();
+
+    glEnable(GL_LIGHTING);
+}
+
+// Draw the virtual plane
+void drawVirtualPlane() {
+    std::lock_guard<std::mutex> lock(environmentMutex);
+
+    if (!virtualPlane.enabled) return;
+
+    // Set material properties for the plane
+    GLfloat matAmbient[] = { virtualPlane.color[0] * 0.3f, virtualPlane.color[1] * 0.3f,
+                             virtualPlane.color[2] * 0.3f, virtualPlane.color[3] };
+    GLfloat matDiffuse[] = { virtualPlane.color[0], virtualPlane.color[1],
+                              virtualPlane.color[2], virtualPlane.color[3] };
+
+    glMaterialfv(GL_FRONT, GL_AMBIENT, matAmbient);
+    glMaterialfv(GL_FRONT, GL_DIFFUSE, matDiffuse);
+
+    // Draw plane
+    float halfSize = virtualPlane.size / 2.0f;
+
+    glPushMatrix();
+    glTranslatef(0.0f, 0.0f, static_cast<float>(virtualPlane.position));
+
+    if (showWireframe) {
+        // Draw wireframe grid
+        glDisable(GL_LIGHTING);
+        glColor4fv(virtualPlane.color);
+
+        glBegin(GL_LINES);
+        for (float i = -halfSize; i <= halfSize; i += 0.02f) {
+            // Lines along X axis
+            glVertex3f(-halfSize, i, 0.0f);
+            glVertex3f(halfSize, i, 0.0f);
+
+            // Lines along Y axis
+            glVertex3f(i, -halfSize, 0.0f);
+            glVertex3f(i, halfSize, 0.0f);
+        }
+        glEnd();
+
+        glEnable(GL_LIGHTING);
+    }
+    else {
+        // Draw solid plane
+        glBegin(GL_QUADS);
+        glNormal3f(0.0f, 0.0f, 1.0f);  // Normal pointing up along z-axis
+        glVertex3f(-halfSize, -halfSize, 0.0f);
+        glVertex3f(halfSize, -halfSize, 0.0f);
+        glVertex3f(halfSize, halfSize, 0.0f);
+        glVertex3f(-halfSize, halfSize, 0.0f);
+        glEnd();
+    }
+
+    glPopMatrix();
+}
+
+// Draw the haptic tool/cursor
+void drawHapticTool() {
+    std::lock_guard<std::mutex> lock(environmentMutex);
+
+    // Set material properties for the tool
+    GLfloat matAmbient[] = { hapticTool.color[0] * 0.3f, hapticTool.color[1] * 0.3f,
+                             hapticTool.color[2] * 0.3f, hapticTool.color[3] };
+    GLfloat matDiffuse[] = { hapticTool.color[0], hapticTool.color[1],
+                              hapticTool.color[2], hapticTool.color[3] };
+
+    glMaterialfv(GL_FRONT, GL_AMBIENT, matAmbient);
+    glMaterialfv(GL_FRONT, GL_DIFFUSE, matDiffuse);
+
+    // Draw sphere at tool position
+    glPushMatrix();
+    glTranslatef(
+        static_cast<float>(hapticTool.position[0]),
+        static_cast<float>(hapticTool.position[1]),
+        static_cast<float>(hapticTool.position[2])
+    );
+
+    // Create sphere for the tool
+    GLUquadricObj* quadric = gluNewQuadric();
+    gluQuadricNormals(quadric, GLU_SMOOTH);
+    gluSphere(quadric, static_cast<float>(hapticTool.size), 16, 16);
+    gluDeleteQuadric(quadric);
+
+    // Draw force vector if enabled
+    if (showForceVector && (hapticTool.force[0] != 0 || hapticTool.force[1] != 0 || hapticTool.force[2] != 0)) {
+        glDisable(GL_LIGHTING);
+
+        // Scale factor to make force visible
+        float forceScale = 0.05f;
+
+        // Draw line representing force vector
+        glLineWidth(2.0f);
+        glBegin(GL_LINES);
+        glColor3f(1.0f, 1.0f, 0.0f);  // Yellow for force
+        glVertex3f(0, 0, 0);
+        glVertex3f(
+            static_cast<float>(-hapticTool.force[0] * forceScale),
+            static_cast<float>(-hapticTool.force[1] * forceScale),
+            static_cast<float>(-hapticTool.force[2] * forceScale)
+        );
+        glEnd();
+        glLineWidth(1.0f);
+
+        glEnable(GL_LIGHTING);
+    }
+
+    glPopMatrix();
+}
+
+// Display function for OpenGL rendering
+void displayFunc() {
+    // Clear buffers
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Set up view matrix
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    // Position camera based on distance and angles
+    float camX = cameraDistance * sin(cameraAngleY * M_PI / 180.0f) * cos(cameraAngleX * M_PI / 180.0f);
+    float camY = cameraDistance * sin(cameraAngleX * M_PI / 180.0f);
+    float camZ = cameraDistance * cos(cameraAngleY * M_PI / 180.0f) * cos(cameraAngleX * M_PI / 180.0f);
+
+    gluLookAt(camX, camY, camZ, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f);
+
+    // Draw coordinate axes if enabled
+    if (showAxes) {
+        drawAxes(0.1f);
+    }
+
+    // Draw virtual environment
+    drawVirtualPlane();
+    drawHapticTool();
+
+    // Swap buffers
+    glutSwapBuffers();
+}
+
+// Reshape function for window resize events
+void reshapeFunc(int width, int height) {
+    windowWidth = width;
+    windowHeight = height;
+
+    // Set viewport
+    glViewport(0, 0, width, height);
+
+    // Set up projection matrix
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(45.0f, static_cast<float>(width) / static_cast<float>(height), 0.01f, 2.0f);
+}
+
+// Mouse button callback
+void mouseFunc(int button, int state, int x, int y) {
+    mouseX = x;
+    mouseY = y;
+
+    if (button == GLUT_LEFT_BUTTON) {
+        mouseLeftDown = (state == GLUT_DOWN);
+    }
+    else if (button == GLUT_RIGHT_BUTTON) {
+        mouseRightDown = (state == GLUT_DOWN);
+    }
+    else if (button == GLUT_MIDDLE_BUTTON) {
+        mouseMiddleDown = (state == GLUT_DOWN);
+    }
+}
+
+// Mouse motion callback
+void motionFunc(int x, int y) {
+    int dx = x - mouseX;
+    int dy = y - mouseY;
+    mouseX = x;
+    mouseY = y;
+
+    if (mouseLeftDown) {
+        // Rotate camera
+        cameraAngleY += dx * 0.5f;
+        cameraAngleX += dy * 0.5f;
+
+        // Limit vertical angle to avoid gimbal lock
+        if (cameraAngleX > 89.0f) cameraAngleX = 89.0f;
+        if (cameraAngleX < -89.0f) cameraAngleX = -89.0f;
+    }
+
+    if (mouseRightDown) {
+        // Adjust camera distance (zoom)
+        cameraDistance += dy * 0.005f;
+
+        // Limit zoom distance
+        if (cameraDistance < 0.1f) cameraDistance = 0.1f;
+        if (cameraDistance > 1.0f) cameraDistance = 1.0f;
+    }
+
+    glutPostRedisplay();
+}
+
+// Keyboard callback for camera control
+void keyboardFunc(unsigned char key, int x, int y) {
+    switch (key) {
+    case 'w':
+        showWireframe = !showWireframe;
+        break;
+    case 'a':
+        showAxes = !showAxes;
+        break;
+    case 'f':
+        showForceVector = !showForceVector;
+        break;
+    case 'r':
+        // Reset camera position
+        cameraDistance = 0.3f;
+        cameraAngleX = 30.0f;
+        cameraAngleY = 45.0f;
+        break;
+    }
+    glutPostRedisplay();
+}
+
+// Timer function to update display
+void timerFunc(int value) {
+    glutPostRedisplay();
+    glutTimerFunc(16, timerFunc, 0);  // ~60 FPS
+}
+
+// Initialize OpenGL and GLUT
+void initGraphics(int argc, char** argv) {
+    // Initialize GLUT
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH | GLUT_MULTISAMPLE);
+    glutInitWindowSize(windowWidth, windowHeight);
+    glutCreateWindow("Haptic Virtual Environment");
+
+    // Register GLUT callbacks
+    glutDisplayFunc(displayFunc);
+    glutReshapeFunc(reshapeFunc);
+    glutKeyboardFunc(keyboardFunc);
+    glutMouseFunc(mouseFunc);
+    glutMotionFunc(motionFunc);
+    glutTimerFunc(16, timerFunc, 0);
+
+    // Initialize OpenGL
+    initGL();
+
+    // Display controls
+    std::cout << "\nGraphical Environment Controls:\n"
+        << "Mouse Left Button: Rotate camera\n"
+        << "Mouse Right Button: Zoom in/out\n"
+        << "Key 'w': Toggle wireframe mode\n"
+        << "Key 'a': Toggle coordinate axes\n"
+        << "Key 'f': Toggle force vector display\n"
+        << "Key 'r': Reset camera view\n";
 }
 
 // ========================= HAPTIC DATA SENDER THREAD =========================
@@ -276,7 +625,7 @@ void hapticDataSender() {
     }
 
     std::cout << "Haptic device initialized!" << std::endl;
-    
+
     // Enable force feedback
     if (dhdEnableForce(DHD_ON) < 0) {
         std::cerr << "Error enabling force feedback: " << dhdErrorGetLastStr() << std::endl;
@@ -287,7 +636,7 @@ void hapticDataSender() {
 
     // Time variables for velocity calculation
     auto lastTime = std::chrono::high_resolution_clock::now();
-    
+
     // Sending loop based on selected delay mode
     while (keepRunning) {
         double hx, hy, hz;
@@ -297,29 +646,29 @@ void hapticDataSender() {
             std::cerr << "Error getting haptic position: " << dhdErrorGetLastStr() << std::endl;
             break;
         }
-        
+
         // Update current time and calculate time step
         auto currentTime = std::chrono::high_resolution_clock::now();
         double timeStep = std::chrono::duration<double>(currentTime - lastTime).count();
         lastTime = currentTime;
-        
+
         // Update tool position
-        double currentPosition[3] = {hx, hy, hz};
+        double currentPosition[3] = { hx, hy, hz };
         updateToolPosition(currentPosition);
-        
-        // Calculate velocity
-        std::lock_guard<std::mutex> lock(environmentMutex);
-        calculateVelocity(hapticTool.position, hapticTool.lastPosition, hapticTool.velocity, timeStep);
-        
-        // Calculate haptic force
-        calculateVirtualPlaneForce(hapticTool.position, hapticTool.velocity, hapticTool.force);
-        
-        // Apply force to the device
+
+        // Calculate velocity and force
+        {
+            std::lock_guard<std::mutex> lock(environmentMutex);
+            calculateVelocity(hapticTool.position, hapticTool.lastPosition, hapticTool.velocity, timeStep);
+            calculateVirtualPlaneForce(hapticTool.position, hapticTool.velocity, hapticTool.force);
+        }
+
+        // Apply force to haptic device
         if (dhdSetForce(hapticTool.force[0], hapticTool.force[1], hapticTool.force[2]) < 0) {
             std::cerr << "Error setting force: " << dhdErrorGetLastStr() << std::endl;
         }
 
-        // Fill packet data
+        // Fill packet data for network transmission
         packet.packetNumber = ++packetNumber;
         packet.x = static_cast<float>(hx);
         packet.y = static_cast<float>(hy);
@@ -337,126 +686,343 @@ void hapticDataSender() {
             packet.delay = HAPTIC_DELAY_US / 1000.0f;
             break;
         case RANDOM_DELAY:
+            // For random delay, generate a random rate between min and max
             currentRate = rateDistribution(gen);
             currentDelay = 1000000 / currentRate;
             packet.delay = currentDelay / 1000.0f;
             break;
         }
 
+        // Add metadata to packet
         getTimestamp(packet.timestamp);
-        strcpy_s(packet.srcIP, SRC_IP);
-        strcpy_s(packet.dstIP, DST_IP);
+        strncpy_s(packet.srcIP, SRC_IP, sizeof(packet.srcIP));
+        strncpy_s(packet.dstIP, DST_IP, sizeof(packet.dstIP));
         packet.srcPort = SRC_PORT;
         packet.dstPort = DST_PORT;
 
-        // Send packet over UDP
-        int sendResult = sendto(clientSocket, reinterpret_cast<char*>(&packet), sizeof(Packet), 0,
-            (sockaddr*)&serverAddr, sizeof(serverAddr));
-
-        if (sendResult == SOCKET_ERROR) {
-            std::cerr << "Send failed: " << WSAGetLastError() << std::endl;
+        // Send the packet
+        if (sendto(clientSocket, (char*)&packet, sizeof(Packet), 0,
+            (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            std::cerr << "Error sending packet: " << WSAGetLastError() << std::endl;
         }
 
-        // Use the current delay for thread sleep
+        // Add appropriate delay based on the selected mode
         std::this_thread::sleep_for(std::chrono::microseconds(currentDelay));
     }
 
-    // Disable force before closing
+    // Disable force and close haptic device
     dhdEnableForce(DHD_OFF);
-    
-    // Cleanup
     dhdClose();
+
+    // Clean up Winsock
     closesocket(clientSocket);
     WSACleanup();
+
+    std::cout << "Haptic data sender thread terminated." << std::endl;
 }
 
-// ========================= PARAMETERS CONTROL THREAD =========================
-void parameterControlThread() {
-    char input;
-    std::cout << "\nControl Menu (press key followed by Enter):\n"
-              << "1: Increase plane stiffness\n"
-              << "2: Decrease plane stiffness\n"
-              << "3: Increase plane damping\n"
-              << "4: Decrease plane damping\n"
-              << "5: Increase plane friction\n"
-              << "6: Decrease plane friction\n"
-              << "7: Move plane up\n"
-              << "8: Move plane down\n"
-              << "9: Toggle plane on/off\n"
-              << "0: Display current parameters\n"
-              << "q: Quit\n";
-    
+// ========================= HAPTIC DATA RECEIVER THREAD =========================
+void hapticDataReceiver() {
+    if (!IS_SERVER) return;  // Only start receiver if configured as server
+
+    WSADATA wsaData;
+    SOCKET serverSocket;
+    sockaddr_in serverAddr, clientAddr;
+    int clientAddrLen = sizeof(clientAddr);
+    char recvBuffer[BUFFER_SIZE];
+    Packet* receivedPacket;
+
+    // Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        return;
+    }
+
+    // Create socket
+    serverSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (serverSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return;
+    }
+
+    // Set up server address
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(DST_PORT);
+
+    // Bind socket
+    if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "Bind failed: " << WSAGetLastError() << std::endl;
+        closesocket(serverSocket);
+        WSACleanup();
+        return;
+    }
+
+    std::cout << "Server listening on port " << DST_PORT << "..." << std::endl;
+
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_OPTION);
+
+    // Receiving loop
     while (keepRunning) {
-        std::cin >> input;
-        
-        std::lock_guard<std::mutex> lock(environmentMutex);
-        
-        switch (input) {
-            case '1':
-                virtualPlane.stiffness = std::min(1.0, virtualPlane.stiffness + 0.1);
-                std::cout << "Plane stiffness: " << virtualPlane.stiffness << std::endl;
-                break;
-            case '2':
-                virtualPlane.stiffness = std::max(0.0, virtualPlane.stiffness - 0.1);
-                std::cout << "Plane stiffness: " << virtualPlane.stiffness << std::endl;
-                break;
-            case '3':
-                virtualPlane.damping = std::min(1.0, virtualPlane.damping + 0.1);
-                std::cout << "Plane damping: " << virtualPlane.damping << std::endl;
-                break;
-            case '4':
-                virtualPlane.damping = std::max(0.0, virtualPlane.damping - 0.1);
-                std::cout << "Plane damping: " << virtualPlane.damping << std::endl;
-                break;
-            case '5':
-                virtualPlane.friction = std::min(1.0, virtualPlane.friction + 0.1);
-                std::cout << "Plane friction: " << virtualPlane.friction << std::endl;
-                break;
-            case '6':
-                virtualPlane.friction = std::max(0.0, virtualPlane.friction - 0.1);
-                std::cout << "Plane friction: " << virtualPlane.friction << std::endl;
-                break;
-            case '7':
-                virtualPlane.position += 0.01;  // Move up 1cm
-                std::cout << "Plane position: " << virtualPlane.position << " m" << std::endl;
-                break;
-            case '8':
-                virtualPlane.position -= 0.01;  // Move down 1cm
-                std::cout << "Plane position: " << virtualPlane.position << " m" << std::endl;
-                break;
-            case '9':
-                virtualPlane.enabled = !virtualPlane.enabled;
-                std::cout << "Plane " << (virtualPlane.enabled ? "enabled" : "disabled") << std::endl;
-                break;
-            case '0':
-                displayParameters();
-                break;
-            case 'q':
-            case 'Q':
-                keepRunning = false;
-                break;
-            default:
-                std::cout << "Invalid option\n";
+        // Receive data
+        int bytesReceived = recvfrom(serverSocket, recvBuffer, BUFFER_SIZE, 0,
+            (sockaddr*)&clientAddr, &clientAddrLen);
+
+        if (bytesReceived > 0) {
+            receivedPacket = (Packet*)recvBuffer;
+
+            // Process received haptic data
+            std::lock_guard<std::mutex> lock(environmentMutex);
+
+            // Update tool position based on received data
+            hapticTool.position[0] = receivedPacket->x;
+            hapticTool.position[1] = receivedPacket->y;
+            hapticTool.position[2] = receivedPacket->z;
+
+            // Update force data
+            hapticTool.force[0] = receivedPacket->fx;
+            hapticTool.force[1] = receivedPacket->fy;
+            hapticTool.force[2] = receivedPacket->fz;
+
+            // Display received packet info (can be commented out to reduce console output)
+            /*
+            std::cout << "Received packet #" << receivedPacket->packetNumber
+                      << " Position: (" << receivedPacket->x << ", "
+                      << receivedPacket->y << ", " << receivedPacket->z << ")"
+                      << " Force: (" << receivedPacket->fx << ", "
+                      << receivedPacket->fy << ", " << receivedPacket->fz << ")"
+                      << " at " << receivedPacket->timestamp << std::endl;
+            */
         }
+    }
+
+    // Clean up
+    closesocket(serverSocket);
+    WSACleanup();
+
+    std::cout << "Haptic data receiver thread terminated." << std::endl;
+}
+
+// ========================= HELP FUNCTION =========================
+void displayHelp() {
+    std::cout << "\n========== HELP MENU ==========\n";
+    std::cout << "Available commands:\n";
+    std::cout << "  help       - Display this help menu\n";
+    std::cout << "  quit       - Exit the application\n";
+    std::cout << "  plane pos  - Set plane position (e.g., plane pos 0.05)\n";
+    std::cout << "  plane stiff - Set plane stiffness (e.g., plane stiff 0.7)\n";
+    std::cout << "  plane damp - Set plane damping (e.g., plane damp 0.3)\n";
+    std::cout << "  plane fric - Set plane friction (e.g., plane fric 0.2)\n";
+    std::cout << "  plane on   - Enable the virtual plane\n";
+    std::cout << "  plane off  - Disable the virtual plane\n";
+    std::cout << "  tool size  - Set tool size in mm (e.g., tool size 5)\n";
+    std::cout << "  tool mass  - Set tool mass in g (e.g., tool mass 100)\n";
+    std::cout << "  status     - Display current system status\n";
+    std::cout << "==============================\n";
+}
+
+// ========================= COMMAND PROCESSING =========================
+void processCommand(const std::string& cmd) {
+    std::istringstream iss(cmd);
+    std::string command, subCommand;
+
+    iss >> command;
+
+    if (command == "help") {
+        displayHelp();
+    }
+    else if (command == "quit") {
+        keepRunning = false;
+        std::cout << "Exiting application...\n";
+    }
+    else if (command == "plane") {
+        iss >> subCommand;
+
+        if (subCommand == "pos") {
+            double pos;
+            if (iss >> pos) {
+                std::lock_guard<std::mutex> lock(environmentMutex);
+                virtualPlane.position = pos;
+                std::cout << "Plane position set to " << pos << " m\n";
+            }
+            else {
+                std::cout << "Invalid value. Usage: plane pos [value]\n";
+            }
+        }
+        else if (subCommand == "stiff") {
+            double stiff;
+            if (iss >> stiff) {
+                if (stiff >= 0.0 && stiff <= 1.0) {
+                    std::lock_guard<std::mutex> lock(environmentMutex);
+                    virtualPlane.stiffness = stiff;
+                    std::cout << "Plane stiffness set to " << stiff << "\n";
+                }
+                else {
+                    std::cout << "Stiffness must be between 0.0 and 1.0\n";
+                }
+            }
+            else {
+                std::cout << "Invalid value. Usage: plane stiff [value]\n";
+            }
+        }
+        else if (subCommand == "damp") {
+            double damp;
+            if (iss >> damp) {
+                if (damp >= 0.0 && damp <= 1.0) {
+                    std::lock_guard<std::mutex> lock(environmentMutex);
+                    virtualPlane.damping = damp;
+                    std::cout << "Plane damping set to " << damp << "\n";
+                }
+                else {
+                    std::cout << "Damping must be between 0.0 and 1.0\n";
+                }
+            }
+            else {
+                std::cout << "Invalid value. Usage: plane damp [value]\n";
+            }
+        }
+        else if (subCommand == "fric") {
+            double fric;
+            if (iss >> fric) {
+                if (fric >= 0.0 && fric <= 1.0) {
+                    std::lock_guard<std::mutex> lock(environmentMutex);
+                    virtualPlane.friction = fric;
+                    std::cout << "Plane friction set to " << fric << "\n";
+                }
+                else {
+                    std::cout << "Friction must be between 0.0 and 1.0\n";
+                }
+            }
+            else {
+                std::cout << "Invalid value. Usage: plane fric [value]\n";
+            }
+        }
+        else if (subCommand == "on") {
+            std::lock_guard<std::mutex> lock(environmentMutex);
+            virtualPlane.enabled = true;
+            std::cout << "Virtual plane enabled\n";
+        }
+        else if (subCommand == "off") {
+            std::lock_guard<std::mutex> lock(environmentMutex);
+            virtualPlane.enabled = false;
+            std::cout << "Virtual plane disabled\n";
+        }
+        else {
+            std::cout << "Unknown plane command. Type 'help' for available commands.\n";
+        }
+    }
+    else if (command == "tool") {
+        iss >> subCommand;
+
+        if (subCommand == "size") {
+            double size;
+            if (iss >> size) {
+                if (size > 0.0) {
+                    std::lock_guard<std::mutex> lock(environmentMutex);
+                    hapticTool.size = size / 1000.0;  // Convert mm to meters
+                    std::cout << "Tool size set to " << size << " mm\n";
+                }
+                else {
+                    std::cout << "Size must be positive\n";
+                }
+            }
+            else {
+                std::cout << "Invalid value. Usage: tool size [value_in_mm]\n";
+            }
+        }
+        else if (subCommand == "mass") {
+            double mass;
+            if (iss >> mass) {
+                if (mass > 0.0) {
+                    std::lock_guard<std::mutex> lock(environmentMutex);
+                    hapticTool.mass = mass / 1000.0;  // Convert g to kg
+                    std::cout << "Tool mass set to " << mass << " g\n";
+                }
+                else {
+                    std::cout << "Mass must be positive\n";
+                }
+            }
+            else {
+                std::cout << "Invalid value. Usage: tool mass [value_in_g]\n";
+            }
+        }
+        else {
+            std::cout << "Unknown tool command. Type 'help' for available commands.\n";
+        }
+    }
+    else if (command == "status") {
+        std::lock_guard<std::mutex> lock(environmentMutex);
+        std::cout << "\n========== SYSTEM STATUS ==========\n";
+        std::cout << "Virtual Plane:\n";
+        std::cout << "  Enabled:    " << (virtualPlane.enabled ? "Yes" : "No") << "\n";
+        std::cout << "  Position:   " << virtualPlane.position << " m\n";
+        std::cout << "  Stiffness:  " << virtualPlane.stiffness << "\n";
+        std::cout << "  Damping:    " << virtualPlane.damping << "\n";
+        std::cout << "  Friction:   " << virtualPlane.friction << "\n";
+        std::cout << "Haptic Tool:\n";
+        std::cout << "  Size:       " << hapticTool.size * 1000.0 << " mm\n";
+        std::cout << "  Mass:       " << hapticTool.mass * 1000.0 << " g\n";
+        std::cout << "  Position:   (" << hapticTool.position[0] << ", "
+            << hapticTool.position[1] << ", " << hapticTool.position[2] << ") m\n";
+        std::cout << "  Force:      (" << hapticTool.force[0] << ", "
+            << hapticTool.force[1] << ", " << hapticTool.force[2] << ") N\n";
+        std::cout << "==================================\n";
+    }
+    else {
+        std::cout << "Unknown command. Type 'help' for available commands.\n";
     }
 }
 
-int main() {
-    // Fetch local IP before starting
+// ========================= MAIN FUNCTION =========================
+int main(int argc, char** argv) {
+    // Get local IP address
     getLocalIP(SRC_IP);
 
-    // Display parameters on console
+    // Display system configuration
     displayParameters();
 
-    // Start the haptic data sender thread
+    // Initialize OpenGL and create window
+    initGraphics(argc, argv);
+
+    // Start haptic data sender thread
     std::thread senderThread(hapticDataSender);
-    
-    // Start parameter control thread
-    std::thread controlThread(parameterControlThread);
+
+    // Start haptic data receiver thread if configured as server
+    std::thread receiverThread;
+    if (IS_SERVER) {
+        receiverThread = std::thread(hapticDataReceiver);
+    }
+
+    // Display help information
+    displayHelp();
+
+    // Start GLUT main loop in a separate thread
+    std::thread glutThread([]() {
+        glutMainLoop();
+        });
+
+    // Main console loop for command processing
+    std::string input;
+    while (keepRunning) {
+        std::cout << "> ";
+        std::getline(std::cin, input);
+
+        if (!input.empty()) {
+            processCommand(input);
+        }
+    }
 
     // Wait for threads to finish
-    senderThread.join();
-    controlThread.join();
+    if (senderThread.joinable()) {
+        senderThread.join();
+    }
 
+    if (IS_SERVER && receiverThread.joinable()) {
+        receiverThread.join();
+    }
+
+    // Exit with success
     return 0;
 }
