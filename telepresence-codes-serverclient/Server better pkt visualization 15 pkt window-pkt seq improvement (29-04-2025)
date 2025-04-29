@@ -19,12 +19,21 @@
 #define MAX_PACKET_SIZE 400
 #define MAX_BUFFER_SIZE 5000  // Increased for secure packet storage
 
+// Global Configuration Parameters
+const int MAX_DISPLAY_PACKETS = 15;  // Maximum packets to display in windows
+const int FEEDBACK_ENABLED = 1;      // Enable/disable feedback (1=enabled, 0=disabled)
+const int PACKET_HISTORY_SIZE = 100; // Number of packets to consider for average timing
+float GLOBAL_RELEASE_RATE_FACTOR = 1.0f; // User-controlled release rate multiplier
+
+// Thread priority settings
+const int THREAD_PRIORITY_PACKET_RECEPTION = THREAD_PRIORITY_HIGHEST;
+const int THREAD_PRIORITY_PROCESSING = THREAD_PRIORITY_ABOVE_NORMAL;
+const int THREAD_PRIORITY_RENDERING = THREAD_PRIORITY_NORMAL;
+
 // Enhanced Visualization Parameters
-const std::chrono::milliseconds UNIFORM_PACKET_INTERVAL(2000);  // 2 seconds between packets (hardcoded)
-const int MAX_DISPLAY_BARS = 15;  // Keep exactly 15 packets in each window
-const float BAR_WIDTH = 0.02f;
-const float BAR_MAX_HEIGHT = 0.3f;
-const int TIMESTAMP_DISPLAY_INTERVAL = 3;
+const float BAR_WIDTH = 0.02f;      // Narrower bars to prevent overlap
+const float BAR_MAX_HEIGHT = 0.3f;  // Vertical height
+const int TIMESTAMP_DISPLAY_INTERVAL = 3; // Display every nth timestamp to avoid crowding
 
 // Packet and Distribution Tracking
 struct PacketStats {
@@ -32,109 +41,139 @@ struct PacketStats {
     int totalPacketsReceived = 0;
     std::chrono::steady_clock::time_point firstPacketTime;
     std::chrono::steady_clock::time_point lastPacketTime;
-    double avgInterPacketTime = 0.0;
+    double avgInterPacketTime = 0.0; // Average time between packets in ms
+    std::deque<double> packetTimings; // Store timing of last PACKET_HISTORY_SIZE packets
 };
 PacketStats globalPacketStats;
+std::mutex statsMutex;
 
 // Common Packet Structure
 struct Packet {
-    int packetNumber;
-    float x, y, z;
-    float delay;
-    char timestamp[64];
-    char srcIP[INET_ADDRSTRLEN];
-    char dstIP[INET_ADDRSTRLEN];
-    int srcPort;
-    int dstPort;
-    std::chrono::steady_clock::time_point receiveTime;
+    int packetNumber;  // Sequential packet number
+    float x, y, z;     // 3D Vector components
+    float delay;       // Processing delay in milliseconds
+    char timestamp[64];  // Timestamp of packet creation
+    char srcIP[INET_ADDRSTRLEN]; // Source IP address
+    char dstIP[INET_ADDRSTRLEN]; // Destination IP address
+    int srcPort;       // Source port
+    int dstPort;       // Destination port
+    std::chrono::steady_clock::time_point receiveTime;  // Time of packet reception
 };
 
-// Sliding Window Packet Distributor with Fixed Release Time
-class TimeAwarePacketDistributor {
+// Sliding Window Packet Distributor with Time-Aware Release
+class SlidingWindowPacketDistributor {
 private:
-    std::deque<Packet> packetBuffer;
-    std::deque<Packet> processedPackets;
+    std::deque<Packet> packetBuffer;       // Main secure buffer for all received packets
+    std::deque<Packet> processedPackets;   // Packets that have been processed/released
     std::mutex bufferMutex;
     std::mutex processedMutex;
     std::chrono::steady_clock::time_point lastReleaseTime;
-    std::map<int, double> packetTimeGaps;
+    std::map<int, double> packetTimeGaps;  // Stores time gaps between consecutive packets
 
 public:
-    TimeAwarePacketDistributor() : lastReleaseTime(std::chrono::steady_clock::now()) {}
+    SlidingWindowPacketDistributor() : lastReleaseTime(std::chrono::steady_clock::now()) {}
 
     void addPacket(const Packet& packet) {
         std::lock_guard<std::mutex> lock(bufferMutex);
-        
-        // Calculate time gap for visualization
+
+        // Calculate and store time gap if not the first packet
         if (!packetBuffer.empty()) {
             auto prevPacket = packetBuffer.back();
             double timeGapMs = std::chrono::duration<double, std::milli>(
                 packet.receiveTime - prevPacket.receiveTime).count();
             packetTimeGaps[packet.packetNumber] = timeGapMs;
         }
-        
-        // Add to buffer, maintaining sliding window behavior
+
+        // Add to secure buffer
         packetBuffer.push_back(packet);
-        
-        // Keep only the most recent packets in buffer (sliding window)
-        while (packetBuffer.size() > MAX_DISPLAY_BARS) {
+
+        // Ensure buffer doesn't exceed maximum size
+        if (packetBuffer.size() > MAX_BUFFER_SIZE) {
+            std::cerr << "Warning: Buffer approaching capacity, removing oldest packet" << std::endl;
             packetBuffer.pop_front();
         }
     }
 
-    // Process packets with fixed 2-second release time
+    // Process packets based on average receival time and ordered by packet number
     void processPackets() {
         auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> bufferLock(bufferMutex);
         std::lock_guard<std::mutex> processedLock(processedMutex);
+        std::lock_guard<std::mutex> statsLock(statsMutex);
 
-        // Check if 2 seconds have passed since last release
-        auto timeSinceLastRelease = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - lastReleaseTime).count();
-            
-        if (timeSinceLastRelease >= UNIFORM_PACKET_INTERVAL.count() && !packetBuffer.empty()) {
-            // Find the oldest packet in buffer (front of the deque)
-            Packet oldestPacket = packetBuffer.front();
-            
-            // Add to processed queue
-            processedPackets.push_back(oldestPacket);
-            
-            // Maintain sliding window of processed packets
-            while (processedPackets.size() > MAX_DISPLAY_BARS) {
-                processedPackets.pop_front();
+        // Check if it's time to release a packet based on average timing
+        if (!packetBuffer.empty()) {
+            // Get the average inter-packet time from global stats
+            double avgTimeMs = globalPacketStats.avgInterPacketTime;
+            if (avgTimeMs <= 0) avgTimeMs = 100.0; // Default if no stats available
+
+            // Apply user-controlled release rate factor
+            avgTimeMs *= GLOBAL_RELEASE_RATE_FACTOR;
+
+            // Calculate time elapsed since last release
+            auto timeSinceLastRelease = std::chrono::duration<double, std::milli>(
+                now - lastReleaseTime).count();
+
+            // Find the packet with the lowest packet number (maintain order)
+            auto oldestPacket = std::min_element(packetBuffer.begin(), packetBuffer.end(),
+                [](const Packet& a, const Packet& b) {
+                    return a.packetNumber < b.packetNumber;
+                });
+
+            // Check if enough time has passed to release the next packet
+            if (timeSinceLastRelease >= avgTimeMs) {
+                // Add to processed packets queue
+                processedPackets.push_back(*oldestPacket);
+
+                // Maintain sliding window by removing oldest when exceeding MAX_DISPLAY_PACKETS
+                while (processedPackets.size() > MAX_DISPLAY_PACKETS) {
+                    processedPackets.pop_front();
+                }
+
+                // Remove from buffer
+                packetBuffer.erase(oldestPacket);
+
+                // Update last release time
+                lastReleaseTime = now;
             }
-            
-            // Remove from buffer
-            packetBuffer.pop_front();
-            
-            // Update last release time
-            lastReleaseTime = now;
         }
     }
 
+    // Get all packets in buffer (only return the most recent for visualization)
     std::deque<Packet> getBufferedPackets() {
         std::lock_guard<std::mutex> lock(bufferMutex);
-        return packetBuffer;
+
+        // Create a copy with just the latest MAX_DISPLAY_PACKETS
+        std::deque<Packet> displayPackets;
+        int startIdx = std::max(0, (int)packetBuffer.size() - MAX_DISPLAY_PACKETS);
+
+        for (int i = startIdx; i < packetBuffer.size(); i++) {
+            displayPackets.push_back(packetBuffer[i]);
+        }
+
+        return displayPackets;
     }
 
+    // Get processed/released packets
     std::deque<Packet> getProcessedPackets() {
         std::lock_guard<std::mutex> lock(processedMutex);
         return processedPackets;
     }
 
+    // Get time gap for a specific packet
     double getPacketTimeGap(int packetNumber) {
         auto it = packetTimeGaps.find(packetNumber);
         if (it != packetTimeGaps.end()) {
             return it->second;
         }
-        return 0.0;
+        return 0.0; // No gap for first packet or if not found
     }
 
     size_t getBufferSize() {
         std::lock_guard<std::mutex> lock(bufferMutex);
         return packetBuffer.size();
     }
-    
+
     size_t getProcessedSize() {
         std::lock_guard<std::mutex> lock(processedMutex);
         return processedPackets.size();
@@ -142,11 +181,44 @@ public:
 };
 
 // Global packet distributor
-TimeAwarePacketDistributor packetDistributor;
+SlidingWindowPacketDistributor packetDistributor;
 
 // Function to calculate packet magnitude
 float calculateMagnitude(const Packet& packet) {
     return sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
+}
+
+// Function to send feedback to client
+void sendFeedback(const sockaddr_in& clientAddr, int packetNumber) {
+    if (!FEEDBACK_ENABLED) return;
+
+    // Create feedback socket
+    static SOCKET feedbackSocket = INVALID_SOCKET;
+    static std::mutex socketMutex;
+
+    std::lock_guard<std::mutex> lock(socketMutex);
+
+    // Create socket if not already created
+    if (feedbackSocket == INVALID_SOCKET) {
+        feedbackSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (feedbackSocket == INVALID_SOCKET) {
+            std::cerr << "Failed to create feedback socket: " << WSAGetLastError() << std::endl;
+            return;
+        }
+    }
+
+    // Create feedback message
+    struct FeedbackPacket {
+        int packetNumber;
+        char message[64];
+    } feedback;
+
+    feedback.packetNumber = packetNumber;
+    snprintf(feedback.message, sizeof(feedback.message), "Packet %d received", packetNumber);
+
+    // Send feedback
+    sendto(feedbackSocket, (const char*)&feedback, sizeof(feedback), 0,
+        (const sockaddr*)&clientAddr, sizeof(clientAddr));
 }
 
 void renderSmallText(float x, float y, void* font, const char* string,
@@ -160,6 +232,7 @@ void renderSmallText(float x, float y, void* font, const char* string,
 
 // Convert timestamp string to more compact format for display
 std::string formatTimestampForDisplay(const char* timestamp) {
+    // Extract just the time portion (assuming format "YYYY-MM-DD HH:MM:SS")
     std::string ts(timestamp);
     size_t spacePos = ts.find(' ');
     if (spacePos != std::string::npos && spacePos + 1 < ts.length()) {
@@ -171,8 +244,8 @@ std::string formatTimestampForDisplay(const char* timestamp) {
 // Draw sliding window visualization with packets moving from right to left
 void drawSlidingWindowGraph(const std::deque<Packet>& packets, float xOffset, const char* title,
     const PacketStats& stats, bool showTimeGaps = true) {
-    
-    // Background
+
+    // Background with subtle gradient
     glBegin(GL_QUADS);
     glColor3f(0.1f, 0.1f, 0.15f);
     glVertex2f(xOffset, 0.1f);
@@ -183,7 +256,7 @@ void drawSlidingWindowGraph(const std::deque<Packet>& packets, float xOffset, co
     glVertex2f(xOffset, 0.9f);
     glEnd();
 
-    // Grid lines
+    // Soft grid lines
     glColor3f(0.3f, 0.3f, 0.4f);
     glLineStipple(1, 0xAAAA);
     glEnable(GL_LINE_STIPPLE);
@@ -196,28 +269,21 @@ void drawSlidingWindowGraph(const std::deque<Packet>& packets, float xOffset, co
     glEnd();
     glDisable(GL_LINE_STIPPLE);
 
-    // Title and statistics
+    // Title with statistics
     std::stringstream titleStream;
-    titleStream << title << " (" << packets.size() << "/" << MAX_DISPLAY_BARS << " packets, Avg: "
+    titleStream << title << " (" << packets.size() << "/" << MAX_DISPLAY_PACKETS << " packets, Avg: "
         << std::fixed << std::setprecision(2)
         << stats.avgReceiveRate << " pkt/s)";
     renderSmallText(xOffset + 0.05f, 0.95f, GLUT_BITMAP_HELVETICA_12,
         titleStream.str().c_str(), 0.8f, 0.8f, 1.0f);
 
-    // Release time info for processed packets
-    if (title[0] == 'P') { // "Processed Packets"
-        std::stringstream releaseStream;
-        releaseStream << "Release Time: " << UNIFORM_PACKET_INTERVAL.count() << " ms (fixed)";
-        renderSmallText(xOffset + 0.05f, 0.91f, GLUT_BITMAP_HELVETICA_10,
-            releaseStream.str().c_str(), 0.9f, 0.7f, 0.7f);
-    } else {
-        // Inter-packet time for buffered packets
-        std::stringstream gapStream;
-        gapStream << "Avg Time Between Packets: " 
-                << std::fixed << std::setprecision(2) << stats.avgInterPacketTime << " ms";
-        renderSmallText(xOffset + 0.05f, 0.91f, GLUT_BITMAP_HELVETICA_10,
-            gapStream.str().c_str(), 0.7f, 0.9f, 0.7f);
-    }
+    // Add inter-packet time info
+    std::stringstream gapStream;
+    gapStream << "Avg Time Between Packets: "
+        << std::fixed << std::setprecision(2) << stats.avgInterPacketTime << " ms"
+        << " (Release Factor: " << GLOBAL_RELEASE_RATE_FACTOR << "x)";
+    renderSmallText(xOffset + 0.05f, 0.91f, GLUT_BITMAP_HELVETICA_10,
+        gapStream.str().c_str(), 0.7f, 0.9f, 0.7f);
 
     // Find max magnitude for scaling
     float maxMagnitude = 0.0f;
@@ -228,47 +294,59 @@ void drawSlidingWindowGraph(const std::deque<Packet>& packets, float xOffset, co
 
     // If we have packets to visualize
     if (!packets.empty()) {
+        // Calculate position scaling for sliding window
         float baseX = xOffset + 0.05f;
         float availableWidth = 0.35f;
-        
-        // Draw bars with sliding window visualization (newer packets on right)
+        float stepSize = availableWidth / MAX_DISPLAY_PACKETS;
+
+        // Draw sliding window bars
         glBegin(GL_QUADS);
-        
+
         for (size_t i = 0; i < packets.size(); ++i) {
             const Packet& packet = packets[i];
             float magnitude = calculateMagnitude(packet);
             float normalizedMagnitude = magnitude / (maxMagnitude > 0 ? maxMagnitude : 1.0f);
             normalizedMagnitude = std::min<float>(normalizedMagnitude, 1.0f);
 
-            // Position from right to left (newer packets on right)
-            // This creates the sliding window effect as packets enter from right
-            float x = xOffset + 0.4f - (packets.size() - i) * (availableWidth / MAX_DISPLAY_BARS);
+            // Position from right to left with newest on right
+            float x = baseX + availableWidth - (i * stepSize);
 
             // Bar gradient with depth effect
-            glColor3f(0.2f, 0.6f, 0.8f);
+            glColor3f(0.2f, 0.6f, 0.8f);  // Base color
             glVertex2f(x - BAR_WIDTH / 2, 0.15f);
             glVertex2f(x + BAR_WIDTH / 2, 0.15f);
 
-            glColor3f(0.3f, 0.7f, 0.9f);
+            glColor3f(0.3f, 0.7f, 0.9f);  // Lighter top
             glVertex2f(x + BAR_WIDTH / 2, 0.15f + normalizedMagnitude * BAR_MAX_HEIGHT);
             glVertex2f(x - BAR_WIDTH / 2, 0.15f + normalizedMagnitude * BAR_MAX_HEIGHT);
+
+            // Draw time gap indicator lines between bars
+            if (showTimeGaps && i > 0) {
+                float nextX = baseX + availableWidth - ((i - 1) * stepSize);
+                glColor3f(0.5f, 0.5f, 0.5f);
+                glVertex2f(x + BAR_WIDTH / 2, 0.145f);
+                glVertex2f(nextX - BAR_WIDTH / 2, 0.145f);
+                glVertex2f(nextX - BAR_WIDTH / 2, 0.155f);
+                glVertex2f(x + BAR_WIDTH / 2, 0.155f);
+            }
         }
         glEnd();
 
-        // Draw labels for each packet (only some to avoid crowding)
+        // Draw X-axis labels with timestamps - only draw some to avoid overlap
         for (size_t i = 0; i < packets.size(); ++i) {
+            // Display timestamps with consistent spacing
             if (i % TIMESTAMP_DISPLAY_INTERVAL == 0) {
-                float x = xOffset + 0.4f - (packets.size() - i) * (availableWidth / MAX_DISPLAY_BARS);
-                
+                float x = baseX + availableWidth - (i * stepSize);
+
                 // Packet number
                 std::stringstream ssNum;
                 ssNum << packets[i].packetNumber;
                 renderSmallText(x - 0.01f, 0.08f, GLUT_BITMAP_HELVETICA_10, ssNum.str().c_str());
-                
+
                 // Compact timestamp
                 std::string formattedTime = formatTimestampForDisplay(packets[i].timestamp);
                 renderSmallText(x - 0.02f, 0.05f, GLUT_BITMAP_HELVETICA_10, formattedTime.c_str());
-                
+
                 // Show delay value
                 std::stringstream ssDelay;
                 ssDelay << packets[i].delay << "ms";
@@ -279,8 +357,9 @@ void drawSlidingWindowGraph(const std::deque<Packet>& packets, float xOffset, co
 
     // Buffer status info
     std::stringstream bufferStream;
-    bufferStream << "Buffer: " << packetDistributor.getBufferSize() 
-                 << " / Processed: " << packetDistributor.getProcessedSize();
+    bufferStream << "Buffer: " << packetDistributor.getBufferSize()
+        << " / Processed: " << packetDistributor.getProcessedSize()
+        << " / Feedback: " << (FEEDBACK_ENABLED ? "ON" : "OFF");
     renderSmallText(xOffset + 0.25f, 0.02f, GLUT_BITMAP_HELVETICA_10,
         bufferStream.str().c_str(), 0.7f, 0.7f, 0.7f);
 }
@@ -297,37 +376,55 @@ void display() {
     std::deque<Packet> bufferedPackets = packetDistributor.getBufferedPackets();
     std::deque<Packet> processedPackets = packetDistributor.getProcessedPackets();
 
+    // Get current stats
+    PacketStats stats;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        stats = globalPacketStats;
+    }
+
     // Draw sliding window visualizations
-    drawSlidingWindowGraph(bufferedPackets, 0.0f, "Buffered Packets", globalPacketStats, false);
-    drawSlidingWindowGraph(processedPackets, 0.5f, "Processed Packets", globalPacketStats, false);
+    drawSlidingWindowGraph(bufferedPackets, 0.0f, "Buffered Packets", stats, false);
+    drawSlidingWindowGraph(processedPackets, 0.5f, "Processed Packets", stats, true);
+
+    // Render help text
+    renderSmallText(0.05f, 0.97f, GLUT_BITMAP_HELVETICA_12,
+        "Controls: 'F' - Toggle Feedback, '+'/'-' - Adjust Release Rate, 'Q' - Quit",
+        1.0f, 1.0f, 0.7f);
 
     glutSwapBuffers();
 }
 
-// Update packet statistics
+// Update packet statistics in UDP server
 void updatePacketStats(const Packet& packet) {
-    static std::mutex statsMutex;
     std::lock_guard<std::mutex> lock(statsMutex);
 
     auto currentTime = std::chrono::steady_clock::now();
-    
+
     if (globalPacketStats.totalPacketsReceived == 0) {
         globalPacketStats.firstPacketTime = currentTime;
         globalPacketStats.lastPacketTime = currentTime;
-    } else {
+    }
+    else {
         // Calculate time between packets
         double interPacketTimeMs = std::chrono::duration<double, std::milli>(
             currentTime - globalPacketStats.lastPacketTime).count();
-            
-        // Update average inter-packet time with exponential moving average
-        if (globalPacketStats.avgInterPacketTime == 0) {
-            globalPacketStats.avgInterPacketTime = interPacketTimeMs;
-        } else {
-            double alpha = 0.1; // Smoothing factor
-            globalPacketStats.avgInterPacketTime = 
-                (1 - alpha) * globalPacketStats.avgInterPacketTime + alpha * interPacketTimeMs;
+
+        // Add to history
+        globalPacketStats.packetTimings.push_back(interPacketTimeMs);
+
+        // Maintain history size
+        while (globalPacketStats.packetTimings.size() > PACKET_HISTORY_SIZE) {
+            globalPacketStats.packetTimings.pop_front();
         }
-        
+
+        // Calculate average from history
+        double sum = 0;
+        for (double timing : globalPacketStats.packetTimings) {
+            sum += timing;
+        }
+        globalPacketStats.avgInterPacketTime = sum / globalPacketStats.packetTimings.size();
+
         globalPacketStats.lastPacketTime = currentTime;
     }
 
@@ -342,6 +439,9 @@ void updatePacketStats(const Packet& packet) {
 
 // UDP server thread for receiving packets
 void udpServer() {
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_PACKET_RECEPTION);
+
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 
@@ -362,23 +462,30 @@ void udpServer() {
             reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
 
         if (bytesReceived > 0 && bytesReceived <= MAX_PACKET_SIZE) {
-            // Capture network details
+            // Capture network details and add to distributor
             inet_ntop(AF_INET, &clientAddr.sin_addr, packet.srcIP, INET_ADDRSTRLEN);
             inet_ntop(AF_INET, &serverAddr.sin_addr, packet.dstIP, INET_ADDRSTRLEN);
             packet.srcPort = ntohs(clientAddr.sin_port);
             packet.dstPort = ntohs(serverAddr.sin_port);
             packet.receiveTime = std::chrono::steady_clock::now();
 
-            // Update stats and add to buffer
+            // Update global packet statistics
             updatePacketStats(packet);
+
+            // Add to secure buffer
             packetDistributor.addPacket(packet);
 
-            // Console output
+            // Send feedback to client
+            sendFeedback(clientAddr, packet.packetNumber);
+
+            // Console output with comprehensive stats
             std::cout << std::fixed << std::setprecision(3)
                 << "Pkt #" << packet.packetNumber
                 << " | Pos: (" << packet.x << "," << packet.y << "," << packet.z << ")"
                 << " | Delay: " << packet.delay << "ms"
-                << " | Release in: " << UNIFORM_PACKET_INTERVAL.count() << "ms (fixed)"
+                << " | Avg Rate: " << globalPacketStats.avgReceiveRate << " pkt/s"
+                << " | Avg Gap: " << globalPacketStats.avgInterPacketTime << " ms"
+                << " | Release Factor: " << GLOBAL_RELEASE_RATE_FACTOR << "x"
                 << std::endl;
         }
     }
@@ -387,11 +494,43 @@ void udpServer() {
     WSACleanup();
 }
 
-// Packet processing thread with fixed 2-second release time
+// Packet processing thread
 void packetProcessingThread() {
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_PROCESSING);
+
     while (true) {
         packetDistributor.processPackets();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5)); // Process more frequently
+    }
+}
+
+// Keyboard handler for controls
+void keyboardFunction(unsigned char key, int x, int y) {
+    switch (key) {
+    case 'f':
+    case 'F':
+        //FEEDBACK_ENABLED = !FEEDBACK_ENABLED;
+        std::cout << "Feedback " << (FEEDBACK_ENABLED ? "enabled" : "disabled") << std::endl;
+        break;
+
+    case '+':
+    case '=':
+        GLOBAL_RELEASE_RATE_FACTOR *= 1.2f;
+        std::cout << "Release rate factor increased to " << GLOBAL_RELEASE_RATE_FACTOR << "x" << std::endl;
+        break;
+
+    case '-':
+    case '_':
+        GLOBAL_RELEASE_RATE_FACTOR *= 0.8f;
+        if (GLOBAL_RELEASE_RATE_FACTOR < 0.1f) GLOBAL_RELEASE_RATE_FACTOR = 0.1f;
+        std::cout << "Release rate factor decreased to " << GLOBAL_RELEASE_RATE_FACTOR << "x" << std::endl;
+        break;
+
+    case 'q':
+    case 'Q':
+        exit(0);
+        break;
     }
 }
 
@@ -408,22 +547,26 @@ void idleFunction() {
 }
 
 int main(int argc, char** argv) {
-    // Start UDP server thread
+    // Start UDP server thread (highest priority)
     std::thread udpThread(udpServer);
 
-    // Start packet processing thread
+    // Start packet processing thread (above normal priority)
     std::thread processingThread(packetProcessingThread);
 
     // OpenGL initialization
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
-    glutInitWindowSize(800, 600);
-    glutCreateWindow("Sliding Window Packet Visualization (2s Fixed Release)");
+    glutInitWindowSize(900, 600);
+    glutCreateWindow("Sliding Window Haptic Teleoperation Packet Visualization");
 
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
 
     glutDisplayFunc(display);
     glutIdleFunc(idleFunction);
+    glutKeyboardFunc(keyboardFunction);
+
+    // Set render thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_RENDERING);
 
     glutMainLoop();
 
