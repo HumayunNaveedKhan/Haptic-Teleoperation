@@ -1,0 +1,462 @@
+#include <iostream>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <cstring>
+#include <ctime>
+#include <chrono>
+#include <thread>
+#include <random>
+#include <vector>
+#include <mutex>
+#include "C:\Program Files\Force Dimension\sdk-3.17.1\include\dhdc.h"  
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+
+// ========================= CONFIGURABLE PARAMETERS =========================
+
+// Network settings
+char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";  // Will be fetched dynamically
+const char DST_IP[] = "169.254.213.206";   // Destination IP (Receiver)
+const int SRC_PORT = 1000;                 // Source UDP Port
+const int DST_PORT = 4000;                 // Destination UDP Port
+
+// Transmission settings
+const int BUFFER_SIZE = 1024;        // Packet buffer size
+const bool IS_SERVER = false;        // Set to true if running as a server
+const int THREAD_PRIORITY_OPTION = THREAD_PRIORITY_TIME_CRITICAL;  // Set priority
+
+// Delay mode settings
+enum DelayMode {
+    UNIFORM_DELAY,    // Constant delay based on haptic rate
+    RANDOM_DELAY      // Variable delay within a range
+};
+const DelayMode DELAY_MODE = UNIFORM_DELAY;  // Choose delay mode
+
+// Haptic device rate settings
+const int HAPTIC_RATE_HZ = 1000;  // Haptic device update rate in Hz
+const int HAPTIC_DELAY_US = 1000000 / HAPTIC_RATE_HZ;  // Delay in microseconds
+
+// Random delay settings
+const int RANDOM_DELAY_MIN_HZ = 1;     // Minimum random rate
+const int RANDOM_DELAY_MAX_HZ = 50;    // Maximum random rate
+const int RANDOM_DELAY_MIN_US = 1000000 / RANDOM_DELAY_MAX_HZ;  // Minimum delay
+const int RANDOM_DELAY_MAX_US = 1000000 / RANDOM_DELAY_MIN_HZ;  // Maximum delay
+
+// Global control variables
+volatile bool keepRunning = true;  // Flag to stop the thread safely
+
+// Random number generator for delay
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_int_distribution<> rateDistribution(RANDOM_DELAY_MIN_HZ, RANDOM_DELAY_MAX_HZ);
+
+// ========================= VIRTUAL ENVIRONMENT PARAMETERS =========================
+
+// Virtual plane parameters
+struct VirtualPlane {
+    double position;      // Z-position of the plane
+    double stiffness;     // Stiffness of the plane (0.0 - 1.0)
+    double damping;       // Damping coefficient (0.0 - 1.0)
+    double friction;      // Surface friction (0.0 - 1.0)
+    bool enabled;         // Enable/disable the plane
+};
+
+// Tool/cursor parameters
+struct HapticTool {
+    double position[3];   // Current position (x,y,z)
+    double lastPosition[3]; // Previous position
+    double velocity[3];   // Current velocity
+    double force[3];      // Force to be applied
+    double size;          // Size of the cursor (radius in m)
+    double mass;          // Mass of the cursor (kg)
+};
+
+// Environment parameters
+VirtualPlane virtualPlane = {
+    0.0,    // Position at z=0
+    0.5,    // Medium stiffness
+    0.3,    // Medium damping
+    0.2,    // Medium friction
+    true    // Enabled by default
+};
+
+HapticTool hapticTool = {
+    {0.0, 0.0, 0.0},  // Position
+    {0.0, 0.0, 0.0},  // Last position
+    {0.0, 0.0, 0.0},  // Velocity
+    {0.0, 0.0, 0.0},  // Force
+    0.005,            // 5mm radius tool
+    0.1               // 100g mass
+};
+
+// Mutex for thread safety when updating parameters
+std::mutex environmentMutex;
+
+// Environment boundaries
+const double ENV_SIZE_X = 0.1;  // ±10cm in X
+const double ENV_SIZE_Y = 0.1;  // ±10cm in Y
+const double ENV_SIZE_Z = 0.1;  // ±10cm in Z
+
+// ========================= FUNCTION TO FETCH SOURCE IP =========================
+void getLocalIP(char* ipBuffer) {
+    char hostname[256];
+    struct addrinfo hints {}, * info, * p;
+    struct sockaddr_in* sockaddr_ipv4;
+
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_PASSIVE;
+
+        if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
+            for (p = info; p != NULL; p = p->ai_next) {
+                sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
+                inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, INET_ADDRSTRLEN);
+                break;
+            }
+            freeaddrinfo(info);
+        }
+    }
+}
+
+// Updated display parameters to show virtual environment settings
+void displayParameters() {
+    std::cout << "========== SYSTEM CONFIGURATION ==========\n";
+    std::cout << "Source IP:         " << SRC_IP << "\n";
+    std::cout << "Destination IP:    " << DST_IP << "\n";
+    std::cout << "Source Port:       " << SRC_PORT << "\n";
+    std::cout << "Destination Port:  " << DST_PORT << "\n";
+    std::cout << "Buffer Size:       " << BUFFER_SIZE << "\n";
+
+    switch (DELAY_MODE) {
+    case UNIFORM_DELAY:
+        std::cout << "Delay Mode:        Uniform\n";
+        std::cout << "Haptic Rate:       " << HAPTIC_RATE_HZ << " Hz\n";
+        std::cout << "Uniform Delay:     " << HAPTIC_DELAY_US << " µs\n";
+        break;
+    case RANDOM_DELAY:
+        std::cout << "Delay Mode:        Random\n";
+        std::cout << "Random Rate Range: " << RANDOM_DELAY_MIN_HZ
+            << " - " << RANDOM_DELAY_MAX_HZ << " Hz\n";
+        std::cout << "Random Delay Range: " << RANDOM_DELAY_MIN_US
+            << " - " << RANDOM_DELAY_MAX_US << " µs\n";
+        break;
+    }
+
+    std::cout << "Is Server:         " << (IS_SERVER ? "True" : "False") << "\n";
+    std::cout << "Thread Priority:   " << THREAD_PRIORITY_OPTION << "\n";
+    std::cout << "\n========== VIRTUAL ENVIRONMENT ==========\n";
+    std::cout << "Plane Position:    " << virtualPlane.position << " m\n";
+    std::cout << "Plane Stiffness:   " << virtualPlane.stiffness << "\n";
+    std::cout << "Plane Damping:     " << virtualPlane.damping << "\n";
+    std::cout << "Plane Friction:    " << virtualPlane.friction << "\n";
+    std::cout << "Tool Size:         " << hapticTool.size * 1000 << " mm\n";
+    std::cout << "Tool Mass:         " << hapticTool.mass * 1000 << " g\n";
+    std::cout << "Environment Size:  ±" << ENV_SIZE_X * 100 << " cm (X), ±" 
+              << ENV_SIZE_Y * 100 << " cm (Y), ±" << ENV_SIZE_Z * 100 << " cm (Z)\n";
+    std::cout << "===========================================\n";
+}
+
+// ========================= PACKET STRUCTURE =========================
+struct Packet {
+    int packetNumber;
+    float x, y, z;        // Position
+    float fx, fy, fz;     // Force
+    float delay;
+    char timestamp[64];
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int srcPort;
+    int dstPort;
+};
+
+// Function to get current timestamp in a specific format
+void getTimestamp(char* timestamp) {
+    time_t now = time(0);
+    struct tm tstruct;
+    localtime_s(&tstruct, &now);
+    strftime(timestamp, 64, "%Y-%m-%d %X", &tstruct);
+}
+
+// ========================= HAPTIC FORCE COMPUTATION =========================
+
+// Calculate force feedback from the virtual plane
+void calculateVirtualPlaneForce(double pos[3], double vel[3], double force[3]) {
+    // Reset forces
+    force[0] = 0.0;
+    force[1] = 0.0;
+    force[2] = 0.0;
+    
+    if (!virtualPlane.enabled) return;
+    
+    // Check if tool is penetrating the plane (tool is below plane)
+    double penetrationDepth = virtualPlane.position - pos[2];
+    
+    if (penetrationDepth > 0.0) {
+        // Calculate normal force based on penetration depth (spring) and velocity (damping)
+        double normalForce = virtualPlane.stiffness * penetrationDepth - virtualPlane.damping * vel[2];
+        force[2] = normalForce;
+        
+        // Calculate friction force tangent to the plane (X and Y directions)
+        // Friction is proportional to normal force and depends on tool movement in X-Y plane
+        double frictionFactor = virtualPlane.friction * normalForce;
+        
+        // Simple viscous friction model - friction opposes velocity
+        if (vel[0] != 0.0 || vel[1] != 0.0) {
+            // Calculate velocity magnitude in XY plane
+            double velXYMag = sqrt(vel[0]*vel[0] + vel[1]*vel[1]);
+            
+            if (velXYMag > 0.0001) {  // Avoid division by very small numbers
+                // Normalize and apply friction
+                force[0] = -frictionFactor * vel[0] / velXYMag;
+                force[1] = -frictionFactor * vel[1] / velXYMag;
+            }
+        }
+    }
+}
+
+// Calculate velocity from current and previous positions
+void calculateVelocity(double pos[3], double lastPos[3], double vel[3], double timeStep) {
+    for (int i = 0; i < 3; i++) {
+        vel[i] = (pos[i] - lastPos[i]) / timeStep;
+    }
+}
+
+// Update tool position and store last position
+void updateToolPosition(double pos[3]) {
+    std::lock_guard<std::mutex> lock(environmentMutex);
+    
+    // Store current position as last position
+    for (int i = 0; i < 3; i++) {
+        hapticTool.lastPosition[i] = hapticTool.position[i];
+        hapticTool.position[i] = pos[i];
+    }
+}
+
+// ========================= HAPTIC DATA SENDER THREAD =========================
+void hapticDataSender() {
+    WSADATA wsaData;
+    SOCKET clientSocket;
+    sockaddr_in serverAddr;
+    Packet packet;
+    int packetNumber = 0;
+
+    // Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed: " << WSAGetLastError() << std::endl;
+        return;
+    }
+
+    // Create the UDP socket
+    clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (clientSocket == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return;
+    }
+
+    // Set up the server address
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(DST_PORT);
+    if (inet_pton(AF_INET, DST_IP, &serverAddr.sin_addr) <= 0) {
+        std::cerr << "Invalid destination IP" << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return;
+    }
+
+    // Initialize the haptic device
+    if (dhdOpen() < 0) {
+        std::cerr << "Cannot open haptic device: " << dhdErrorGetLastStr() << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return;
+    }
+
+    std::cout << "Haptic device initialized!" << std::endl;
+    
+    // Enable force feedback
+    if (dhdEnableForce(DHD_ON) < 0) {
+        std::cerr << "Error enabling force feedback: " << dhdErrorGetLastStr() << std::endl;
+    }
+
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_OPTION);
+
+    // Time variables for velocity calculation
+    auto lastTime = std::chrono::high_resolution_clock::now();
+    
+    // Sending loop based on selected delay mode
+    while (keepRunning) {
+        double hx, hy, hz;
+
+        // Get haptic device position
+        if (dhdGetPosition(&hx, &hy, &hz) < 0) {
+            std::cerr << "Error getting haptic position: " << dhdErrorGetLastStr() << std::endl;
+            break;
+        }
+        
+        // Update current time and calculate time step
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        double timeStep = std::chrono::duration<double>(currentTime - lastTime).count();
+        lastTime = currentTime;
+        
+        // Update tool position
+        double currentPosition[3] = {hx, hy, hz};
+        updateToolPosition(currentPosition);
+        
+        // Calculate velocity
+        std::lock_guard<std::mutex> lock(environmentMutex);
+        calculateVelocity(hapticTool.position, hapticTool.lastPosition, hapticTool.velocity, timeStep);
+        
+        // Calculate haptic force
+        calculateVirtualPlaneForce(hapticTool.position, hapticTool.velocity, hapticTool.force);
+        
+        // Apply force to the device
+        if (dhdSetForce(hapticTool.force[0], hapticTool.force[1], hapticTool.force[2]) < 0) {
+            std::cerr << "Error setting force: " << dhdErrorGetLastStr() << std::endl;
+        }
+
+        // Fill packet data
+        packet.packetNumber = ++packetNumber;
+        packet.x = static_cast<float>(hx);
+        packet.y = static_cast<float>(hy);
+        packet.z = static_cast<float>(hz);
+        packet.fx = static_cast<float>(hapticTool.force[0]);
+        packet.fy = static_cast<float>(hapticTool.force[1]);
+        packet.fz = static_cast<float>(hapticTool.force[2]);
+
+        // Choose delay based on DELAY_MODE
+        int currentDelay, currentRate;
+        switch (DELAY_MODE) {
+        case UNIFORM_DELAY:
+            currentDelay = HAPTIC_DELAY_US;
+            currentRate = HAPTIC_RATE_HZ;
+            packet.delay = HAPTIC_DELAY_US / 1000.0f;
+            break;
+        case RANDOM_DELAY:
+            currentRate = rateDistribution(gen);
+            currentDelay = 1000000 / currentRate;
+            packet.delay = currentDelay / 1000.0f;
+            break;
+        }
+
+        getTimestamp(packet.timestamp);
+        strcpy_s(packet.srcIP, SRC_IP);
+        strcpy_s(packet.dstIP, DST_IP);
+        packet.srcPort = SRC_PORT;
+        packet.dstPort = DST_PORT;
+
+        // Send packet over UDP
+        int sendResult = sendto(clientSocket, reinterpret_cast<char*>(&packet), sizeof(Packet), 0,
+            (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+        if (sendResult == SOCKET_ERROR) {
+            std::cerr << "Send failed: " << WSAGetLastError() << std::endl;
+        }
+
+        // Use the current delay for thread sleep
+        std::this_thread::sleep_for(std::chrono::microseconds(currentDelay));
+    }
+
+    // Disable force before closing
+    dhdEnableForce(DHD_OFF);
+    
+    // Cleanup
+    dhdClose();
+    closesocket(clientSocket);
+    WSACleanup();
+}
+
+// ========================= PARAMETERS CONTROL THREAD =========================
+void parameterControlThread() {
+    char input;
+    std::cout << "\nControl Menu (press key followed by Enter):\n"
+              << "1: Increase plane stiffness\n"
+              << "2: Decrease plane stiffness\n"
+              << "3: Increase plane damping\n"
+              << "4: Decrease plane damping\n"
+              << "5: Increase plane friction\n"
+              << "6: Decrease plane friction\n"
+              << "7: Move plane up\n"
+              << "8: Move plane down\n"
+              << "9: Toggle plane on/off\n"
+              << "0: Display current parameters\n"
+              << "q: Quit\n";
+    
+    while (keepRunning) {
+        std::cin >> input;
+        
+        std::lock_guard<std::mutex> lock(environmentMutex);
+        
+        switch (input) {
+            case '1':
+                virtualPlane.stiffness = std::min(1.0, virtualPlane.stiffness + 0.1);
+                std::cout << "Plane stiffness: " << virtualPlane.stiffness << std::endl;
+                break;
+            case '2':
+                virtualPlane.stiffness = std::max(0.0, virtualPlane.stiffness - 0.1);
+                std::cout << "Plane stiffness: " << virtualPlane.stiffness << std::endl;
+                break;
+            case '3':
+                virtualPlane.damping = std::min(1.0, virtualPlane.damping + 0.1);
+                std::cout << "Plane damping: " << virtualPlane.damping << std::endl;
+                break;
+            case '4':
+                virtualPlane.damping = std::max(0.0, virtualPlane.damping - 0.1);
+                std::cout << "Plane damping: " << virtualPlane.damping << std::endl;
+                break;
+            case '5':
+                virtualPlane.friction = std::min(1.0, virtualPlane.friction + 0.1);
+                std::cout << "Plane friction: " << virtualPlane.friction << std::endl;
+                break;
+            case '6':
+                virtualPlane.friction = std::max(0.0, virtualPlane.friction - 0.1);
+                std::cout << "Plane friction: " << virtualPlane.friction << std::endl;
+                break;
+            case '7':
+                virtualPlane.position += 0.01;  // Move up 1cm
+                std::cout << "Plane position: " << virtualPlane.position << " m" << std::endl;
+                break;
+            case '8':
+                virtualPlane.position -= 0.01;  // Move down 1cm
+                std::cout << "Plane position: " << virtualPlane.position << " m" << std::endl;
+                break;
+            case '9':
+                virtualPlane.enabled = !virtualPlane.enabled;
+                std::cout << "Plane " << (virtualPlane.enabled ? "enabled" : "disabled") << std::endl;
+                break;
+            case '0':
+                displayParameters();
+                break;
+            case 'q':
+            case 'Q':
+                keepRunning = false;
+                break;
+            default:
+                std::cout << "Invalid option\n";
+        }
+    }
+}
+
+int main() {
+    // Fetch local IP before starting
+    getLocalIP(SRC_IP);
+
+    // Display parameters on console
+    displayParameters();
+
+    // Start the haptic data sender thread
+    std::thread senderThread(hapticDataSender);
+    
+    // Start parameter control thread
+    std::thread controlThread(parameterControlThread);
+
+    // Wait for threads to finish
+    senderThread.join();
+    controlThread.join();
+
+    return 0;
+}
