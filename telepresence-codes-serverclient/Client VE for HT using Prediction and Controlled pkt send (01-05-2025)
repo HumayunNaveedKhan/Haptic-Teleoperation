@@ -1,0 +1,1321 @@
+//------------------------------------------------------------------------------
+// INTEGRATED HAPTIC VISUALIZATION WITH NETWORK COMMUNICATION
+// 
+// This application integrates CHAI3D terrain visualization with UDP networking
+// for haptic device position transmission.
+//
+// For Visual Studio on Windows
+//------------------------------------------------------------------------------
+
+#include "chai3d.h"
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <random>
+#include <chrono>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+
+//------------------------------------------------------------------------------
+using namespace chai3d;
+using namespace std;
+//------------------------------------------------------------------------------
+
+// GLUT window handler
+#include "GL/glut.h"
+
+//------------------------------------------------------------------------------
+// NETWORK CONFIGURATION
+//------------------------------------------------------------------------------
+char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";  // Will be fetched dynamically
+const char DST_IP[] = "169.254.213.206";   // Destination IP (Receiver)
+const int SRC_PORT = 1000;                 // Source UDP Port
+const int DST_PORT = 4000;                 // Destination UDP Port
+const int BUFFER_SIZE = 1024;              // Packet buffer size
+
+// Networking packet structure
+struct Packet {
+    int packetNumber;
+    float x, y, z;
+    float fx, fy, fz;  // For force feedback if needed
+    float delay;
+    char timestamp[64];
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int srcPort;
+    int dstPort;
+};
+
+// Delay mode settings
+enum DelayMode {
+    UNIFORM_DELAY,    // Constant delay based on haptic rate
+    RANDOM_DELAY      // Variable delay within a range
+};
+const DelayMode DELAY_MODE = RANDOM_DELAY;  // Choose delay mode
+const int HAPTIC_RATE_HZ = 1000;            // Target haptic update rate in Hz
+const int HAPTIC_DELAY_US = 1000000 / HAPTIC_RATE_HZ;  // Delay in microseconds
+const int RANDOM_DELAY_MIN_HZ = 1;          // Minimum random rate
+const int RANDOM_DELAY_MAX_HZ = 50;         // Maximum random rate
+const int RANDOM_DELAY_MIN_US = 1000000 / RANDOM_DELAY_MAX_HZ;  // Min delay
+const int RANDOM_DELAY_MAX_US = 1000000 / RANDOM_DELAY_MIN_HZ;  // Max delay
+
+// Network socket
+SOCKET networkSocket = INVALID_SOCKET;
+struct sockaddr_in serverAddr;
+
+// Flag to control network thread
+std::atomic<bool> networkRunning(false);
+std::thread networkThread;
+
+// Random number generator for delay
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_int_distribution<> rateDistribution(RANDOM_DELAY_MIN_HZ, RANDOM_DELAY_MAX_HZ);
+
+//------------------------------------------------------------------------------
+// GENERAL SETTINGS
+//------------------------------------------------------------------------------
+
+// stereo Mode
+cStereoMode stereoMode = C_STEREO_DISABLED;
+
+// fullscreen mode
+bool fullscreen = false;
+
+// mirrored display
+bool mirroredDisplay = false;
+
+// state machine states
+const int STATE_IDLE            = 1;
+const int STATE_MODIFY_MAP      = 2;
+const int STATE_MOVE_CAMERA     = 3;
+
+// Network state options
+const int NETWORK_DISABLED      = 0;
+const int NETWORK_ENABLED       = 1;
+int networkState = NETWORK_DISABLED;
+
+// Packet counter
+int packetNumber = 0;
+
+//------------------------------------------------------------------------------
+// DECLARED VARIABLES
+//------------------------------------------------------------------------------
+
+// a world that contains all objects of the virtual environment
+cWorld* world;
+
+// a camera to render the world in the window display
+cCamera* camera;
+
+// a light source to illuminate the objects in the world
+cSpotLight *light;
+
+// a haptic device handler
+cHapticDeviceHandler* handler;
+
+// a pointer to the current haptic device
+cGenericHapticDevicePtr hapticDevice;
+
+// a virtual tool representing the haptic device in the scene
+cToolCursor* tool;
+
+// radius of tool for graphic and haptic representation
+double hapticRadius;
+double displayRadius;
+
+// a virtual mesh like object
+cMesh* object;
+
+// a small magnetic line used to constrain the tool along the vertical axis
+cShapeLine* magneticLine;
+
+// two sphere placed at both end of the magnetic line
+cShapeSphere* sphereA;
+cShapeSphere* sphereB;
+
+// a label to display the rate [Hz] at which the simulation is running
+cLabel* labelHapticRate;
+cLabel* labelMessage;
+cLabel* labelNetworkStatus;
+
+// indicates if the haptic simulation currently running
+bool simulationRunning = false;
+
+// indicates if the haptic simulation has terminated
+bool simulationFinished = true;
+
+// frequency counter to measure the simulation haptic rate
+cFrequencyCounter frequencyCounter;
+
+// information about computer screen and GLUT display window
+int screenW;
+int screenH;
+int windowW;
+int windowH;
+int windowPosX;
+int windowPosY;
+
+// state machine 
+int state = STATE_IDLE;
+
+// mouse position and button status
+int mouseX, mouseY;
+int mouseButton;
+
+// camera status
+bool flagCameraInMotion = false;
+
+// informs the graphic display callback to update the display list
+// when the topology of the 3D height map is changed.
+bool flagMarkForUpdate = false;
+
+// root resource path
+string resourceRoot;
+
+//------------------------------------------------------------------------------
+// DECLARED MACROS
+//------------------------------------------------------------------------------
+
+// convert to resource path
+#define RESOURCE_PATH(p)    (char*)((resourceRoot+string(p)).c_str())
+
+//------------------------------------------------------------------------------
+// DECLARED FUNCTIONS
+//------------------------------------------------------------------------------
+
+// callback when the window display is resized
+void resizeWindow(int w, int h);
+
+// callback when a key is pressed
+void keySelect(unsigned char key, int x, int y);
+
+// callback to render graphic scene
+void updateGraphics(void);
+
+// callback of GLUT timer
+void graphicsTimer(int data);
+
+// function that closes the application
+void close(void);
+
+// main haptics simulation loop
+void updateHaptics(void);
+
+// update camera settings
+void updateCameraPosition();
+
+// loads a bitmap file and create 3D height map based on pixel color
+int loadHeightMap();
+
+// Network functions
+void getLocalIP(char* ipBuffer);
+void getTimestamp(char* timestamp);
+void initializeNetwork();
+void closeNetwork();
+void networkSender();
+void toggleNetwork();
+void displayNetworkParameters();
+
+//------------------------------------------------------------------------------
+// NETWORK IMPLEMENTATION
+//------------------------------------------------------------------------------
+
+// Function to get local IP address
+void getLocalIP(char* ipBuffer) {
+    char hostname[256];
+    struct addrinfo hints {}, * info, * p;
+    struct sockaddr_in* sockaddr_ipv4;
+
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_PASSIVE;
+
+        if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
+            for (p = info; p != NULL; p = p->ai_next) {
+                sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
+                inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, INET_ADDRSTRLEN);
+                break;
+            }
+            freeaddrinfo(info);
+        }
+    }
+}
+
+// Function to get current timestamp
+void getTimestamp(char* timestamp) {
+    time_t now = time(0);
+    struct tm tstruct;
+    localtime_s(&tstruct, &now);
+    strftime(timestamp, 64, "%Y-%m-%d %X", &tstruct);
+}
+
+// Initialize network connection
+void initializeNetwork() {
+    WSADATA wsaData;
+    
+    // Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        cout << "WSAStartup failed: " << WSAGetLastError() << endl;
+        return;
+    }
+
+    // Create the UDP socket
+    networkSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (networkSocket == INVALID_SOCKET) {
+        cout << "Socket creation failed: " << WSAGetLastError() << endl;
+        WSACleanup();
+        return;
+    }
+
+    // Set up the server address
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(DST_PORT);
+    if (inet_pton(AF_INET, DST_IP, &serverAddr.sin_addr) <= 0) {
+        cout << "Invalid destination IP" << endl;
+        closesocket(networkSocket);
+        WSACleanup();
+        return;
+    }
+
+    // Get local IP
+    getLocalIP(SRC_IP);
+    
+    // Start network thread
+    networkRunning = true;
+    networkThread = std::thread(networkSender);
+    
+    // Set network state
+    networkState = NETWORK_ENABLED;
+    
+    // Display network parameters
+    displayNetworkParameters();
+}
+
+// Close network connection
+void closeNetwork() {
+    if (networkState == NETWORK_ENABLED) {
+        networkRunning = false;
+        if (networkThread.joinable()) {
+            networkThread.join();
+        }
+        
+        if (networkSocket != INVALID_SOCKET) {
+            closesocket(networkSocket);
+            networkSocket = INVALID_SOCKET;
+        }
+        
+        WSACleanup();
+        networkState = NETWORK_DISABLED;
+    }
+}
+
+// Toggle network state
+void toggleNetwork() {
+    if (networkState == NETWORK_DISABLED) {
+        initializeNetwork();
+    } else {
+        closeNetwork();
+    }
+}
+
+// Display network parameters
+void displayNetworkParameters() {
+    cout << "========== NETWORK CONFIGURATION ==========\n";
+    cout << "Network State:     " << (networkState == NETWORK_ENABLED ? "ENABLED" : "DISABLED") << "\n";
+    cout << "Source IP:         " << SRC_IP << "\n";
+    cout << "Destination IP:    " << DST_IP << "\n";
+    cout << "Source Port:       " << SRC_PORT << "\n";
+    cout << "Destination Port:  " << DST_PORT << "\n";
+    cout << "Buffer Size:       " << BUFFER_SIZE << "\n";
+
+    switch (DELAY_MODE) {
+    case UNIFORM_DELAY:
+        cout << "Delay Mode:        Uniform\n";
+        cout << "Haptic Rate:       " << HAPTIC_RATE_HZ << " Hz\n";
+        cout << "Uniform Delay:     " << HAPTIC_DELAY_US << " µs\n";
+        break;
+    case RANDOM_DELAY:
+        cout << "Delay Mode:        Random\n";
+        cout << "Random Rate Range: " << RANDOM_DELAY_MIN_HZ
+            << " - " << RANDOM_DELAY_MAX_HZ << " Hz\n";
+        cout << "Random Delay Range: " << RANDOM_DELAY_MIN_US
+            << " - " << RANDOM_DELAY_MAX_US << " µs\n";
+        break;
+    }
+    cout << "===========================================\n";
+}
+
+// Network sender thread function
+void networkSender() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    
+    while (networkRunning) {
+        if (hapticDevice) {
+            Packet packet;
+            
+            // Get haptic device position and force
+            cVector3d position = tool->getDeviceGlobalPos();
+            cVector3d force = tool->getDeviceGlobalForce();
+            
+            // Fill packet data
+            packet.packetNumber = ++packetNumber;
+            packet.x = static_cast<float>(position.x());
+            packet.y = static_cast<float>(position.y());
+            packet.z = static_cast<float>(position.z());
+            packet.fx = static_cast<float>(force.x());
+            packet.fy = static_cast<float>(force.y());
+            packet.fz = static_cast<float>(force.z());
+            
+            // Choose delay based on DELAY_MODE
+            int currentDelay, currentRate;
+            switch (DELAY_MODE) {
+            case UNIFORM_DELAY:
+                currentDelay = HAPTIC_DELAY_US;
+                currentRate = HAPTIC_RATE_HZ;
+                packet.delay = HAPTIC_DELAY_US / 1000.0f;
+                break;
+            case RANDOM_DELAY:
+                currentRate = rateDistribution(gen);
+                currentDelay = 1000000 / currentRate;
+                packet.delay = currentDelay / 1000.0f;
+                break;
+            }
+
+            getTimestamp(packet.timestamp);
+            strcpy_s(packet.srcIP, SRC_IP);
+            strcpy_s(packet.dstIP, DST_IP);
+            packet.srcPort = SRC_PORT;
+            packet.dstPort = DST_PORT;
+
+            // Send packet over UDP
+            int sendResult = sendto(networkSocket, reinterpret_cast<char*>(&packet), sizeof(Packet), 0,
+                (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+            if (sendResult == SOCKET_ERROR) {
+                cout << "Send failed: " << WSAGetLastError() << endl;
+            }
+
+            // Use the current delay for thread sleep
+            std::this_thread::sleep_for(std::chrono::microseconds(currentDelay));
+        }
+    }
+}
+
+//==============================================================================
+// MAIN FUNCTION
+//==============================================================================
+int main(int argc, char* argv[])
+{
+    //--------------------------------------------------------------------------
+    // INITIALIZATION
+    //--------------------------------------------------------------------------
+
+    cout << endl;
+    cout << "-----------------------------------" << endl;
+    cout << "CHAI3D with Network Communication" << endl;
+    cout << "Integrated Haptic App" << endl;
+    cout << "-----------------------------------" << endl << endl << endl;
+    cout << "Instructions:" << endl << endl;
+    cout << "- Use left mouse button to rotate camera view." << endl;
+    cout << "- Use right mouse button to control camera zoom." << endl;
+    cout << "- Use haptic device and user switch to rotate" << endl;
+    cout << "  camera or deform terrain." << endl << endl;
+    cout << "Keyboard Options:" << endl << endl;
+    cout << "[1] - Haptic Shading (ON/OFF)" << endl;
+    cout << "[2] - Wireframe (ON/OFF)" << endl;
+    cout << "[3] - Save map to 3D files: map3d.obj, map3d.3ds, map3d.stl" << endl;
+    cout << "[n] - Enable/Disable network communication" << endl;
+    cout << "[f] - Enable/Disable full screen mode" << endl;
+    cout << "[m] - Enable/Disable vertical mirroring" << endl;
+    cout << "[x] - Exit application" << endl;
+    cout << endl << endl;
+
+    // parse first arg to try and locate resources
+    resourceRoot = string(argv[0]).substr(0,string(argv[0]).find_last_of("/\\")+1);
+
+
+    //--------------------------------------------------------------------------
+    // OPEN GL - WINDOW DISPLAY
+    //--------------------------------------------------------------------------
+
+    // initialize GLUT
+    glutInit(&argc, argv);
+
+    // retrieve  resolution of computer display and position window accordingly
+    screenW = glutGet(GLUT_SCREEN_WIDTH);
+    screenH = glutGet(GLUT_SCREEN_HEIGHT);
+    windowW = 0.8 * screenH;
+    windowH = 0.5 * screenH;
+    windowPosY = (screenH - windowH) / 2;
+    windowPosX = windowPosY; 
+
+    // initialize the OpenGL GLUT window
+    glutInitWindowPosition(windowPosX, windowPosY);
+    glutInitWindowSize(windowW, windowH);
+
+    if (stereoMode == C_STEREO_ACTIVE)
+        glutInitDisplayMode(GLUT_RGB | GLUT_DEPTH | GLUT_DOUBLE | GLUT_STEREO);
+    else
+        glutInitDisplayMode(GLUT_RGB | GLUT_DEPTH | GLUT_DOUBLE);
+
+    // create display context and initialize GLEW library
+    glutCreateWindow(argv[0]);
+
+#ifdef GLEW_VERSION
+    // initialize GLEW
+    glewInit();
+#endif
+
+    // setup GLUT options
+    glutDisplayFunc(updateGraphics);
+    glutKeyboardFunc(keySelect);
+    glutReshapeFunc(resizeWindow);
+    glutSetWindowTitle("CHAI3D with Network");
+
+    // set fullscreen mode
+    if (fullscreen)
+    {
+        glutFullScreen();
+    }
+
+
+    //--------------------------------------------------------------------------
+    // WORLD - CAMERA - LIGHTING
+    //--------------------------------------------------------------------------
+
+    // create a new world.
+    world = new cWorld();
+
+    // set the background color of the environment
+    world->m_backgroundColor.setWhite();
+
+    // create a camera and insert it into the virtual world
+    camera = new cCamera(world);
+    world->addChild(camera);
+
+    // define a basis in spherical coordinates for the camera
+    camera->setSphericalReferences(cVector3d(0,0,0),    // origin
+                                   cVector3d(0,0,1),    // zenith direction
+                                   cVector3d(1,0,0));   // azimuth direction
+
+    camera->setSphericalDeg(3.5,    // spherical coordinate radius
+                            40,     // spherical coordinate azimuth angle
+                            5);     // spherical coordinate polar angle
+
+    // set the near and far clipping planes of the camera
+    // anything in front/behind these clipping planes will not be rendered
+    camera->setClippingPlanes(0.01, 10.0);
+
+    // set stereo mode
+    camera->setStereoMode(stereoMode);
+
+    // set stereo eye separation and focal length (applies only if stereo is enabled)
+    camera->setStereoEyeSeparation(0.03);
+    camera->setStereoFocalLength(3.0);
+
+    // set vertical mirrored display mode
+    camera->setMirrorVertical(mirroredDisplay);
+
+    // create a light source
+    light = new cSpotLight(world);
+
+    // attach light to camera
+    world->addChild(light);
+
+    // enable light source
+    light->setEnabled(true);
+
+    // position the light source
+    light->setLocalPos(2.5, 0.0, 2.0);
+
+    // define the direction of the light beam
+    light->setDir(-1.0, 0.0,-1.0);             
+
+    // enable this light source to generate shadows
+    light->setShadowMapEnabled(true);
+
+    // set the resolution of the shadow map
+    light->m_shadowMap->setQualityLow();
+    //light->m_shadowMap->setQualityMedium();
+
+    // set light cone half angle
+    light->setCutOffAngleDeg(25);
+
+
+    //--------------------------------------------------------------------------
+    // HAPTIC DEVICES / TOOLS
+    //--------------------------------------------------------------------------
+
+    // create a haptic device handler
+    handler = new cHapticDeviceHandler();
+
+    // get access to the first available haptic device
+    handler->getDevice(hapticDevice, 0);
+
+    // retrieve information about the current haptic device
+    cHapticDeviceInfo hapticDeviceInfo = hapticDevice->getSpecifications();
+
+    // if the device has a gripper, then enable it to behave like a user switch
+    hapticDevice->setEnableGripperUserSwitch(true);
+
+    // create a 3D tool and add it to the camera
+    tool = new cToolCursor(world);
+    world->addChild(tool);
+
+    // connect the haptic device to the tool
+    tool->setHapticDevice(hapticDevice);
+
+    // hide the device sphere. only show proxy.
+    tool->setShowContactPoints(true, false);
+
+    // set color of tool
+    tool->m_hapticPoint->m_sphereProxy->m_material->setWhiteAliceBlue();
+
+    // set the physical radius of the proxy.
+    hapticRadius  = 0.00;
+    displayRadius = 0.05;
+    tool->setRadius(displayRadius, hapticRadius);
+
+    // map the physical workspace of the haptic device to a larger virtual workspace.
+    tool->setWorkspaceRadius(1.0);
+
+    // oriente tool with camera
+    tool->setLocalRot(camera->getLocalRot());
+
+    // initialize tool by connecting to haptic device
+    tool->start();
+
+
+    //--------------------------------------------------------------------------
+    // CREATING OBJECTS
+    //--------------------------------------------------------------------------
+
+    // read the scale factor between the physical workspace of the haptic
+    // device and the virtual workspace defined for the tool
+    double workspaceScaleFactor = tool->getWorkspaceScaleFactor();
+
+    // get properties of haptic device
+    double maxLinearForce = hapticDeviceInfo.m_maxLinearForce;
+    double maxLinearDamping = hapticDeviceInfo.m_maxLinearDamping;
+    double maxStiffness = hapticDeviceInfo.m_maxLinearStiffness / workspaceScaleFactor;
+
+
+    /////////////////////////////////////////////////////////////////////////
+    // MAP
+    /////////////////////////////////////////////////////////////////////////
+
+    // create a virtual mesh
+    object = new cMesh();
+
+    // add object to world
+    world->addChild(object);
+
+    // set the position of the object at the center of the world
+    object->setLocalPos(0.0, 0.0, 0.0);
+
+    // Since we want to see our polygons from both sides, we disable culling.
+    object->setUseCulling(false);
+
+    // load default map
+    loadHeightMap();
+
+    // set color properties
+    object->m_material->setBlueCornflower();
+
+    // set stiffness
+    object->m_material->setStiffness(0.5 * maxStiffness);
+
+    // enable haptic shading
+    object->m_material->setUseHapticShading(true);
+
+    // use display list to increase graphical rendering performance
+    object->setUseDisplayList(true);
+
+
+    /////////////////////////////////////////////////////////////////////////
+    // MAGNETIC LINE
+    /////////////////////////////////////////////////////////////////////////
+
+    // create a small vertical white magnetic line that will be activated when the
+    // user deforms the mesh.
+    magneticLine = new cShapeLine(cVector3d(0,0,0), cVector3d(0,0,0));
+
+    // add line to world
+    world->addChild(magneticLine);
+
+    // set color of line
+    magneticLine->m_colorPointA.setGrayDark();
+    magneticLine->m_colorPointB.setGrayDark();
+
+    // line is not yet enabled
+    magneticLine->setHapticEnabled(false);
+    magneticLine->setShowEnabled(false);
+
+    // set haptic properties
+    magneticLine->m_material->setStiffness(0.05 * maxStiffness);
+    magneticLine->m_material->setMagnetMaxForce(maxLinearForce);
+    magneticLine->m_material->setMagnetMaxDistance(0.25);
+    magneticLine->m_material->setViscosity(0.05 * maxLinearDamping);
+
+    // create a haptic magnetic effect
+    cEffectMagnet* newEffect = new cEffectMagnet(magneticLine);
+    magneticLine->addEffect(newEffect);
+
+    // create two sphere that will be added at both ends of the line
+    sphereA = new cShapeSphere(0.02);
+    sphereB = new cShapeSphere(0.02);
+
+    // add spheres to world
+    world->addChild(sphereA);
+    world->addChild(sphereB);
+
+    // disable spheres for now
+    sphereA->setShowEnabled(false);
+    sphereB->setShowEnabled(false);
+
+    // define some material properties for spheres
+    cMaterial matSphere;
+    matSphere.setWhiteAliceBlue();
+
+    // assign material properties to both spheres
+    sphereA->setMaterial(matSphere);
+    sphereB->setMaterial(matSphere);
+
+
+    //--------------------------------------------------------------------------
+    // WIDGETS
+    //--------------------------------------------------------------------------
+
+    // create a font
+    cFont *font = NEW_CFONTCALIBRI20();
+    
+    // create a label to display the haptic rate of the simulation
+    labelHapticRate = new cLabel(font);
+    camera->m_frontLayer->addChild(labelHapticRate);
+
+    // set font color
+    labelHapticRate->m_fontColor.setBlack();
+
+    // create a label with a small message
+    labelMessage = new cLabel(font);
+    camera->m_frontLayer->addChild(labelMessage);
+
+    // set font color
+    labelMessage->m_fontColor.setBlack();
+
+    // set text message
+    labelMessage->setText("touch surface - press user switch to deform surface or move camera");
+
+    // create a label for network status
+    labelNetworkStatus = new cLabel(font);
+    camera->m_frontLayer->addChild(labelNetworkStatus);
+    
+    // set font color
+    labelNetworkStatus->m_fontColor.setBlack();
+    
+    // set text message
+    labelNetworkStatus->setText("Network: DISABLED [Press 'n' to enable]");
+
+    // create a background
+    cBackground* background = new cBackground();
+    camera->m_backLayer->addChild(background);
+
+    // set background properties
+    background->setCornerColors(cColorf(1.0f, 1.0f, 1.0f),
+                                cColorf(1.0f, 1.0f, 1.0f),
+                                cColorf(0.8f, 0.8f, 0.8f),
+                                cColorf(0.8f, 0.8f, 0.8f));
+
+
+    //--------------------------------------------------------------------------
+    // START SIMULATION
+    //--------------------------------------------------------------------------
+
+    // create a thread which starts the main haptics rendering loop
+    cThread* hapticsThread = new cThread();
+    hapticsThread->start(updateHaptics, CTHREAD_PRIORITY_HAPTICS);
+
+    // setup callback when application exits
+    atexit(close);
+
+    // start the main graphics rendering loop
+    glutTimerFunc(50, graphicsTimer, 0);
+    glutMainLoop();
+
+    // exit
+    return (0);
+}
+
+//------------------------------------------------------------------------------
+
+void resizeWindow(int w, int h)
+{
+    windowW = w;
+    windowH = h;
+}
+
+//------------------------------------------------------------------------------
+
+void keySelect(unsigned char key, int x, int y)
+{
+    // option ESC: exit
+    if ((key == 27) || (key == 'x'))
+    {
+        exit(0);
+    }
+
+    // option 1: haptic shading:
+    if (key == '1')
+    {
+        bool useHapticShading = !object->m_material->getUseHapticShading();
+        object->m_material->setUseHapticShading(useHapticShading);
+        if (useHapticShading)
+            cout << "> Haptic shading enabled     \r";
+        else
+            cout << "> Haptic shading disabled    \r";
+    }
+
+    // option 2: wire mode
+    if (key == '2')
+    {
+        bool useWireMode = !object->getWireMode();
+        object->setWireMode(useWireMode);
+        if (useWireMode)
+            cout << "> Wire mode enabled          \r";
+        else
+            cout << "> Wire mode disabled         \r";
+    }
+
+    // option 3: save to file
+    if (key == '3')
+    {
+        cMultiMesh* multimesh = new cMultiMesh();
+        cMesh* mesh = object->copy();
+        multimesh->addMesh(mesh);
+        multimesh->saveToFile("map3d.3ds");
+        multimesh->saveToFile("map3d.obj");
+        multimesh->saveToFile("map3d.stl");
+        delete multimesh;
+        cout << "> 3D Map has been saved to files \r";
+    }
+    
+    // option n: toggle network
+    if (key == 'n')
+    {
+        toggleNetwork();
+        if (networkState == NETWORK_ENABLED) {
+            labelNetworkStatus->setText("Network: ENABLED [Press 'n' to disable]");
+            cout << "> Network enabled           \r";
+        } else {
+            labelNetworkStatus->setText("Network: DISABLED [Press 'n' to enable]");
+            cout << "> Network disabled          \r";
+        }
+    }
+
+    // option f: toggle fullscreen
+    if (key == 'f')
+    {
+        if (fullscreen)
+        {
+            windowPosX = glutGet(GLUT_INIT_WINDOW_X);
+            windowPosY = glutGet(GLUT_INIT_WINDOW_Y);
+            windowW = glutGet(GLUT_INIT_WINDOW_WIDTH);
+            windowH = glutGet(GLUT_INIT_WINDOW_HEIGHT);
+            glutPositionWindow(windowPosX, windowPosY);
+            glutReshapeWindow(windowW, windowH);
+            fullscreen = false;
+        }
+        else
+        {
+            glutFullScreen();
+            fullscreen = true;
+        }
+    }
+
+    // option m: toggle vertical mirroring
+    if (key == 'm')
+    {
+        mirroredDisplay = !mirroredDisplay;
+        camera->setMirrorVertical(mirroredDisplay);
+    }
+}
+
+//------------------------------------------------------------------------------
+
+void close(void)
+{
+    // stop the simulation
+    simulationRunning = false;
+
+    // wait for graphics and haptics loops to terminate
+    while (!simulationFinished) { cSleepMs(100); }
+
+    // close network
+    closeNetwork();
+
+    // close haptic device
+    tool->stop();
+}
+
+//------------------------------------------------------------------------------
+
+void graphicsTimer(int data)
+{
+    if (simulationRunning)
+    {
+        glutPostRedisplay();
+    }
+
+    glutTimerFunc(50, graphicsTimer, 0);
+}
+
+//------------------------------------------------------------------------------
+
+void updateGraphics(void)
+{
+    /////////////////////////////////////////////////////////////////////
+    // UPDATE WIDGETS
+    /////////////////////////////////////////////////////////////////////
+
+    // update haptic rate data
+    labelHapticRate->setText(cStr(frequencyCounter.getFrequency(), 0) + " Hz");
+
+    // update position of label
+    labelHapticRate->setLocalPos((int)(0.5 * (windowW - labelHapticRate->getWidth())), 15);
+
+    // update position of message label
+    labelMessage->setLocalPos((int)(0.5 * (windowW - labelMessage->getWidth())), 50);
+    
+    // update network status label
+    labelNetworkStatus->setLocalPos((int)(0.5 * (windowW - labelNetworkStatus->getWidth())), 85);
+
+    /////////////////////////////////////////////////////////////////////
+    // UPDATE MODEL
+    /////////////////////////////////////////////////////////////////////
+
+    // update object normals
+    if (state == STATE_MODIFY_MAP)
+    {
+        object->computeAllNormals();
+    }
+
+    // if the mesh has been modified we update the display list
+    if (flagMarkForUpdate)
+    {
+        object->markForUpdate(false);
+        flagMarkForUpdate = false;
+    }
+
+
+    /////////////////////////////////////////////////////////////////////
+    // RENDER SCENE
+    /////////////////////////////////////////////////////////////////////
+
+    // update shadow maps (if any)
+    world->updateShadowMaps(false, mirroredDisplay);
+
+    // render world
+    camera->renderView(windowW, windowH);
+
+    // swap buffers
+    glutSwapBuffers();
+//------------------------------------------------------------------------------
+// HAPTICS AND HEIGHT MAP IMPLEMENTATION
+//------------------------------------------------------------------------------
+
+// Main haptics simulation loop
+void updateHaptics(void)
+{
+    // Set high priority for this thread
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    // Initialize simulation
+    simulationRunning = true;
+    simulationFinished = false;
+    
+    // Array of triangles composing our terrain
+    cTriangleArrayPtr triangles;
+    
+    // Local variable to store position of haptic device
+    cVector3d hapticDeviceGlobalPosition;
+    
+    // Define scaling factor for the object scale
+    double polygonScale = 0.5;
+    
+    // Stiffness value for haptic surface
+    double surfaceStiffness = 0.6 * object->m_material->getStiffness();
+    
+    // Main haptic simulation loop
+    while(simulationRunning)
+    {
+        /////////////////////////////////////////////////////////////////////////
+        // HAPTIC RENDERING
+        /////////////////////////////////////////////////////////////////////////
+        
+        // Get position of cursor in global coordinates
+        hapticDeviceGlobalPosition = tool->getDeviceGlobalPos();
+        
+        // Update position and orientation of tool
+        tool->updateFromDevice();
+        
+        // Compute interaction forces
+        tool->computeInteractionForces();
+        
+        // Check user switch status
+        bool userSwitch = tool->getUserSwitch(0);
+
+        // Update simulation based on state
+        switch(state)
+        {
+            // User is idle
+            case STATE_IDLE:
+            {
+                // If the user presses the switch, move to either camera or map modification
+                if (userSwitch)
+                {
+                    // Initialize variables
+                    cCollisionRecorder collisionRecorder;
+                    cCollisionSettings collisionSettings;
+                    bool hit = object->computeCollisionDetection(hapticDeviceGlobalPosition, 
+                                              hapticDeviceGlobalPosition, 
+                                              collisionRecorder, 
+                                              collisionSettings);
+                    
+                    // If the user is touching the object, then enable deformation
+                    if (hit)
+                    {
+                        // Enable map modification mode
+                        state = STATE_MODIFY_MAP;
+                        
+                        // Retrieve collision event
+                        cCollisionEvent* collisionEvent = collisionRecorder.m_nearestCollision;
+                        
+                        // Get position of cursor projected on the object (closest surface point)
+                        cVector3d pointOnObject = collisionEvent->m_localPos;
+                        
+                        // Initialize magnetic line for interaction
+                        triangles = collisionEvent->m_triangles;
+                        
+                        // Get position in local coordinates
+                        cVector3d pointOnObjectLocal = pointOnObject;
+                        
+                        // Compute surface normal at contact point
+                        cVector3d normal(0,0,1);
+                        if (triangles != NULL)
+                        {
+                            triangles->computeSurfaceNormal(pointOnObjectLocal, normal);
+                        }
+                        
+                        // Scale the normal to offset the end points of the line
+                        normal.mul(1.0);
+                        
+                        // Setup the magnetic line constrained to the normal direction
+                        magneticLine->m_pointA = pointOnObject + normal;
+                        magneticLine->m_pointB = pointOnObject - normal;
+                        
+                        // Set the positions of the two spheres
+                        sphereA->setLocalPos(magneticLine->m_pointA);
+                        sphereB->setLocalPos(magneticLine->m_pointB);
+                        
+                        // Enable magnetic line and spheres
+                        magneticLine->setHapticEnabled(true, true);
+                        magneticLine->setShowEnabled(true);
+                        sphereA->setShowEnabled(true);
+                        sphereB->setShowEnabled(true);
+                    }
+                    else
+                    {
+                        // Enable camera motion mode
+                        state = STATE_MOVE_CAMERA;
+                    }
+                }
+                break;
+            }
+            
+            // Deforming the surface
+            case STATE_MODIFY_MAP:
+            {
+                // If user is not pressing the switch, go back to idle
+                if (!userSwitch)
+                {
+                    // Disable magnetic line and spheres
+                    magneticLine->setHapticEnabled(false, false);
+                    magneticLine->setShowEnabled(false);
+                    sphereA->setShowEnabled(false);
+                    sphereB->setShowEnabled(false);
+                    
+                    // Return to idle state
+                    state = STATE_IDLE;
+                }
+                else
+                {
+                    // Get position of tool
+                    cVector3d pos = tool->getDeviceGlobalPos();
+                    
+                    // Project point on the magnetic line
+                    cVector3d proj = cProjectPointOnLine(pos, 
+                                                         magneticLine->m_pointA,
+                                                         cSub(magneticLine->m_pointB, magneticLine->m_pointA));
+                    
+                    // Project tool on the triangle
+                    if (triangles != NULL)
+                    {
+                        // Get triangle vertices
+                        cVector3d vertex0, vertex1, vertex2;
+                        triangles->getTriangleVertices(vertex0, vertex1, vertex2);
+                        
+                        // Get barycentric coordinates
+                        double a, b, c;
+                        triangles->computeBarycentricCoordinates(proj, a, b, c);
+                        
+                        // Get vertices local position
+                        cVector3d p0 = vertex0;
+                        cVector3d p1 = vertex1;
+                        cVector3d p2 = vertex2;
+                        
+                        // Get vertex normal
+                        cVector3d normal(0,0,1);
+                        triangles->computeSurfaceNormal(normal);
+                        
+                        // Scale normal to get displacement
+                        cVector3d offset = cMul(normal, cDistance(pos, proj));
+                        
+                        // Update position of triangle vertices
+                        const double CONST_SCALE = 0.5 * polygonScale;
+                        double distance = cDistance(pos, proj);
+                        if (pos.z() < proj.z())
+                        {
+                            distance = -distance;
+                        }
+                        
+                        // Deform with a displacement function
+                        deformationFunction(vertex0, a, distance, CONST_SCALE);
+                        deformationFunction(vertex1, b, distance, CONST_SCALE);
+                        deformationFunction(vertex2, c, distance, CONST_SCALE);
+                        
+                        // We need to update the mesh graphics and physics
+                        flagMarkForUpdate = true;
+                    }
+                }
+                break;
+            }
+            
+            // Moving the camera
+            case STATE_MOVE_CAMERA:
+            {
+                // If user is not pressing the switch, go back to idle
+                if (!userSwitch)
+                {
+                    state = STATE_IDLE;
+                }
+                else
+                {
+                    // Update camera with motion from haptic device
+                    updateCameraPosition();
+                }
+                break;
+            }
+        }
+        
+        // Send forces to device
+        tool->applyToDevice();
+        
+        // Update frequency counter
+        frequencyCounter.signal(1);
+    }
+    
+    // Exit haptics loop
+    simulationFinished = true;
+}
+
+// Helper function for deforming vertices
+void deformationFunction(cVector3d& vertex, double weight, double distance, double scale)
+{
+    // Apply smooth deformation based on weight and distance
+    if (weight > 0.01)
+    {
+        // Calculate exponential falloff
+        double factor = weight * scale * exp(-0.5 * (1.0 - weight));
+        
+        // Apply displacement in z direction
+        vertex.z(vertex.z() + factor * distance);
+    }
+}
+
+// Function to update camera position based on haptic device
+void updateCameraPosition()
+{
+    // Get position and orientation changes of haptic device
+    cVector3d position = tool->getDeviceGlobalPos();
+    static cVector3d prevPosition;
+    cVector3d deltaPosition = position - prevPosition;
+    prevPosition = position;
+    
+    // Get velocity from haptic device (for potential use)
+    cVector3d linearVelocity;
+    cVector3d angularVelocity;
+    tool->getDeviceVelocity(linearVelocity, angularVelocity);
+    
+    // Scale movement for better camera control
+    const double CameraSensitivity = 2.5;
+    deltaPosition.mul(CameraSensitivity);
+    
+    // Update camera orbit
+    camera->orbitDeg(-deltaPosition.x(), deltaPosition.y());
+    
+    // Handle zoom with Z movement
+    double camDistance = camera->getSphericalRadius();
+    camDistance -= deltaPosition.z() * 0.5;
+    
+    // Enforce minimum and maximum camera distances
+    camDistance = cClamp(camDistance, 0.5, 5.0);
+    camera->setSphericalRadius(camDistance);
+}
+
+// Function to load a height map from an image file
+int loadHeightMap()
+{
+    // Create a new height map from an image file
+    int imageWidth = 64;
+    int imageHeight = 64;
+    unsigned char* image = NULL;
+    
+    try
+    {
+        // Try to load an image file for height map (using a placeholder image path)
+        string filename = RESOURCE_PATH("resources/images/terrain.jpg");
+        
+        // Load image file
+        bool fileLoaded = cLoadFileImage(filename, &image, imageWidth, imageHeight);
+        
+        // If file loading fails, create a procedural height map
+        if (!fileLoaded || image == NULL)
+        {
+            cout << "Error loading image, creating procedural terrain instead.\n";
+            
+            // Create a procedural terrain
+            imageWidth = 64;
+            imageHeight = 64;
+            
+            // Allocate memory for image
+            image = new unsigned char[3 * imageWidth * imageHeight];
+            
+            // Create a simple heightfield pattern
+            for (int y=0; y<imageHeight; y++)
+            {
+                for (int x=0; x<imageWidth; x++)
+                {
+                    // Create procedural height pattern
+                    double px = (double)x / (double)imageWidth;
+                    double py = (double)y / (double)imageHeight;
+                    double h = 0.4 * (sin(px * 10) + cos(py * 10));
+                    
+                    // Convert to RGB (grayscale)
+                    int index = 3 * (x + y * imageWidth);
+                    unsigned char value = (unsigned char)(255.0 * ((h + 1.0) / 2.0));
+                    image[index + 0] = value;
+                    image[index + 1] = value;
+                    image[index + 2] = value;
+                }
+            }
+        }
+        
+        // Clear any existing mesh
+        object->clear();
+        
+        // Create mesh
+        double meshScale = 2.0 / (double)((imageWidth > imageHeight) ? imageWidth : imageHeight);
+        double heightScale = 0.4;
+        
+        // Create vertices and triangles from image data
+        int numSidesX = imageWidth - 1;
+        int numSidesY = imageHeight - 1;
+        
+        // Vertices
+        for (int y=0; y<imageHeight; y++)
+        {
+            for (int x=0; x<imageWidth; x++)
+            {
+                // Get pixel color
+                int index = 3 * (x + y * imageWidth);
+                double r = (double)image[index + 0] / 255.0;
+                double g = (double)image[index + 1] / 255.0;
+                double b = (double)image[index + 2] / 255.0;
+                
+                // Convert to grayscale height value (simple average)
+                double height = (r + g + b) / 3.0;
+                
+                // Compute vertex position
+                double px = meshScale * (double)x - (meshScale * imageWidth / 2.0);
+                double py = meshScale * (double)y - (meshScale * imageHeight / 2.0);
+                double pz = heightScale * height;
+                
+                // Create vertex
+                int vertexIndex = object->newVertex(px, py, pz);
+                
+                // Set vertex color based on height
+                cColorf color;
+                if (height < 0.25)      // Deep area - darker blue
+                    color.set(0.0, 0.2, 0.5);
+                else if (height < 0.5)  // Medium area - medium blue
+                    color.set(0.0, 0.4, 0.7);
+                else if (height < 0.75) // Shallow area - light blue
+                    color.set(0.2, 0.6, 0.9);
+                else                    // Peaks - white/gray
+                    color.set(0.7, 0.7, 0.7);
+                
+                // Assign color to vertex
+                object->m_vertices->setColor(vertexIndex, color);
+            }
+        }
+        
+        // Triangles
+        for (int y=0; y<numSidesY; y++)
+        {
+            for (int x=0; x<numSidesX; x++)
+            {
+                // Get indices of corners
+                int index00 = x   + y     * imageWidth;
+                int index01 = x   + (y+1) * imageWidth;
+                int index10 = x+1 + y     * imageWidth;
+                int index11 = x+1 + (y+1) * imageWidth;
+                
+                // Create two triangles for each grid square
+                object->newTriangle(index00, index01, index10);
+                object->newTriangle(index10, index01, index11);
+            }
+        }
+        
+        // Compute normals
+        object->computeAllNormals();
+        
+        // Mark for update
+        flagMarkForUpdate = true;
+        
+        // Clean up image memory if we created it
+        if (!fileLoaded && image != NULL)
+        {
+            delete[] image;
+        }
+        
+        return 1;
+    }
+    catch (const exception& e)
+    {
+        cout << "Error creating height map: " << e.what() << endl;
+        
+        // Clean up image memory if needed
+        if (image != NULL)
+        {
+            delete[] image;
+        }
+        
+        return 0;
+    }
+}
