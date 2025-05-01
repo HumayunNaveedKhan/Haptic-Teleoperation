@@ -925,3 +925,397 @@ void updateGraphics(void)
 
     // swap buffers
     glutSwapBuffers();
+//------------------------------------------------------------------------------
+// HAPTICS AND HEIGHT MAP IMPLEMENTATION
+//------------------------------------------------------------------------------
+
+// Main haptics simulation loop
+void updateHaptics(void)
+{
+    // Set high priority for this thread
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    // Initialize simulation
+    simulationRunning = true;
+    simulationFinished = false;
+    
+    // Array of triangles composing our terrain
+    cTriangleArrayPtr triangles;
+    
+    // Local variable to store position of haptic device
+    cVector3d hapticDeviceGlobalPosition;
+    
+    // Define scaling factor for the object scale
+    double polygonScale = 0.5;
+    
+    // Stiffness value for haptic surface
+    double surfaceStiffness = 0.6 * object->m_material->getStiffness();
+    
+    // Main haptic simulation loop
+    while(simulationRunning)
+    {
+        /////////////////////////////////////////////////////////////////////////
+        // HAPTIC RENDERING
+        /////////////////////////////////////////////////////////////////////////
+        
+        // Get position of cursor in global coordinates
+        hapticDeviceGlobalPosition = tool->getDeviceGlobalPos();
+        
+        // Update position and orientation of tool
+        tool->updateFromDevice();
+        
+        // Compute interaction forces
+        tool->computeInteractionForces();
+        
+        // Check user switch status
+        bool userSwitch = tool->getUserSwitch(0);
+
+        // Update simulation based on state
+        switch(state)
+        {
+            // User is idle
+            case STATE_IDLE:
+            {
+                // If the user presses the switch, move to either camera or map modification
+                if (userSwitch)
+                {
+                    // Initialize variables
+                    cCollisionRecorder collisionRecorder;
+                    cCollisionSettings collisionSettings;
+                    bool hit = object->computeCollisionDetection(hapticDeviceGlobalPosition, 
+                                              hapticDeviceGlobalPosition, 
+                                              collisionRecorder, 
+                                              collisionSettings);
+                    
+                    // If the user is touching the object, then enable deformation
+                    if (hit)
+                    {
+                        // Enable map modification mode
+                        state = STATE_MODIFY_MAP;
+                        
+                        // Retrieve collision event
+                        cCollisionEvent* collisionEvent = collisionRecorder.m_nearestCollision;
+                        
+                        // Get position of cursor projected on the object (closest surface point)
+                        cVector3d pointOnObject = collisionEvent->m_localPos;
+                        
+                        // Initialize magnetic line for interaction
+                        triangles = collisionEvent->m_triangles;
+                        
+                        // Get position in local coordinates
+                        cVector3d pointOnObjectLocal = pointOnObject;
+                        
+                        // Compute surface normal at contact point
+                        cVector3d normal(0,0,1);
+                        if (triangles != NULL)
+                        {
+                            triangles->computeSurfaceNormal(pointOnObjectLocal, normal);
+                        }
+                        
+                        // Scale the normal to offset the end points of the line
+                        normal.mul(1.0);
+                        
+                        // Setup the magnetic line constrained to the normal direction
+                        magneticLine->m_pointA = pointOnObject + normal;
+                        magneticLine->m_pointB = pointOnObject - normal;
+                        
+                        // Set the positions of the two spheres
+                        sphereA->setLocalPos(magneticLine->m_pointA);
+                        sphereB->setLocalPos(magneticLine->m_pointB);
+                        
+                        // Enable magnetic line and spheres
+                        magneticLine->setHapticEnabled(true, true);
+                        magneticLine->setShowEnabled(true);
+                        sphereA->setShowEnabled(true);
+                        sphereB->setShowEnabled(true);
+                    }
+                    else
+                    {
+                        // Enable camera motion mode
+                        state = STATE_MOVE_CAMERA;
+                    }
+                }
+                break;
+            }
+            
+            // Deforming the surface
+            case STATE_MODIFY_MAP:
+            {
+                // If user is not pressing the switch, go back to idle
+                if (!userSwitch)
+                {
+                    // Disable magnetic line and spheres
+                    magneticLine->setHapticEnabled(false, false);
+                    magneticLine->setShowEnabled(false);
+                    sphereA->setShowEnabled(false);
+                    sphereB->setShowEnabled(false);
+                    
+                    // Return to idle state
+                    state = STATE_IDLE;
+                }
+                else
+                {
+                    // Get position of tool
+                    cVector3d pos = tool->getDeviceGlobalPos();
+                    
+                    // Project point on the magnetic line
+                    cVector3d proj = cProjectPointOnLine(pos, 
+                                                         magneticLine->m_pointA,
+                                                         cSub(magneticLine->m_pointB, magneticLine->m_pointA));
+                    
+                    // Project tool on the triangle
+                    if (triangles != NULL)
+                    {
+                        // Get triangle vertices
+                        cVector3d vertex0, vertex1, vertex2;
+                        triangles->getTriangleVertices(vertex0, vertex1, vertex2);
+                        
+                        // Get barycentric coordinates
+                        double a, b, c;
+                        triangles->computeBarycentricCoordinates(proj, a, b, c);
+                        
+                        // Get vertices local position
+                        cVector3d p0 = vertex0;
+                        cVector3d p1 = vertex1;
+                        cVector3d p2 = vertex2;
+                        
+                        // Get vertex normal
+                        cVector3d normal(0,0,1);
+                        triangles->computeSurfaceNormal(normal);
+                        
+                        // Scale normal to get displacement
+                        cVector3d offset = cMul(normal, cDistance(pos, proj));
+                        
+                        // Update position of triangle vertices
+                        const double CONST_SCALE = 0.5 * polygonScale;
+                        double distance = cDistance(pos, proj);
+                        if (pos.z() < proj.z())
+                        {
+                            distance = -distance;
+                        }
+                        
+                        // Deform with a displacement function
+                        deformationFunction(vertex0, a, distance, CONST_SCALE);
+                        deformationFunction(vertex1, b, distance, CONST_SCALE);
+                        deformationFunction(vertex2, c, distance, CONST_SCALE);
+                        
+                        // We need to update the mesh graphics and physics
+                        flagMarkForUpdate = true;
+                    }
+                }
+                break;
+            }
+            
+            // Moving the camera
+            case STATE_MOVE_CAMERA:
+            {
+                // If user is not pressing the switch, go back to idle
+                if (!userSwitch)
+                {
+                    state = STATE_IDLE;
+                }
+                else
+                {
+                    // Update camera with motion from haptic device
+                    updateCameraPosition();
+                }
+                break;
+            }
+        }
+        
+        // Send forces to device
+        tool->applyToDevice();
+        
+        // Update frequency counter
+        frequencyCounter.signal(1);
+    }
+    
+    // Exit haptics loop
+    simulationFinished = true;
+}
+
+// Helper function for deforming vertices
+void deformationFunction(cVector3d& vertex, double weight, double distance, double scale)
+{
+    // Apply smooth deformation based on weight and distance
+    if (weight > 0.01)
+    {
+        // Calculate exponential falloff
+        double factor = weight * scale * exp(-0.5 * (1.0 - weight));
+        
+        // Apply displacement in z direction
+        vertex.z(vertex.z() + factor * distance);
+    }
+}
+
+// Function to update camera position based on haptic device
+void updateCameraPosition()
+{
+    // Get position and orientation changes of haptic device
+    cVector3d position = tool->getDeviceGlobalPos();
+    static cVector3d prevPosition;
+    cVector3d deltaPosition = position - prevPosition;
+    prevPosition = position;
+    
+    // Get velocity from haptic device (for potential use)
+    cVector3d linearVelocity;
+    cVector3d angularVelocity;
+    tool->getDeviceVelocity(linearVelocity, angularVelocity);
+    
+    // Scale movement for better camera control
+    const double CameraSensitivity = 2.5;
+    deltaPosition.mul(CameraSensitivity);
+    
+    // Update camera orbit
+    camera->orbitDeg(-deltaPosition.x(), deltaPosition.y());
+    
+    // Handle zoom with Z movement
+    double camDistance = camera->getSphericalRadius();
+    camDistance -= deltaPosition.z() * 0.5;
+    
+    // Enforce minimum and maximum camera distances
+    camDistance = cClamp(camDistance, 0.5, 5.0);
+    camera->setSphericalRadius(camDistance);
+}
+
+// Function to load a height map from an image file
+int loadHeightMap()
+{
+    // Create a new height map from an image file
+    int imageWidth = 64;
+    int imageHeight = 64;
+    unsigned char* image = NULL;
+    
+    try
+    {
+        // Try to load an image file for height map (using a placeholder image path)
+        string filename = RESOURCE_PATH("resources/images/terrain.jpg");
+        
+        // Load image file
+        bool fileLoaded = cLoadFileImage(filename, &image, imageWidth, imageHeight);
+        
+        // If file loading fails, create a procedural height map
+        if (!fileLoaded || image == NULL)
+        {
+            cout << "Error loading image, creating procedural terrain instead.\n";
+            
+            // Create a procedural terrain
+            imageWidth = 64;
+            imageHeight = 64;
+            
+            // Allocate memory for image
+            image = new unsigned char[3 * imageWidth * imageHeight];
+            
+            // Create a simple heightfield pattern
+            for (int y=0; y<imageHeight; y++)
+            {
+                for (int x=0; x<imageWidth; x++)
+                {
+                    // Create procedural height pattern
+                    double px = (double)x / (double)imageWidth;
+                    double py = (double)y / (double)imageHeight;
+                    double h = 0.4 * (sin(px * 10) + cos(py * 10));
+                    
+                    // Convert to RGB (grayscale)
+                    int index = 3 * (x + y * imageWidth);
+                    unsigned char value = (unsigned char)(255.0 * ((h + 1.0) / 2.0));
+                    image[index + 0] = value;
+                    image[index + 1] = value;
+                    image[index + 2] = value;
+                }
+            }
+        }
+        
+        // Clear any existing mesh
+        object->clear();
+        
+        // Create mesh
+        double meshScale = 2.0 / (double)((imageWidth > imageHeight) ? imageWidth : imageHeight);
+        double heightScale = 0.4;
+        
+        // Create vertices and triangles from image data
+        int numSidesX = imageWidth - 1;
+        int numSidesY = imageHeight - 1;
+        
+        // Vertices
+        for (int y=0; y<imageHeight; y++)
+        {
+            for (int x=0; x<imageWidth; x++)
+            {
+                // Get pixel color
+                int index = 3 * (x + y * imageWidth);
+                double r = (double)image[index + 0] / 255.0;
+                double g = (double)image[index + 1] / 255.0;
+                double b = (double)image[index + 2] / 255.0;
+                
+                // Convert to grayscale height value (simple average)
+                double height = (r + g + b) / 3.0;
+                
+                // Compute vertex position
+                double px = meshScale * (double)x - (meshScale * imageWidth / 2.0);
+                double py = meshScale * (double)y - (meshScale * imageHeight / 2.0);
+                double pz = heightScale * height;
+                
+                // Create vertex
+                int vertexIndex = object->newVertex(px, py, pz);
+                
+                // Set vertex color based on height
+                cColorf color;
+                if (height < 0.25)      // Deep area - darker blue
+                    color.set(0.0, 0.2, 0.5);
+                else if (height < 0.5)  // Medium area - medium blue
+                    color.set(0.0, 0.4, 0.7);
+                else if (height < 0.75) // Shallow area - light blue
+                    color.set(0.2, 0.6, 0.9);
+                else                    // Peaks - white/gray
+                    color.set(0.7, 0.7, 0.7);
+                
+                // Assign color to vertex
+                object->m_vertices->setColor(vertexIndex, color);
+            }
+        }
+        
+        // Triangles
+        for (int y=0; y<numSidesY; y++)
+        {
+            for (int x=0; x<numSidesX; x++)
+            {
+                // Get indices of corners
+                int index00 = x   + y     * imageWidth;
+                int index01 = x   + (y+1) * imageWidth;
+                int index10 = x+1 + y     * imageWidth;
+                int index11 = x+1 + (y+1) * imageWidth;
+                
+                // Create two triangles for each grid square
+                object->newTriangle(index00, index01, index10);
+                object->newTriangle(index10, index01, index11);
+            }
+        }
+        
+        // Compute normals
+        object->computeAllNormals();
+        
+        // Mark for update
+        flagMarkForUpdate = true;
+        
+        // Clean up image memory if we created it
+        if (!fileLoaded && image != NULL)
+        {
+            delete[] image;
+        }
+        
+        return 1;
+    }
+    catch (const exception& e)
+    {
+        cout << "Error creating height map: " << e.what() << endl;
+        
+        // Clean up image memory if needed
+        if (image != NULL)
+        {
+            delete[] image;
+        }
+        
+        return 0;
+    }
+}
