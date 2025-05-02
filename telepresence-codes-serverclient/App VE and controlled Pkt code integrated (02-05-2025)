@@ -1,9 +1,11 @@
 //------------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN  // Exclude rarely-used stuff from Windows headers
+#include <windows.h>
+#include <winsock2.h>  // Include before windows.h if both are needed
+#include <ws2tcpip.h>  // For additional socket functions
 #include "chai3d.h"
 //------------------------------------------------------------------------------
 #include <GLFW/glfw3.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <thread>
 #include <random>
@@ -75,7 +77,7 @@ cWorld* world;
 cCamera* camera;
 
 // a light source to illuminate the objects in the world
-cSpotLight *light;
+cSpotLight* light;
 
 // a haptic device handler
 cHapticDeviceHandler* handler;
@@ -123,7 +125,7 @@ cThread* hapticsThread;
 GLFWwindow* window = NULL;
 
 // current width of window
-int width  = 0;
+int width = 0;
 
 // current height of window
 int height = 0;
@@ -179,7 +181,7 @@ void getTimestamp(char* timestamp);
 
 void getLocalIP(char* ipBuffer) {
     char hostname[256];
-    struct addrinfo hints {}, *info, *p;
+    struct addrinfo hints {}, * info, * p;
     struct sockaddr_in* sockaddr_ipv4;
 
     if (gethostname(hostname, sizeof(hostname)) == 0) {
@@ -259,7 +261,7 @@ void networkCommunication(void) {
 
             // Send packet over UDP
             sendto(clientSocket, reinterpret_cast<char*>(&packet), sizeof(Packet), 0,
-                  (sockaddr*)&serverAddr, sizeof(serverAddr));
+                (sockaddr*)&serverAddr, sizeof(serverAddr));
         }
 
         // Sleep for the appropriate interval to match haptic rate
@@ -387,8 +389,8 @@ int main(int argc, char* argv[])
 
     // position and orient the camera
     camera->set(cVector3d(0.20, 0.00, 0.10),    // camera position (eye)
-                cVector3d(0.00, 0.00, 0.05),    // lookat position (target)
-                cVector3d(0.00, 0.00, 1.00));   // direction of the (up) vector
+        cVector3d(0.00, 0.00, 0.05),    // lookat position (target)
+        cVector3d(0.00, 0.00, 1.00));   // direction of the (up) vector
 
     // set the near and far clipping planes of the camera
     camera->setClippingPlanes(0.01, 10.0);
@@ -416,7 +418,7 @@ int main(int argc, char* argv[])
     light->setLocalPos(0.0, 0.3, 0.4);
 
     // define the direction of the light beam
-    light->setDir(0.0,-0.25, -0.4);
+    light->setDir(0.0, -0.25, -0.4);
 
     // enable this light source to generate shadows
     light->setShadowMapEnabled(true);
@@ -479,9 +481,9 @@ int main(int argc, char* argv[])
     bool fileload = texture->loadFromFile(RESOURCE_PATH("../resources/images/coin-normal.png"));
     if (!fileload)
     {
-        #if defined(_MSVC)
+#if defined(_MSVC)
         fileload = texture->loadFromFile("../../../bin/resources/images/coin-normal.png");
-        #endif
+#endif
     }
     if (!fileload)
     {
@@ -491,7 +493,7 @@ int main(int argc, char* argv[])
     }
 
     // create spheres
-    for (int i=0; i<NUM_SPHERES; i++)
+    for (int i = 0; i < NUM_SPHERES; i++)
     {
         // create a sphere and define its radius
         cShapeSphere* sphere = new cShapeSphere(SPHERE_RADIUS);
@@ -503,9 +505,9 @@ int main(int argc, char* argv[])
         world->addChild(sphere);
 
         // set the position of the object at the center of the world
-        sphere->setLocalPos(0.8 * SPHERE_RADIUS * (double)(i+2) * cos(1.0 * (double)(i)), 
-                            0.8 * SPHERE_RADIUS * (double)(i+2) * sin(1.0 * (double)(i)), 
-                            SPHERE_RADIUS);
+        sphere->setLocalPos(0.8 * SPHERE_RADIUS * (double)(i + 2) * cos(1.0 * (double)(i)),
+            0.8 * SPHERE_RADIUS * (double)(i + 2) * sin(1.0 * (double)(i)),
+            SPHERE_RADIUS);
 
         // set graphic properties of sphere
         sphere->setTexture(texture);
@@ -520,7 +522,7 @@ int main(int argc, char* argv[])
 
     // create a font
     font = NEW_CFONTCALIBRI20();
-    
+
     // create a label to display the haptic and graphic rate of the simulation
     labelRates = new cLabel(font);
     labelRates->m_fontColor.setBlack();
@@ -544,9 +546,9 @@ int main(int argc, char* argv[])
     fileload = background->loadFromFile(RESOURCE_PATH("../resources/images/HHRCM background.png"));
     if (!fileload)
     {
-        #if defined(_MSVC)
+#if defined(_MSVC)
         fileload = background->loadFromFile("../../../bin/resources/images/HHRCM background.png");
-        #endif
+#endif
     }
     if (!fileload)
     {
@@ -610,7 +612,7 @@ int main(int argc, char* argv[])
 void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height)
 {
     // update window size
-    width  = a_width;
+    width = a_width;
     height = a_height;
 
     // update position of message label
@@ -687,7 +689,7 @@ void close(void)
 
     // wait for graphics and haptics loops to terminate
     while (!simulationFinished) { cSleepMs(100); }
-    
+
     // wait for network thread to terminate
     if (networkThread && networkThread->joinable()) {
         networkThread->join();
@@ -710,7 +712,7 @@ void updateGraphics(void)
 
     // update haptic and graphic rate data
     labelRates->setText(cStr(freqCounterGraphics.getFrequency(), 0) + " Hz / " +
-                        cStr(freqCounterHaptics.getFrequency(), 0) + " Hz");
+        cStr(freqCounterHaptics.getFrequency(), 0) + " Hz");
 
     // update position of label
     labelRates->setLocalPos((int)(0.5 * (width - labelRates->getWidth())), 15);
@@ -738,7 +740,7 @@ void updateGraphics(void)
 void updateHaptics(void)
 {
     // simulation is now running
-    simulationRunning  = true;
+    simulationRunning = true;
     simulationFinished = false;
 
     // a flag to indicate if haptic forces are active
@@ -755,7 +757,7 @@ void updateHaptics(void)
     hapticDevice->calibrate();
 
     // main haptic simulation loop
-    while(simulationRunning)
+    while (simulationRunning)
     {
         /////////////////////////////////////////////////////////////////////
         // SIMULATION TIME
@@ -791,37 +793,37 @@ void updateHaptics(void)
         /////////////////////////////////////////////////////////////////////////
 
         // position of walls and ground
-        const double WALL_GROUND        = 0.0 + SPHERE_RADIUS;
-        const double WALL_LEFT          =-0.1;
-        const double WALL_RIGHT         = 0.2;
-        const double WALL_FRONT         = 0.08;
-        const double WALL_BACK          =-0.08;
-        const double SPHERE_STIFFNESS   = 1000.0;
-        const double SPHERE_MASS        = 0.04;
-        const double K_DAMPING          = 0.996;
-        const double K_MAGNET           = 500.0;
-        const double HAPTIC_STIFFNESS   = 500.0;
+        const double WALL_GROUND = 0.0 + SPHERE_RADIUS;
+        const double WALL_LEFT = -0.1;
+        const double WALL_RIGHT = 0.2;
+        const double WALL_FRONT = 0.08;
+        const double WALL_BACK = -0.08;
+        const double SPHERE_STIFFNESS = 1000.0;
+        const double SPHERE_MASS = 0.04;
+        const double K_DAMPING = 0.996;
+        const double K_MAGNET = 500.0;
+        const double HAPTIC_STIFFNESS = 500.0;
 
         // clear forces for all spheres
         cVector3d sphereFce[NUM_SPHERES];
 
-        for (int i=0; i<NUM_SPHERES; i++)
+        for (int i = 0; i < NUM_SPHERES; i++)
         {
             sphereFce[i].zero();
         }
 
         // compute forces for all spheres
-        for (int i=0; i<NUM_SPHERES; i++)
+        for (int i = 0; i < NUM_SPHERES; i++)
         {
             cVector3d force;
             cVector3d pos0 = spheres[i]->getLocalPos();
 
             // check forces with all other spheres
-            for (int j=i+1; j<NUM_SPHERES; j++)
+            for (int j = i + 1; j < NUM_SPHERES; j++)
             {
                 // init force
                 force.zero();
-                
+
                 // get position of sphere
                 cVector3d pos1 = spheres[j]->getLocalPos();
 
@@ -876,12 +878,12 @@ void updateHaptics(void)
 
         // compute haptic force
         cVector3d dirHapticSphere = spheres[0]->getLocalPos() - position;
-        cVector3d forceSphere =-SPHERE_STIFFNESS * dirHapticSphere;
+        cVector3d forceSphere = -SPHERE_STIFFNESS * dirHapticSphere;
         cVector3d forceHaptic = HAPTIC_STIFFNESS * dirHapticSphere;
         sphereFce[0].add(forceSphere);
 
         // update velocity and position of all spheres
-        for (int i=0; i<NUM_SPHERES; i++)
+        for (int i = 0; i < NUM_SPHERES; i++)
         {
             // compute acceleration
             cVector3d sphereAcc = (sphereFce[i] / SPHERE_MASS) + cVector3d(0.0, 0.0, -9.81);
