@@ -1,0 +1,1073 @@
+//------------------------------------------------------------------------------
+// Haptic Teleoperation System - Windows Version
+// Receives network packets, forwards to Force Dimension haptic device, sends feedback to client
+// Port: 4000 for both receiving and sending
+//------------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN  // Exclude rarely-used stuff from Windows headers
+#define NOMINMAX
+#include <windows.h>
+#include <winsock2.h>  // Include before windows.h if both are needed
+#include <ws2tcpip.h>  // For additional socket functions
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <GL/glut.h>
+#include <iostream>
+#include <iomanip>
+#include <mutex>
+#include <sstream>
+#include <thread>
+#include <vector>
+#include <map>
+using namespace std;
+
+// Force Dimension haptic device libraries
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\sdk-3.17.1\include\dhdc.h>  // Force Dimension haptic device communication
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\sdk-3.17.1\include\drdc.h>  // Force Dimension robot kinematics
+
+#pragma comment(lib, "ws2_32.lib")
+// Force Dimension library linkage
+#pragma comment(lib, "dhdms64.lib")
+#pragma comment(lib, "drdms64.lib")
+
+#define UDP_PORT 4000
+#define MAX_PACKET_SIZE 400
+#define MAX_BUFFER_SIZE 5000  // Secure packet storage
+
+// Global Configuration Parameters
+const int MAX_DISPLAY_PACKETS = 15;  // Maximum packets to display in windows
+int FEEDBACK_ENABLED = 1;      // Enable/disable feedback (1=enabled, 0=disabled)
+const int PACKET_HISTORY_SIZE = 100; // Number of packets to consider for average timing
+float GLOBAL_RELEASE_RATE_FACTOR = 1.0f; // User-controlled release rate multiplier
+
+// Thread priority settings
+const int THREAD_PRIORITY_PACKET_RECEPTION = THREAD_PRIORITY_HIGHEST;
+const int THREAD_PRIORITY_PROCESSING = THREAD_PRIORITY_ABOVE_NORMAL;
+const int THREAD_PRIORITY_RENDERING = THREAD_PRIORITY_NORMAL;
+const int THREAD_PRIORITY_HAPTICS = THREAD_PRIORITY_TIME_CRITICAL;  // Highest priority for haptics
+
+// Enhanced Visualization Parameters
+const float BAR_WIDTH = 0.016f;      // Narrower bars to prevent overlap
+const float BAR_MAX_HEIGHT = 0.3f;   // Vertical height
+const float TEXT_Y_OFFSET = 0.025f;  // Increased offset for text to prevent overlap
+const int TIMESTAMP_DISPLAY_INTERVAL = 4; // Display every nth timestamp to avoid crowding
+
+// Visualization window parameters
+int windowWidth = 1200;
+int windowHeight = 800;
+bool fullscreen = false;
+float scaleFactor = 1.0f;  // For adjusting visualization scale
+
+// Haptic parameters
+struct HapticConfig {
+    double Kp = 100.0;              // Position proportional gain - can be adjusted at runtime
+    double Kd = 20.0;               // Damping gain
+    double maxForce = 5.0;          // Maximum force in Newtons
+    double forceScale = 1.0;        // User-adjustable force scaling
+    bool hapticEnabled = true;      // Enable/disable haptic feedback
+    bool deviceConnected = false;   // Flag to indicate if device is connected
+    int deviceID = -1;              // Device ID for Force Dimension device
+};
+HapticConfig hapticConfig;
+std::mutex hapticMutex;
+
+// Current device state
+struct DeviceState {
+    double position[3] = { 0.0, 0.0, 0.0 };    // Current device position
+    double velocity[3] = { 0.0, 0.0, 0.0 };    // Current device velocity
+    double force[3] = { 0.0, 0.0, 0.0 };       // Current force being applied
+    double targetPos[3] = { 0.0, 0.0, 0.0 };   // Target position from received packets
+};
+DeviceState deviceState;
+std::mutex deviceMutex;
+
+// Packet and Distribution Tracking
+struct PacketStats {
+    double avgReceiveRate = 0.0;
+    int totalPacketsReceived = 0;
+    std::chrono::steady_clock::time_point firstPacketTime;
+    std::chrono::steady_clock::time_point lastPacketTime;
+    double avgInterPacketTime = 0.0; // Average time between packets in ms
+    std::deque<double> packetTimings; // Store timing of last PACKET_HISTORY_SIZE packets
+};
+PacketStats globalPacketStats;
+std::mutex statsMutex;
+
+// Common Packet Structure
+struct Packet {
+    int packetNumber;  // Sequential packet number
+    float x, y, z;     // 3D Vector components
+    float delay;       // Processing delay in milliseconds
+    char timestamp[64];  // Timestamp of packet creation
+    char srcIP[INET_ADDRSTRLEN]; // Source IP address
+    char dstIP[INET_ADDRSTRLEN]; // Destination IP address
+    int srcPort;       // Source port
+    int dstPort;       // Destination port
+    std::chrono::steady_clock::time_point receiveTime;  // Time of packet reception
+};
+
+// Enhanced feedback packet structure with force data
+struct FeedbackPacket {
+    int packetNumber;      // Sequential packet number
+    double force[3];       // Force vector (x,y,z)
+    double position[3];    // Current device position
+    double error[3];       // Position error
+    char message[64];      // Message/status
+};
+
+// Socket data
+SOCKET recvSocket = INVALID_SOCKET;
+SOCKET feedbackSocket = INVALID_SOCKET;
+std::mutex socketMutex;
+
+// Client information storage for feedback
+struct ClientInfo {
+    sockaddr_in addr;
+    bool valid = false;
+};
+ClientInfo lastClient;
+std::mutex clientMutex;
+
+// Forward declarations
+void sendFeedback(const sockaddr_in& clientAddr, int packetNumber, const double force[3],
+    const double position[3], const double error[3]);
+void cleanup();
+
+// Sliding Window Packet Distributor with Time-Aware Release
+class SlidingWindowPacketDistributor {
+private:
+    std::deque<Packet> packetBuffer;       // Main secure buffer for all received packets
+    std::deque<Packet> processedPackets;   // Packets that have been processed/released
+    std::mutex bufferMutex;
+    std::mutex processedMutex;
+    std::chrono::steady_clock::time_point lastReleaseTime;
+    std::map<int, double> packetTimeGaps;  // Stores time gaps between consecutive packets
+
+public:
+    SlidingWindowPacketDistributor() : lastReleaseTime(std::chrono::steady_clock::now()) {}
+
+    void addPacket(const Packet& packet) {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+
+        // Calculate and store time gap if not the first packet
+        if (!packetBuffer.empty()) {
+            auto prevPacket = packetBuffer.back();
+            double timeGapMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                packet.receiveTime - prevPacket.receiveTime).count();
+            packetTimeGaps[packet.packetNumber] = timeGapMs;
+        }
+
+        // Add to secure buffer
+        packetBuffer.push_back(packet);
+
+        // Ensure buffer doesn't exceed maximum size
+        if (packetBuffer.size() > MAX_BUFFER_SIZE) {
+            packetBuffer.pop_front();
+        }
+    }
+
+    // Process packets based on average receival time and ordered by packet number
+    void processPackets() {
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> bufferLock(bufferMutex);
+        std::lock_guard<std::mutex> processedLock(processedMutex);
+
+        // Check if it's time to release a packet based on average timing
+        if (!packetBuffer.empty()) {
+            // Get the average inter-packet time from global stats
+            double avgTimeMs;
+            {
+                std::lock_guard<std::mutex> statsLock(statsMutex);
+                avgTimeMs = globalPacketStats.avgInterPacketTime;
+            }
+            if (avgTimeMs <= 0) avgTimeMs = 100.0; // Default if no stats available
+
+            // Apply user-controlled release rate factor
+            avgTimeMs *= GLOBAL_RELEASE_RATE_FACTOR;
+
+            // Calculate time elapsed since last release
+            auto timeSinceLastRelease = std::chrono::duration<double, std::milli>(
+                now - lastReleaseTime).count();
+
+            // Find the packet with the lowest packet number (maintain order)
+            auto oldestPacket = std::min_element(packetBuffer.begin(), packetBuffer.end(),
+                [](const Packet& a, const Packet& b) {
+                    return a.packetNumber < b.packetNumber;
+                });
+
+            // Check if enough time has passed to release the next packet
+            if (timeSinceLastRelease >= avgTimeMs) {
+                // Before adding to processed, update the target position for haptic device
+                {
+                    std::lock_guard<std::mutex> lock(deviceMutex);
+                    deviceState.targetPos[0] = oldestPacket->x;
+                    deviceState.targetPos[1] = oldestPacket->y;
+                    deviceState.targetPos[2] = oldestPacket->z;
+                }
+
+                // Add to processed packets queue
+                processedPackets.push_back(*oldestPacket);
+
+                // Maintain sliding window by removing oldest when exceeding MAX_DISPLAY_PACKETS
+                while (processedPackets.size() > MAX_DISPLAY_PACKETS) {
+                    processedPackets.pop_front();
+                }
+
+                // Remove from buffer
+                packetBuffer.erase(oldestPacket);
+
+                // Update last release time
+                lastReleaseTime = now;
+            }
+        }
+    }
+
+    // Get all packets in buffer (only return the most recent for visualization)
+    std::deque<Packet> getBufferedPackets() {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+
+        // Create a copy with just the latest MAX_DISPLAY_PACKETS
+        std::deque<Packet> displayPackets;
+        int tempIdx = static_cast<int>(packetBuffer.size()) - MAX_DISPLAY_PACKETS;
+        int startIdx = (tempIdx > 0) ? tempIdx : 0;
+
+        for (int i = startIdx; i < packetBuffer.size(); i++) {
+            displayPackets.push_back(packetBuffer[i]);
+        }
+
+        return displayPackets;
+    }
+
+    // Get processed/released packets
+    std::deque<Packet> getProcessedPackets() {
+        std::lock_guard<std::mutex> lock(processedMutex);
+        return processedPackets;
+    }
+
+    // Get time gap for a specific packet
+    double getPacketTimeGap(int packetNumber) {
+        auto it = packetTimeGaps.find(packetNumber);
+        if (it != packetTimeGaps.end()) {
+            return it->second;
+        }
+        return 0.0; // No gap for first packet or if not found
+    }
+
+    size_t getBufferSize() {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+        return packetBuffer.size();
+    }
+
+    size_t getProcessedSize() {
+        std::lock_guard<std::mutex> lock(processedMutex);
+        return processedPackets.size();
+    }
+};
+
+// Global packet distributor
+SlidingWindowPacketDistributor packetDistributor;
+
+// Function to calculate packet magnitude
+float calculateMagnitude(const Packet& packet) {
+    return sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
+}
+
+// Enhanced function to send feedback to client with force data
+void sendFeedback(const sockaddr_in& clientAddr, int packetNumber, const double force[3],
+    const double position[3], const double error[3]) {
+    if (!FEEDBACK_ENABLED) return;
+
+    std::lock_guard<std::mutex> lock(socketMutex);
+
+    // Create socket if not already created
+    if (feedbackSocket == INVALID_SOCKET) {
+        feedbackSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (feedbackSocket == INVALID_SOCKET) {
+            std::cerr << "Failed to create feedback socket. Error: " << WSAGetLastError() << std::endl;
+            return;
+        }
+    }
+
+    // Create enhanced feedback message
+    FeedbackPacket feedback;
+    feedback.packetNumber = packetNumber;
+
+    // Copy force, position and error data
+    memcpy(feedback.force, force, sizeof(double) * 3);
+    memcpy(feedback.position, position, sizeof(double) * 3);
+    memcpy(feedback.error, error, sizeof(double) * 3);
+
+    snprintf(feedback.message, sizeof(feedback.message), "Force feedback for packet %d", packetNumber);
+
+    // Send feedback to client on port 4000
+    int result = sendto(feedbackSocket, (const char*)&feedback, sizeof(feedback), 0,
+        (const sockaddr*)&clientAddr, sizeof(clientAddr));
+
+    if (result == SOCKET_ERROR) {
+        std::cerr << "Failed to send feedback. Error: " << WSAGetLastError() << std::endl;
+    }
+}
+
+// Rendering helper functions
+void renderSmallText(float x, float y, void* font, const char* string,
+    float r = 0.7f, float g = 0.7f, float b = 0.7f) {
+    glColor3f(r, g, b);
+    glRasterPos2f(x, y);
+    for (const char* c = string; *c != '\0'; c++) {
+        glutBitmapCharacter(font, *c);
+    }
+}
+
+// Convert timestamp string to more compact format for display
+std::string formatTimestampForDisplay(const char* timestamp) {
+    // Extract just the time portion (assuming format "YYYY-MM-DD HH:MM:SS")
+    std::string ts(timestamp);
+    size_t spacePos = ts.find(' ');
+    if (spacePos != std::string::npos && spacePos + 1 < ts.length()) {
+        return ts.substr(spacePos + 1); // Return just the time part
+    }
+    return ts;
+}
+
+// Draw sliding window visualization with packets moving from right to left
+void drawSlidingWindowGraph(const std::deque<Packet>& packets, float xOffset, const char* title,
+    const PacketStats& stats, bool showTimeGaps = true) {
+
+    if (packets.empty()) {
+        renderSmallText(xOffset + 0.05f, 0.9f, GLUT_BITMAP_HELVETICA_12, "No packets to display");
+        return;
+    }
+
+    // Draw title and stats
+    renderSmallText(xOffset + 0.05f, 0.95f, GLUT_BITMAP_HELVETICA_12, title);
+
+    std::ostringstream statsText;
+    statsText << "Packets: " << stats.totalPacketsReceived
+        << " | Avg Rate: " << std::fixed << std::setprecision(1)
+        << stats.avgReceiveRate << " pkt/s"
+        << " | Avg Time: " << std::fixed << std::setprecision(2)
+        << stats.avgInterPacketTime << " ms";
+
+    renderSmallText(xOffset + 0.05f, 0.92f, GLUT_BITMAP_HELVETICA_10, statsText.str().c_str());
+
+    // Calculate space allocation
+    float packetSpacing = 0.8f / MAX_DISPLAY_PACKETS;
+    float maxValue = 0.0f;
+
+    for (const auto& packet : packets) {
+        float magnitude = calculateMagnitude(packet);
+        if (magnitude > maxValue) maxValue = magnitude;
+    }
+
+    // Ensure we have a reasonable scale
+    if (maxValue < 0.1f) maxValue = 1.0f;
+
+    // Draw packets as vertical bars with dynamic spacing
+    int index = 0;
+    for (const auto& packet : packets) {
+        float x = xOffset + 0.1f + (packets.size() - 1 - index) * packetSpacing;
+        float magnitude = calculateMagnitude(packet);
+        float normalizedHeight = (magnitude / maxValue) * BAR_MAX_HEIGHT;
+
+        // Use packet number to create a repeating color pattern
+        int colorIndex = packet.packetNumber % 6;
+        float r = 0.2f, g = 0.2f, b = 0.7f;  // Default blue
+
+        switch (colorIndex) {
+        case 0: r = 0.7f; g = 0.2f; b = 0.2f; break; // Red
+        case 1: r = 0.2f; g = 0.7f; b = 0.2f; break; // Green
+        case 2: r = 0.2f; g = 0.2f; b = 0.7f; break; // Blue
+        case 3: r = 0.7f; g = 0.7f; b = 0.2f; break; // Yellow
+        case 4: r = 0.7f; g = 0.2f; b = 0.7f; break; // Purple
+        case 5: r = 0.2f; g = 0.7f; b = 0.7f; break; // Cyan
+        }
+
+        // Draw the packet bar
+        glColor3f(r, g, b);
+        glBegin(GL_QUADS);
+        glVertex2f(x - BAR_WIDTH / 2, 0.4f);
+        glVertex2f(x + BAR_WIDTH / 2, 0.4f);
+        glVertex2f(x + BAR_WIDTH / 2, 0.4f + normalizedHeight);
+        glVertex2f(x - BAR_WIDTH / 2, 0.4f + normalizedHeight);
+        glEnd();
+
+        // Display packet number above bar with staggered positioning to prevent overlap
+        char packetNumStr[32];
+        snprintf(packetNumStr, sizeof(packetNumStr), "%d", packet.packetNumber);
+        float textY = 0.4f + normalizedHeight + TEXT_Y_OFFSET;
+
+        // Stagger text positions to prevent overlap
+        if (index % 2 == 0) {
+            textY += TEXT_Y_OFFSET;
+        }
+
+        renderSmallText(x - 0.015f, textY, GLUT_BITMAP_HELVETICA_10, packetNumStr);
+
+        // Show timestamp for some packets to avoid crowding
+        if (index % TIMESTAMP_DISPLAY_INTERVAL == 0) {
+            std::string formattedTime = formatTimestampForDisplay(packet.timestamp);
+            renderSmallText(x - 0.04f, 0.35f, GLUT_BITMAP_HELVETICA_10, formattedTime.c_str());
+        }
+
+        // Show time gap between packets if enabled
+        if (showTimeGaps && index > 0) {
+            double timeGap = packetDistributor.getPacketTimeGap(packet.packetNumber);
+            if (timeGap > 0) {
+                char timeGapStr[32];
+                snprintf(timeGapStr, sizeof(timeGapStr), "%.1f ms", timeGap);
+                renderSmallText(x - 0.02f, 0.32f, GLUT_BITMAP_HELVETICA_10, timeGapStr);
+            }
+        }
+
+        index++;
+    }
+}
+
+// Draw a 3D vector representation in 2D space
+void draw3DVector(float x, float y, float scale, const float vec[3], const char* label = nullptr) {
+    // Draw base axes
+    glColor3f(0.5f, 0.5f, 0.5f);
+    glBegin(GL_LINES);
+    // X axis
+    glVertex2f(x - 0.05f, y);
+    glVertex2f(x + 0.05f, y);
+    // Y axis
+    glVertex2f(x, y - 0.05f);
+    glVertex2f(x, y + 0.05f);
+    glEnd();
+
+    // Draw vector
+    glColor3f(0.9f, 0.3f, 0.3f); // Red vector
+    glBegin(GL_LINES);
+    glVertex2f(x, y);
+    glVertex2f(x + vec[0] * scale, y + vec[1] * scale);
+    glEnd();
+
+    // Draw vector endpoint
+    glPointSize(5.0f);
+    glBegin(GL_POINTS);
+    glVertex2f(x + vec[0] * scale, y + vec[1] * scale);
+    glEnd();
+
+    // Draw label if provided
+    if (label) {
+        renderSmallText(x - 0.04f, y + 0.08f, GLUT_BITMAP_HELVETICA_10, label);
+    }
+
+    // Draw magnitude and components
+    char magnitudeStr[64];
+    float magnitude = sqrt(vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2]);
+    snprintf(magnitudeStr, sizeof(magnitudeStr), "Mag: %.2f", magnitude);
+    renderSmallText(x - 0.04f, y - 0.08f, GLUT_BITMAP_HELVETICA_10, magnitudeStr);
+
+    char compStr[64];
+    snprintf(compStr, sizeof(compStr), "[%.2f, %.2f, %.2f]", vec[0], vec[1], vec[2]);
+    renderSmallText(x - 0.04f, y - 0.10f, GLUT_BITMAP_HELVETICA_10, compStr);
+}
+
+// Draw haptic device state visualization
+void drawHapticState(float xOffset) {
+    // Draw section title
+    renderSmallText(xOffset + 0.05f, 0.95f, GLUT_BITMAP_HELVETICA_12, "Haptic Device State");
+
+    // Get haptic config
+    bool hapticEnabled;
+    bool deviceConnected;
+    int deviceID;
+    double Kp, Kd, maxForce, forceScale;
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticEnabled = hapticConfig.hapticEnabled;
+        deviceConnected = hapticConfig.deviceConnected;
+        deviceID = hapticConfig.deviceID;
+        Kp = hapticConfig.Kp;
+        Kd = hapticConfig.Kd;
+        maxForce = hapticConfig.maxForce;
+        forceScale = hapticConfig.forceScale;
+    }
+
+    // Draw device status
+    std::ostringstream deviceStatusStr;
+    deviceStatusStr << "Device: " << (deviceConnected ? "Connected" : "Not Connected");
+    if (deviceConnected) {
+        deviceStatusStr << " (ID: " << deviceID << ")";
+    }
+    deviceStatusStr << " | Haptic Feedback: " << (hapticEnabled ? "Enabled" : "Disabled");
+    renderSmallText(xOffset + 0.05f, 0.92f, GLUT_BITMAP_HELVETICA_10, deviceStatusStr.str().c_str(),
+        deviceConnected ? 0.2f : 0.7f, deviceConnected ? 0.7f : 0.2f, 0.2f);
+
+    // Draw haptic parameters
+    std::ostringstream paramsStr;
+    paramsStr << "Kp: " << Kp << " | Kd: " << Kd << " | Max Force: " << maxForce
+        << " N | Force Scale: " << forceScale << "x";
+    renderSmallText(xOffset + 0.05f, 0.89f, GLUT_BITMAP_HELVETICA_10, paramsStr.str().c_str());
+
+    // Get device state
+    float position[3], targetPos[3], force[3], error[3];
+    {
+        std::lock_guard<std::mutex> lock(deviceMutex);
+        position[0] = static_cast<float>(deviceState.position[0]);
+        position[1] = static_cast<float>(deviceState.position[1]);
+        position[2] = static_cast<float>(deviceState.position[2]);
+
+        targetPos[0] = static_cast<float>(deviceState.targetPos[0]);
+        targetPos[1] = static_cast<float>(deviceState.targetPos[1]);
+        targetPos[2] = static_cast<float>(deviceState.targetPos[2]);
+
+        force[0] = static_cast<float>(deviceState.force[0]);
+        force[1] = static_cast<float>(deviceState.force[1]);
+        force[2] = static_cast<float>(deviceState.force[2]);
+
+        // Calculate position error
+        error[0] = targetPos[0] - position[0];
+        error[1] = targetPos[1] - position[1];
+        error[2] = targetPos[2] - position[2];
+    }
+
+    // Draw current position vector
+    draw3DVector(xOffset + 0.2f, 0.7f, 0.05f, position, "Current Position");
+
+    // Draw target position vector
+    draw3DVector(xOffset + 0.5f, 0.7f, 0.05f, targetPos, "Target Position");
+
+    // Draw force vector
+    draw3DVector(xOffset + 0.2f, 0.5f, 0.01f, force, "Applied Force");
+
+    // Draw error vector
+    draw3DVector(xOffset + 0.5f, 0.5f, 0.05f, error, "Position Error");
+
+    // Draw feedback status
+    std::ostringstream feedbackStr;
+    feedbackStr << "Feedback: " << (FEEDBACK_ENABLED ? "Enabled" : "Disabled")
+        << " | Release Rate: " << GLOBAL_RELEASE_RATE_FACTOR << "x";
+    renderSmallText(xOffset + 0.05f, 0.35f, GLUT_BITMAP_HELVETICA_10, feedbackStr.str().c_str(),
+        FEEDBACK_ENABLED ? 0.2f : 0.7f, FEEDBACK_ENABLED ? 0.7f : 0.2f, 0.2f);
+}
+
+// Draw help and controls overlay
+void drawControls() {
+    renderSmallText(0.02f, 0.10f, GLUT_BITMAP_HELVETICA_12, "Controls:", 1.0f, 1.0f, 1.0f);
+    renderSmallText(0.02f, 0.08f, GLUT_BITMAP_HELVETICA_10, "F - Toggle fullscreen", 0.9f, 0.9f, 0.9f);
+    renderSmallText(0.02f, 0.06f, GLUT_BITMAP_HELVETICA_10, "H - Toggle haptic feedback", 0.9f, 0.9f, 0.9f);
+    renderSmallText(0.02f, 0.04f, GLUT_BITMAP_HELVETICA_10, "R - Reset statistics", 0.9f, 0.9f, 0.9f);
+    renderSmallText(0.02f, 0.02f, GLUT_BITMAP_HELVETICA_10, "F1-F4 - Adjust force parameters", 0.9f, 0.9f, 0.9f);
+    renderSmallText(0.42f, 0.08f, GLUT_BITMAP_HELVETICA_10, "+/- - Adjust release rate", 0.9f, 0.9f, 0.9f);
+    renderSmallText(0.42f, 0.06f, GLUT_BITMAP_HELVETICA_10, "B - Toggle client feedback", 0.9f, 0.9f, 0.9f);
+    renderSmallText(0.42f, 0.04f, GLUT_BITMAP_HELVETICA_10, "Q/ESC - Quit application", 0.9f, 0.9f, 0.9f);
+}
+
+// Handle keyboard input
+void keyboardFunc(unsigned char key, int x, int y) {
+    switch (key) {
+    case 'q':
+    case 'Q':
+    case 27: // ESC key
+        // Clean shutdown
+        exit(0);
+        break;
+
+    case 'f':
+    case 'F':
+        // Toggle fullscreen
+        fullscreen = !fullscreen;
+        if (fullscreen) {
+            glutFullScreen();
+        }
+        else {
+            glutReshapeWindow(windowWidth, windowHeight);
+            glutPositionWindow(100, 100);
+        }
+        break;
+
+    case 'h':
+    case 'H':
+        // Toggle haptic feedback
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.hapticEnabled = !hapticConfig.hapticEnabled;
+    }
+    break;
+
+    case 'r':
+    case 'R':
+        // Reset packet stats
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        globalPacketStats.totalPacketsReceived = 0;
+        globalPacketStats.avgReceiveRate = 0.0;
+        globalPacketStats.packetTimings.clear();
+        globalPacketStats.firstPacketTime = std::chrono::steady_clock::now();
+    }
+    break;
+
+    case 'b':
+    case 'B':
+        // Toggle client feedback
+        FEEDBACK_ENABLED = !FEEDBACK_ENABLED;
+        std::cout << "Client feedback " << (FEEDBACK_ENABLED ? "enabled" : "disabled") << std::endl;
+        break;
+
+    case '+':
+    case '=':
+        // Increase release rate
+        GLOBAL_RELEASE_RATE_FACTOR = std::min(2.0f, GLOBAL_RELEASE_RATE_FACTOR + 0.1f);
+        std::cout << "Release rate factor: " << GLOBAL_RELEASE_RATE_FACTOR << "x" << std::endl;
+        break;
+
+    case '-':
+    case '_':
+        // Decrease release rate
+        GLOBAL_RELEASE_RATE_FACTOR = std::max(0.1f, GLOBAL_RELEASE_RATE_FACTOR - 0.1f);
+        std::cout << "Release rate factor: " << GLOBAL_RELEASE_RATE_FACTOR << "x" << std::endl;
+        break;
+    }
+}
+
+// Handle special keys (F1-F12, arrows, etc.)
+void specialKeyFunc(int key, int x, int y) {
+    switch (key) {
+    case GLUT_KEY_F1:
+        // Increase Kp
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.Kp = std::min(500.0, hapticConfig.Kp + 10.0);
+        std::cout << "Kp increased to " << hapticConfig.Kp << std::endl;
+    }
+    break;
+
+    case GLUT_KEY_F2:
+        // Decrease Kp
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.Kp = std::max(10.0, hapticConfig.Kp - 10.0);
+        std::cout << "Kp decreased to " << hapticConfig.Kp << std::endl;
+    }
+    break;
+
+    case GLUT_KEY_F3:
+        // Increase force scale
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.forceScale = std::min(5.0, hapticConfig.forceScale + 0.1);
+        std::cout << "Force scale increased to " << hapticConfig.forceScale << "x" << std::endl;
+    }
+    break;
+
+    case GLUT_KEY_F4:
+        // Decrease force scale
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.forceScale = std::max(0.1, hapticConfig.forceScale - 0.1);
+        std::cout << "Force scale decreased to " << hapticConfig.forceScale << "x" << std::endl;
+    }
+    break;
+    }
+}
+
+// Function to update haptic device state
+void updateHapticState() {
+    // Set thread priority for haptics
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HAPTICS);
+
+    while (true) {
+        bool hapticEnabled;
+        double Kp, Kd, maxForce, forceScale;
+
+        // Get haptic parameters
+        {
+            std::lock_guard<std::mutex> lock(hapticMutex);
+            hapticEnabled = hapticConfig.hapticEnabled && hapticConfig.deviceConnected;
+            Kp = hapticConfig.Kp;
+            Kd = hapticConfig.Kd;
+            maxForce = hapticConfig.maxForce;
+            forceScale = hapticConfig.forceScale;
+        }
+
+        if (hapticEnabled) {
+            // Get current and target position
+            double currentPos[3], targetPos[3], velocity[3];
+
+            // Get actual position from device
+            dhdGetPosition(&currentPos[0], &currentPos[1], &currentPos[2]);
+            dhdGetLinearVelocity(&velocity[0], &velocity[1], &velocity[2]);
+
+            // Get target position
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                memcpy(targetPos, deviceState.targetPos, sizeof(double) * 3);
+
+                // Update device position
+                memcpy(deviceState.position, currentPos, sizeof(double) * 3);
+                memcpy(deviceState.velocity, velocity, sizeof(double) * 3);
+            }
+
+            // Calculate force (PD control)
+            double force[3];
+            double posError[3];
+
+            for (int i = 0; i < 3; i++) {
+                posError[i] = targetPos[i] - currentPos[i];
+                force[i] = (Kp * posError[i] - Kd * velocity[i]) * forceScale;
+            }
+
+            // Apply force limiting
+            double forceMagnitude = sqrt(force[0] * force[0] + force[1] * force[1] + force[2] * force[2]);
+            if (forceMagnitude > maxForce) {
+                double scale = maxForce / forceMagnitude;
+                force[0] *= scale;
+                force[1] *= scale;
+                force[2] *= scale;
+            }
+
+            // Apply force to device
+            dhdSetForce(force[0], force[1], force[2]);
+
+            // Store force for visualization
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                memcpy(deviceState.force, force, sizeof(double) * 3);
+            }
+
+            // Send feedback to client
+            {
+                std::lock_guard<std::mutex> lock(clientMutex);
+                if (lastClient.valid) {
+                    // Get latest processed packet
+                    auto processedPackets = packetDistributor.getProcessedPackets();
+                    if (!processedPackets.empty()) {
+                        int latestPacketNum = processedPackets.back().packetNumber;
+                        sendFeedback(lastClient.addr, latestPacketNum, force, currentPos, posError);
+                    }
+                }
+            }
+        }
+        else {
+            // No haptic feedback, set zero force
+            dhdSetForce(0.0, 0.0, 0.0);
+
+            // Clear stored force
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                deviceState.force[0] = 0.0;
+                deviceState.force[1] = 0.0;
+                deviceState.force[2] = 0.0;
+            }
+        }
+
+        // Sleep to maintain haptic update rate (1kHz is ideal, but we'll use a bit faster)
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+}
+
+// Function to clean up resources on exit
+void cleanup() {
+    // Close haptic device
+    if (dhdGetDeviceCount() > 0) {
+        dhdStop();
+    }
+
+    // Close sockets
+    {
+        std::lock_guard<std::mutex> lock(socketMutex);
+        if (recvSocket != INVALID_SOCKET) {
+            closesocket(recvSocket);
+            recvSocket = INVALID_SOCKET;
+        }
+
+        if (feedbackSocket != INVALID_SOCKET) {
+            closesocket(feedbackSocket);
+            feedbackSocket = INVALID_SOCKET;
+        }
+    }
+
+    // Cleanup Winsock
+    WSACleanup();
+
+    std::cout << "Application cleaned up successfully" << std::endl;
+}
+
+// Initialize haptic device
+bool initHapticDevice() {
+    // Initialize Force Dimension device
+    int deviceID = dhdOpen();
+
+    if (deviceID < 0) {
+        std::cerr << "Error: Failed to open haptic device. Error code: " << deviceID << std::endl;
+        std::cerr << "Error message: " << dhdErrorGetLastStr() << std::endl;
+
+        // Continue without haptic feedback
+        std::cout << "Continuing without haptic feedback..." << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(hapticMutex);
+            hapticConfig.deviceConnected = false;
+            hapticConfig.deviceID = -1;
+        }
+        return false;
+    }
+
+    // Device connected successfully
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.deviceConnected = true;
+        hapticConfig.deviceID = deviceID;
+    }
+
+    // Configure device
+    dhdEnableForce(DHD_ON);
+
+    std::cout << "Haptic device initialized: " << dhdGetSystemName() << std::endl;
+    return true;
+}
+
+// Initialize network
+bool initNetwork() {
+    // Initialize Winsock
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        std::cerr << "WSAStartup failed: " << result << std::endl;
+        return false;
+    }
+
+    // Create receive socket
+    {
+        std::lock_guard<std::mutex> lock(socketMutex);
+        recvSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (recvSocket == INVALID_SOCKET) {
+            std::cerr << "Failed to create receive socket. Error: " << WSAGetLastError() << std::endl;
+            WSACleanup();
+            return false;
+        }
+
+        // Set up receive socket address
+        sockaddr_in recvAddr;
+        recvAddr.sin_family = AF_INET;
+        recvAddr.sin_port = htons(UDP_PORT);
+        recvAddr.sin_addr.s_addr = INADDR_ANY;
+
+        // Bind socket
+        if (bind(recvSocket, (sockaddr*)&recvAddr, sizeof(recvAddr)) == SOCKET_ERROR) {
+            std::cerr << "Failed to bind socket. Error: " << WSAGetLastError() << std::endl;
+            closesocket(recvSocket);
+            WSACleanup();
+            return false;
+        }
+
+        // Create feedback socket
+        feedbackSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (feedbackSocket == INVALID_SOCKET) {
+            std::cerr << "Failed to create feedback socket. Error: " << WSAGetLastError() << std::endl;
+            closesocket(recvSocket);
+            WSACleanup();
+            return false;
+        }
+    }
+
+    std::cout << "Network initialized, listening on UDP port " << UDP_PORT << std::endl;
+    return true;
+}
+
+// Thread function to receive packets
+void receivePackets() {
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_PACKET_RECEPTION);
+
+    std::cout << "Packet receiver thread started" << std::endl;
+
+    char buffer[MAX_PACKET_SIZE];
+
+    while (true) {
+        sockaddr_in clientAddr;
+        int clientAddrLen = sizeof(clientAddr);
+
+        // Wait for packet
+        int bytesReceived = recvfrom(recvSocket, buffer, MAX_PACKET_SIZE, 0,
+            (sockaddr*)&clientAddr, &clientAddrLen);
+
+        if (bytesReceived > 0) {
+            // Store the client information for feedback
+            {
+                std::lock_guard<std::mutex> lock(clientMutex);
+                lastClient.addr = clientAddr;
+                lastClient.valid = true;
+            }
+
+            // Create packet structure
+            Packet packet;
+            int copySize = bytesReceived;
+            if (copySize > (int)sizeof(Packet)) {
+                copySize = (int)sizeof(Packet);
+            }
+            memcpy(&packet, buffer, copySize);
+
+            // Set receive time
+            packet.receiveTime = std::chrono::steady_clock::now();
+
+            // Add to distributor
+            packetDistributor.addPacket(packet);
+
+            // Update packet statistics
+            {
+                std::lock_guard<std::mutex> lock(statsMutex);
+
+                // If this is the first packet, initialize time
+                if (globalPacketStats.totalPacketsReceived == 0) {
+                    globalPacketStats.firstPacketTime = packet.receiveTime;
+                }
+
+                // Store packet timing
+                if (globalPacketStats.totalPacketsReceived > 0) {
+                    auto timeSinceLastPacket = std::chrono::duration<double, std::milli>(
+                        packet.receiveTime - globalPacketStats.lastPacketTime).count();
+
+                    globalPacketStats.packetTimings.push_back(timeSinceLastPacket);
+
+                    // Keep only the most recent PACKET_HISTORY_SIZE timings
+                    while (globalPacketStats.packetTimings.size() > PACKET_HISTORY_SIZE) {
+                        globalPacketStats.packetTimings.pop_front();
+                    }
+
+                    // Calculate average inter-packet time
+                    double sum = 0.0;
+                    for (const auto& timing : globalPacketStats.packetTimings) {
+                        sum += timing;
+                    }
+
+                    globalPacketStats.avgInterPacketTime = sum / globalPacketStats.packetTimings.size();
+                }
+
+                // Update packet count and rate
+                globalPacketStats.totalPacketsReceived++;
+                globalPacketStats.lastPacketTime = packet.receiveTime;
+
+                // Calculate packets per second
+                auto elapsedSeconds = std::chrono::duration<double>(
+                    globalPacketStats.lastPacketTime - globalPacketStats.firstPacketTime).count();
+
+                if (elapsedSeconds > 0) {
+                    globalPacketStats.avgReceiveRate = globalPacketStats.totalPacketsReceived / elapsedSeconds;
+                }
+            }
+        }
+    }
+}
+
+// Thread function to process packets
+void processPacketsThread() {
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_PROCESSING);
+
+    std::cout << "Packet processor thread started" << std::endl;
+
+    while (true) {
+        // Process packets based on timing
+        packetDistributor.processPackets();
+
+        // Sleep briefly to prevent high CPU usage
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+// GLUT display function
+void displayFunc() {
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLoadIdentity();
+
+    // Get statistics for visualization
+    PacketStats stats;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        stats = globalPacketStats;
+    }
+
+    // Get buffered and processed packets
+    auto bufferedPackets = packetDistributor.getBufferedPackets();
+    auto processedPackets = packetDistributor.getProcessedPackets();
+
+    // Draw sliding window visualizations
+    drawSlidingWindowGraph(bufferedPackets, 0.0f, "Incoming Packets", stats, true);
+    drawSlidingWindowGraph(processedPackets, 0.5f, "Processed Packets", stats, false);
+
+    // Draw haptic device state
+    drawHapticState(0.0f);
+
+    // Draw controls help
+    drawControls();
+
+    glutSwapBuffers();
+}
+
+// GLUT reshape function
+void reshapeFunc(int width, int height) {
+    windowWidth = width;
+    windowHeight = height;
+
+    glViewport(0, 0, width, height);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, 1, 0, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+}
+
+// GLUT idle function
+void idleFunc() {
+    glutPostRedisplay();
+}
+
+// Main function
+int main(int argc, char** argv) {
+    // Register cleanup handler
+    atexit(cleanup);
+
+    // Initialize network
+    if (!initNetwork()) {
+        std::cerr << "Failed to initialize network, exiting." << std::endl;
+        return 1;
+    }
+
+    // Initialize haptic device (continue even if failed)
+    if (!initHapticDevice()) {
+        std::cout << "Warning: Failed to initialize haptic device. Continuing without haptic feedback." << std::endl;
+    }
+
+    // Start packet receiver thread
+    std::thread receiverThread(receivePackets);
+    receiverThread.detach();
+
+    // Start packet processor thread
+    std::thread processorThread(processPacketsThread);
+    processorThread.detach();
+
+    // Start haptic update thread
+    std::thread hapticThread(updateHapticState);
+    hapticThread.detach();
+
+    // Initialize GLUT
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(windowWidth, windowHeight);
+    glutCreateWindow("Haptic Teleoperation System");
+
+    // Register GLUT callbacks
+    glutDisplayFunc(displayFunc);
+    glutReshapeFunc(reshapeFunc);
+    glutIdleFunc(idleFunc);
+    glutKeyboardFunc(keyboardFunc);
+    glutSpecialFunc(specialKeyFunc);
+
+    // Set up OpenGL
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    std::cout << "Haptic Teleoperation System initialized successfully" << std::endl;
+    std::cout << "UDP server listening on port " << UDP_PORT << " for incoming packets" << std::endl;
+    std::cout << "Client feedback will be sent back on port " << UDP_PORT << std::endl;
+
+    // Start GLUT main loop
+    glutMainLoop();
+
+    return 0;
+}
