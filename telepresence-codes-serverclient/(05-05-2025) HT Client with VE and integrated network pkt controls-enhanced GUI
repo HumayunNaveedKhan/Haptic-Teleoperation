@@ -1,0 +1,1776 @@
+//------------------------------------------------------------------------------
+// Enhanced Haptic Teleoperator Client with Advanced Delay Controls
+// This code adds a control GUI and feedback visualization to the existing client
+//------------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN  // Exclude rarely-used stuff from Windows headers
+#include <windows.h>
+#include <winsock2.h>  // Include before windows.h if both are needed
+#include <ws2tcpip.h>  // For additional socket functions
+#include "chai3d.h"
+//------------------------------------------------------------------------------
+#include <GLFW/glfw3.h>
+#include <iphlpapi.h>
+#include <thread>
+#include <random>
+#include <mutex>
+#include <deque>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <atomic>
+//------------------------------------------------------------------------------
+using namespace chai3d;
+using namespace std;
+//------------------------------------------------------------------------------
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+
+//------------------------------------------------------------------------------
+// CONFIGURATION PARAMETERS
+//------------------------------------------------------------------------------
+// Network Settings
+char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";     // Will be fetched dynamically
+const char DST_IP[] = "169.254.213.206";      // Destination IP (Receiver/Server)
+const int SRC_PORT = 1000;                    // Source UDP Port
+const int DST_PORT = 4000;                    // Destination UDP Port
+const int LISTEN_PORT = 4000;                 // Port to listen for feedback
+const int BUFFER_SIZE = 1024;                 // Packet buffer size
+
+// GUI Settings
+const int CONTROL_WINDOW_WIDTH = 500;         // Width of control window
+const int CONTROL_WINDOW_HEIGHT = 750;        // Height of control window
+const int MAX_DISPLAY_PACKETS = 15;           // Maximum packets to display in graphs
+const int FEEDBACK_UPDATE_INTERVAL_MS = 20;   // Interval to update feedback UI
+const int PACKET_HISTORY_SIZE = 100;          // Max packets to keep in history
+const int MAX_GRAPH_POINTS = 50;              // Maximum points in delay graph
+const float TEXT_SPACING = 20.0f;             // Vertical spacing between text lines
+
+// Haptic Feedback Settings
+const double DEFAULT_STIFFNESS = 500.0;       // Default stiffness (N/m)
+const double DEFAULT_DAMPING = 20.0;          // Default damping coefficient (Ns/m)
+const double MAX_FORCE = 5.0;                 // Maximum force magnitude (N)
+const int FEEDBACK_VALIDATION_INTERVAL = 2000; // Number of packets before validating feedback
+
+// Delay Settings - Default values
+int DEFAULT_HAPTIC_RATE_HZ = 1000;            // Haptic device update rate in Hz
+
+// Thread flags
+volatile bool networkRunning = true;
+volatile bool feedbackRunning = true;
+std::atomic<bool> enableHapticFeedback(true);
+std::atomic<int> feedbackMode(0);  // 0=Position, 1=Force, 2=Stiffness/Damping
+
+// Thread pointers
+std::thread* networkThread = nullptr;
+std::thread* feedbackThread = nullptr;
+
+// Network sockets
+SOCKET clientSocket = INVALID_SOCKET;
+SOCKET feedbackSocket = INVALID_SOCKET;
+
+// Mutexes for thread safety
+std::mutex packetMutex;
+std::mutex feedbackMutex;
+std::mutex statsMutex;
+std::mutex delayMutex;
+
+// Random number generators for delay simulation
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_real_distribution<> uniformDist;
+std::normal_distribution<> normalDist;
+
+//------------------------------------------------------------------------------
+// PACKET STRUCTURES
+//------------------------------------------------------------------------------
+// Outgoing packet structure (to server)
+struct Packet {
+    int packetNumber;                 // Sequential packet number
+    float x, y, z;                    // 3D Vector components
+    float delay;                      // Processing delay in milliseconds
+    char timestamp[64];               // Timestamp of packet creation
+    char srcIP[INET_ADDRSTRLEN];      // Source IP address
+    char dstIP[INET_ADDRSTRLEN];      // Destination IP address
+    int srcPort;                      // Source port
+    int dstPort;                      // Destination port
+    std::chrono::steady_clock::time_point receiveTime; // For client tracking
+};
+
+// Incoming feedback packet structure (from server)
+struct FeedbackPacket {
+    int packetNumber;                 // Sequential packet number
+    double force[3];                  // Force vector (x,y,z)
+    double position[3];               // Current device position
+    double error[3];                  // Position error
+    double stiffness;                 // Current stiffness value used (K)
+    double damping;                   // Current damping value used (B)
+    char message[64];                 // Message/status
+    std::chrono::steady_clock::time_point receiveTime; // For client tracking
+};
+
+// Statistics tracking
+struct PacketStats {
+    int totalPacketsSent = 0;
+    int totalFeedbackReceived = 0;
+    double avgSendRate = 0.0;
+    double avgResponseTime = 0.0;
+    std::chrono::steady_clock::time_point firstPacketTime;
+    std::chrono::steady_clock::time_point lastPacketTime;
+    std::deque<double> packetTimings;  // Store timing between sent packets
+    std::deque<std::pair<int, double>> responseTimeData; // For graphing
+    std::deque<std::pair<int, double>> appliedDelayData; // For tracking applied delays
+};
+
+// Delay configuration parameters
+enum DelayMode {
+    NO_DELAY = 0,
+    FIXED_DELAY,
+    UNIFORM_RANDOM_DELAY,
+    NORMAL_RANDOM_DELAY,
+    INCREASING_DELAY,
+    NETWORK_SIMULATION_DELAY
+};
+
+struct DelayParams {
+    DelayMode mode = NO_DELAY;
+    int hapticRateHz = DEFAULT_HAPTIC_RATE_HZ;     // Base rate for haptic updates
+    int fixedDelayMs = 0;                          // Fixed delay in milliseconds
+    int minRandomDelayMs = 0;                      // Minimum delay for uniform random
+    int maxRandomDelayMs = 100;                    // Maximum delay for uniform random
+    double meanDelayMs = 50.0;                     // Mean for normal distribution
+    double stdDevDelayMs = 10.0;                   // Std deviation for normal distribution
+    int increaseStepMs = 5;                        // Increment step for increasing delay
+    int increaseIntervalPackets = 100;             // Number of packets before increasing
+    int networkCongestionLevel = 0;                // 0-10 scale for network congestion
+    int packetLossPercent = 0;                     // Percentage of packets to drop (0-100)
+    int jitterLevel = 0;                           // Jitter level for network sim (0-10)
+    bool enabled = false;                          // Master enable for delay
+    
+    // Track current delay for some modes
+    int currentDelayMs = 0;
+    int packetsSinceLastIncrease = 0;
+};
+
+//------------------------------------------------------------------------------
+// GLOBAL VARIABLES
+//------------------------------------------------------------------------------
+// Packet data
+int packetNumber = 0;
+std::deque<Packet> recentPackets;
+std::deque<FeedbackPacket> recentFeedback;
+PacketStats stats;
+DelayParams delayParams;
+
+// UI state for control window
+GLFWwindow* controlWindow = nullptr;
+double controlMouseX = 0, controlMouseY = 0;
+bool controlMousePressed = false;
+int selectedUI = -1;
+int selectedDelayTab = 0; // 0 = Basic, 1 = Advanced
+char statusMessage[256] = "System ready";
+
+// Haptic feedback parameters
+struct HapticParams {
+    double stiffness = DEFAULT_STIFFNESS;
+    double damping = DEFAULT_DAMPING;
+    double forceScale = 1.0;
+    int packetApplyInterval = 1;       // Apply every Nth packet
+    int packetsToApply = 0;            // Number of packets to apply (0 = infinite)
+    int packetsApplied = 0;            // Counter for applied packets
+    bool useServerStiffness = true;    // Use stiffness from server feedback
+    int validationCounter = 0;         // Counter for validation interval
+};
+HapticParams hapticParams;
+
+// Forward declarations for original code compatibility
+extern cGenericHapticDevicePtr hapticDevice;
+extern void getLocalIP(char* ipBuffer);
+extern void getTimestamp(char* timestamp);
+extern GLFWwindow* window;
+
+//------------------------------------------------------------------------------
+// UTILITY FUNCTIONS
+//------------------------------------------------------------------------------
+// Get magnitude of a 3D vector
+double vectorMagnitude(const double vec[3]) {
+    return sqrt(vec[0]*vec[0] + vec[1]*vec[1] + vec[2]*vec[2]);
+}
+
+// Get string representation of a 3D vector
+std::string vectorToString(const double vec[3]) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3) 
+        << "[" << vec[0] << ", " << vec[1] << ", " << vec[2] << "]";
+    return oss.str();
+}
+
+// Calculate time difference in milliseconds
+double calculateTimeDiffMs(const std::chrono::steady_clock::time_point& start,
+                          const std::chrono::steady_clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+// Get delay for the current packet based on configured delay mode
+int calculateDelayMs() {
+    std::lock_guard<std::mutex> lock(delayMutex);
+    
+    // If delay is disabled, return 0
+    if (!delayParams.enabled) {
+        return 0;
+    }
+    
+    int delayMs = 0;
+    
+    switch (delayParams.mode) {
+        case NO_DELAY:
+            delayMs = 0;
+            break;
+            
+        case FIXED_DELAY:
+            delayMs = delayParams.fixedDelayMs;
+            break;
+            
+        case UNIFORM_RANDOM_DELAY:
+            {
+                // Update distribution range
+                uniformDist = std::uniform_real_distribution<>(
+                    delayParams.minRandomDelayMs, 
+                    delayParams.maxRandomDelayMs);
+                
+                delayMs = static_cast<int>(uniformDist(gen));
+            }
+            break;
+            
+        case NORMAL_RANDOM_DELAY:
+            {
+                // Update normal distribution parameters
+                normalDist = std::normal_distribution<>(
+                    delayParams.meanDelayMs, 
+                    delayParams.stdDevDelayMs);
+                
+                // Get value, ensure it's non-negative
+                delayMs = static_cast<int>(max(0.0, normalDist(gen)));
+            }
+            break;
+            
+        case INCREASING_DELAY:
+            {
+                // Use current delay value
+                delayMs = delayParams.currentDelayMs;
+                
+                // Check if we need to increase
+                delayParams.packetsSinceLastIncrease++;
+                
+                if (delayParams.packetsSinceLastIncrease >= delayParams.increaseIntervalPackets) {
+                    // Increase delay for next time
+                    delayParams.currentDelayMs += delayParams.increaseStepMs;
+                    delayParams.packetsSinceLastIncrease = 0;
+                }
+            }
+            break;
+            
+        case NETWORK_SIMULATION_DELAY:
+            {
+                // Base delay based on congestion level (0-200ms)
+                int baseDelay = 20 * delayParams.networkCongestionLevel;
+                
+                // Add jitter (0-50ms depending on jitter level)
+                int maxJitter = 5 * delayParams.jitterLevel;
+                int jitter = 0;
+                
+                if (maxJitter > 0) {
+                    std::uniform_real_distribution<> jitterDist(0, maxJitter);
+                    jitter = static_cast<int>(jitterDist(gen));
+                }
+                
+                delayMs = baseDelay + jitter;
+                
+                // Simulate packet loss (return -1 to indicate packet should be dropped)
+                if (delayParams.packetLossPercent > 0) {
+                    std::uniform_real_distribution<> lossDist(0, 100);
+                    if (lossDist(gen) < delayParams.packetLossPercent) {
+                        delayMs = -1; // Signal to drop this packet
+                    }
+                }
+            }
+            break;
+    }
+    
+    return delayMs;
+}
+
+// Reset all delay parameters to defaults
+void resetDelayParams() {
+    std::lock_guard<std::mutex> lock(delayMutex);
+    
+    delayParams.mode = NO_DELAY;
+    delayParams.hapticRateHz = DEFAULT_HAPTIC_RATE_HZ;
+    delayParams.fixedDelayMs = 0;
+    delayParams.minRandomDelayMs = 0;
+    delayParams.maxRandomDelayMs = 100;
+    delayParams.meanDelayMs = 50.0;
+    delayParams.stdDevDelayMs = 10.0;
+    delayParams.increaseStepMs = 5;
+    delayParams.increaseIntervalPackets = 100;
+    delayParams.networkCongestionLevel = 0;
+    delayParams.packetLossPercent = 0;
+    delayParams.jitterLevel = 0;
+    delayParams.enabled = false;
+    delayParams.currentDelayMs = 0;
+    delayParams.packetsSinceLastIncrease = 0;
+}
+
+//------------------------------------------------------------------------------
+// NETWORK FUNCTIONS
+//------------------------------------------------------------------------------
+// Initialize the network for sending packets to server
+bool initSendSocket() {
+    WSADATA wsaData;
+    
+    // Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        strcpy_s(statusMessage, "WSAStartup failed for send socket");
+        return false;
+    }
+    
+    // Create the UDP socket for sending
+    clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (clientSocket == INVALID_SOCKET) {
+        strcpy_s(statusMessage, "Failed to create send socket");
+        WSACleanup();
+        return false;
+    }
+    
+    return true;
+}
+
+// Initialize the network for receiving feedback from server
+bool initFeedbackSocket() {
+    // Create the UDP socket for receiving feedback
+    feedbackSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (feedbackSocket == INVALID_SOCKET) {
+        strcpy_s(statusMessage, "Failed to create feedback socket");
+        return false;
+    }
+    
+    // Bind to the feedback port
+    sockaddr_in recvAddr;
+    recvAddr.sin_family = AF_INET;
+    recvAddr.sin_port = htons(LISTEN_PORT);
+    recvAddr.sin_addr.s_addr = INADDR_ANY;
+    
+    if (bind(feedbackSocket, (sockaddr*)&recvAddr, sizeof(recvAddr)) == SOCKET_ERROR) {
+        strcpy_s(statusMessage, "Failed to bind feedback socket");
+        closesocket(feedbackSocket);
+        feedbackSocket = INVALID_SOCKET;
+        return false;
+    }
+    
+    // Set non-blocking mode for the socket
+    u_long mode = 1;
+    ioctlsocket(feedbackSocket, FIONBIO, &mode);
+    
+    return true;
+}
+
+// Network thread for sending packets to server
+void networkCommunication(void) {
+    Packet packet;
+    sockaddr_in serverAddr;
+    
+    // Set up the server address
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(DST_PORT);
+    if (inet_pton(AF_INET, DST_IP, &serverAddr.sin_addr) <= 0) {
+        strcpy_s(statusMessage, "Invalid destination IP");
+        networkRunning = false;
+        return;
+    }
+    
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    
+    // Initialize statistics
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        stats.firstPacketTime = std::chrono::steady_clock::now();
+        stats.lastPacketTime = stats.firstPacketTime;
+    }
+    
+    // Sending loop based on haptic rate
+    while (networkRunning) {
+        // Get current haptic rate
+        int currentHapticRate;
+        {
+            std::lock_guard<std::mutex> lock(delayMutex);
+            currentHapticRate = delayParams.hapticRateHz;
+        }
+        
+        // Get haptic device position directly
+        cVector3d position;
+        if (hapticDevice && hapticDevice->getPosition(position)) {
+            auto sendTime = std::chrono::steady_clock::now();
+            
+            // Calculate delay for this packet
+            int appliedDelayMs = calculateDelayMs();
+            
+            // If delay is -1, simulate packet loss by skipping this packet
+            if (appliedDelayMs == -1) {
+                // Sleep for the appropriate interval to match haptic rate
+                std::this_thread::sleep_for(std::chrono::microseconds(1000000 / currentHapticRate));
+                continue;
+            }
+            
+            // Apply the delay if there is one
+            if (appliedDelayMs > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(appliedDelayMs));
+            }
+            
+            // Fill packet data
+            packet.packetNumber = ++packetNumber;
+            packet.x = static_cast<float>(position.x());
+            packet.y = static_cast<float>(position.y());
+            packet.z = static_cast<float>(position.z());
+            packet.delay = static_cast<float>(appliedDelayMs); // Store the applied delay
+
+            getTimestamp(packet.timestamp);
+            strcpy_s(packet.srcIP, SRC_IP);
+            strcpy_s(packet.dstIP, DST_IP);
+            packet.srcPort = SRC_PORT;
+            packet.dstPort = DST_PORT;
+            packet.receiveTime = sendTime;
+            
+            // Store packet in recent history
+            {
+                std::lock_guard<std::mutex> lock(packetMutex);
+                recentPackets.push_back(packet);
+                
+                // Keep only the latest packets
+                while (recentPackets.size() > PACKET_HISTORY_SIZE) {
+                    recentPackets.pop_front();
+                }
+            }
+            
+            // Update statistics
+            {
+                std::lock_guard<std::mutex> lock(statsMutex);
+                
+                // Calculate time since last packet
+                if (stats.totalPacketsSent > 0) {
+                    double timeSinceLastPacket = calculateTimeDiffMs(
+                        stats.lastPacketTime, sendTime);
+                    
+                    stats.packetTimings.push_back(timeSinceLastPacket);
+                    
+                    // Keep only most recent timing data
+                    while (stats.packetTimings.size() > PACKET_HISTORY_SIZE) {
+                        stats.packetTimings.pop_front();
+                    }
+                }
+                
+                // Update counters and time
+                stats.totalPacketsSent++;
+                stats.lastPacketTime = sendTime;
+                
+                // Calculate send rate (packets/second)
+                auto elapsedSeconds = std::chrono::duration<double>(
+                    stats.lastPacketTime - stats.firstPacketTime).count();
+                
+                if (elapsedSeconds > 0) {
+                    stats.avgSendRate = stats.totalPacketsSent / elapsedSeconds;
+                }
+                
+                // Store applied delay for graphing
+                stats.appliedDelayData.push_back(
+                    std::make_pair(packet.packetNumber, appliedDelayMs));
+                
+                // Keep only the latest data points
+                while (stats.appliedDelayData.size() > MAX_GRAPH_POINTS) {
+                    stats.appliedDelayData.pop_front();
+                }
+            }
+            
+            // Send packet over UDP
+            sendto(clientSocket, reinterpret_cast<char*>(&packet), sizeof(Packet), 0,
+                  (sockaddr*)&serverAddr, sizeof(serverAddr));
+        }
+        
+        // Sleep for the appropriate interval to match haptic rate
+        std::this_thread::sleep_for(std::chrono::microseconds(1000000 / currentHapticRate));
+    }
+}
+
+// Thread to receive feedback from server
+void receiveFeedback(void) {
+    char buffer[BUFFER_SIZE];
+    FeedbackPacket feedback;
+    int bytesReceived;
+    
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    
+    while (feedbackRunning) {
+        // Try to receive feedback packet
+        bytesReceived = recv(feedbackSocket, buffer, BUFFER_SIZE, 0);
+        
+        if (bytesReceived > 0 && bytesReceived >= sizeof(FeedbackPacket)) {
+            // Got a valid feedback packet
+            memcpy(&feedback, buffer, sizeof(FeedbackPacket));
+            
+            // Set receive time
+            feedback.receiveTime = std::chrono::steady_clock::now();
+            
+            // Store the feedback
+            {
+                std::lock_guard<std::mutex> lock(feedbackMutex);
+                recentFeedback.push_back(feedback);
+                
+                // Keep only the most recent feedback
+                while (recentFeedback.size() > PACKET_HISTORY_SIZE) {
+                    recentFeedback.pop_front();
+                }
+            }
+            
+            // Find matching sent packet to calculate response time
+            {
+                std::lock_guard<std::mutex> lockPackets(packetMutex);
+                std::lock_guard<std::mutex> lockStats(statsMutex);
+                
+                for (const auto& packet : recentPackets) {
+                    if (packet.packetNumber == feedback.packetNumber) {
+                        // Calculate response time
+                        double responseTime = calculateTimeDiffMs(
+                            packet.receiveTime, feedback.receiveTime);
+                        
+                        // Store for graphing
+                        stats.responseTimeData.push_back(
+                            std::make_pair(feedback.packetNumber, responseTime));
+                        
+                        // Keep only the latest data points
+                        while (stats.responseTimeData.size() > MAX_GRAPH_POINTS) {
+                            stats.responseTimeData.pop_front();
+                        }
+                        
+                        // Update average response time
+                        if (stats.totalFeedbackReceived == 0) {
+                            stats.avgResponseTime = responseTime;
+                        } else {
+                            stats.avgResponseTime = 
+                                (stats.avgResponseTime * stats.totalFeedbackReceived + responseTime) / 
+                                (stats.totalFeedbackReceived + 1);
+                        }
+                        
+                        stats.totalFeedbackReceived++;
+                        break;
+                    }
+                }
+            }
+            
+            // Apply haptic feedback if enabled
+            if (enableHapticFeedback && hapticDevice) {
+                // Only apply feedback for every Nth packet (based on user setting)
+                if (hapticParams.packetsApplied % hapticParams.packetApplyInterval == 0) {
+                    // Check if we've reached the limit of packets to apply
+                    if (hapticParams.packetsToApply == 0 || 
+                        hapticParams.packetsApplied < hapticParams.packetsToApply) {
+                        
+                        // Apply feedback based on selected mode
+                        switch (feedbackMode) {
+                            case 0: // Position-based feedback
+                                {
+                                    // Create a target position using the received position
+                                    cVector3d targetPos(
+                                        feedback.position[0],
+                                        feedback.position[1],
+                                        feedback.position[2]
+                                    );
+                                    
+                                    // Get current device position
+                                    cVector3d currPos;
+                                    hapticDevice->getPosition(currPos);
+                                    
+                                    // Calculate error (distance to target)
+                                    cVector3d posDiff = targetPos - currPos;
+                                    
+                                    // Apply force based on position error (spring model)
+                                    double k = hapticParams.useServerStiffness ? 
+                                              feedback.stiffness : hapticParams.stiffness;
+                                    
+                                    // Apply force with stiffness (spring) and damping
+                                    cVector3d force = k * posDiff;
+                                    
+                                    // Get velocity for damping
+                                    cVector3d velocity;
+                                    hapticDevice->getLinearVelocity(velocity);
+                                    
+                                    // Apply damping
+                                    double b = hapticParams.useServerStiffness ? 
+                                              feedback.damping : hapticParams.damping;
+                                    force -= b * velocity;
+                                    
+                                    // Limit maximum force
+                                    if (force.length() > MAX_FORCE) {
+                                        force = MAX_FORCE * cNormalize(force);
+                                    }
+                                    
+                                    // Send force to device
+                                    hapticDevice->setForce(force);
+                                }
+                                break;
+                                
+                            case 1: // Force-based feedback
+                                {
+                                    // Directly apply the force vector from the feedback
+                                    cVector3d force(
+                                        feedback.force[0] * hapticParams.forceScale,
+                                        feedback.force[1] * hapticParams.forceScale,
+                                        feedback.force[2] * hapticParams.forceScale
+                                    );
+                                    
+                                    // Limit maximum force
+                                    if (force.length() > MAX_FORCE) {
+                                        force = MAX_FORCE * cNormalize(force);
+                                    }
+                                    
+                                    // Apply force directly
+                                    hapticDevice->setForce(force);
+                                }
+                                break;
+                                
+                            case 2: // Stiffness/Damping based feedback
+                                {
+                                    // Use stiffness and damping values from feedback
+                                    double k = feedback.stiffness;
+                                    double b = feedback.damping;
+                                    
+                                    // Calculate position error
+                                    cVector3d error(
+                                        feedback.error[0],
+                                        feedback.error[1],
+                                        feedback.error[2]
+                                    );
+                                    
+                                    // Get current velocity
+                                    cVector3d velocity;
+                                    hapticDevice->getLinearVelocity(velocity);
+                                    
+                                    // Calculate force: F = -k*x - b*v
+                                    cVector3d force = k * error - b * velocity;
+                                    
+                                    // Limit maximum force
+                                    if (force.length() > MAX_FORCE) {
+                                        force = MAX_FORCE * cNormalize(force);
+                                    }
+                                    
+                                    // Apply force
+                                    hapticDevice->setForce(force);
+                                }
+                                break;
+                        }
+                    }
+                }
+                
+                // Increment applied packets counter
+                hapticParams.packetsApplied++;
+                
+                // Increment validation counter
+                hapticParams.validationCounter++;
+                
+                // Check if we need to validate/alter stiffness and damping
+                if (hapticParams.validationCounter >= FEEDBACK_VALIDATION_INTERVAL) {
+                    // Reset counter
+                    hapticParams.validationCounter = 0;
+                    
+                    // Get the most recent feedback
+                    FeedbackPacket latestFeedback;
+                    {
+                        std::lock_guard<std::mutex> lock(feedbackMutex);
+                        if (!recentFeedback.empty()) {
+                            latestFeedback = recentFeedback.back();
+                            
+                            // Update stiffness and damping if using server values
+                            if (hapticParams.useServerStiffness) {
+                                hapticParams.stiffness = latestFeedback.stiffness;
+                                hapticParams.damping = latestFeedback.damping;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Small sleep to prevent CPU hogging
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+//------------------------------------------------------------------------------
+// GUI FUNCTIONS FOR CONTROL WINDOW
+//------------------------------------------------------------------------------
+// Draw a rectangle for UI
+void drawRect(float x, float y, float width, float height, float r, float g, float b, float a = 1.0f) {
+    glColor4f(r, g, b, a);
+    glBegin(GL_QUADS);
+    glVertex2f(x, y);
+    glVertex2f(x + width, y);
+    glVertex2f(x + width, y + height);
+    glVertex2f(x, y + height);
+    glEnd();
+    
+    // Draw border
+    glColor4f(r * 0.7f, g * 0.7f, b * 0.7f, 1.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x, y);
+    glVertex2f(x + width, y);
+    glVertex2f(x + width, y + height);
+    glVertex2f(x, y + height);
+    glEnd();
+}
+
+// Draw text in the control window
+void drawText(float x, float y, const char* text, float r = 1.0f, float g = 1.0f, float b = 1.0f) {
+    glColor3f(r, g, b);
+    glRasterPos2f(x, y);
+    for (const char* c = text; *c != '\0'; c++) {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *c);
+    }
+}
+
+// Draw a button and return if it was clicked
+bool drawButton(float x, float y, float width, float height, const char* text, bool highlighted) {
+    // Draw button background
+    if (highlighted) {
+        drawRect(x, y, width, height, 0.4f, 0.6f, 0.9f);
+    } else {
+        drawRect(x, y, width, height, 0.3f, 0.3f, 0.6f);
+    }
+    
+    // Draw button text
+    float textX = x + (width - glutBitmapLength(GLUT_BITMAP_HELVETICA_12, (const unsigned char*)text)) / 2;
+    float textY = y + height / 2 + 5;
+    drawText(textX, textY, text);
+    
+    // Check if button was clicked
+    if (controlMousePressed && 
+        controlMouseX >= x && controlMouseX <= x + width &&
+        controlMouseY >= y && controlMouseY <= y + height) {
+        controlMousePressed = false;
+        return true;
+    }
+    
+    return false;
+}
+
+// Draw a slider for numeric input
+bool drawSlider(float x, float y, float width, float height, const char* label, 
+               double& value, double minVal, double maxVal, double step, bool highlighted) {
+    bool changed = false;
+    
+    // Draw slider background
+    if (highlighted) {
+        drawRect(x, y, width, height, 0.25f, 0.25f, 0.3f);
+    } else {
+        drawRect(x, y, width, height, 0.2f, 0.2f, 0.25f);
+    }
+    
+    // Draw slider label
+    drawText(x + 5, y + height - 5, label);
+    
+    // Calculate slider track and handle
+    float trackY = y + height / 2;
+    float trackHeight = 4;
+    float handleRadius = 8;
+    float trackStart = x + 10;
+    float trackWidth = width - 20;
+    float trackEnd = trackStart + trackWidth;
+    
+    // Draw track
+    drawRect(trackStart, trackY - trackHeight/2, trackWidth, trackHeight, 0.5f, 0.5f, 0.5f);
+    
+    // Calculate handle position
+    float normalizedVal = (value - minVal) / (maxVal - minVal);
+    float handleX = trackStart + normalizedVal * trackWidth;
+    
+    // Draw handle
+    glColor3f(0.7f, 0.7f, 0.8f);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(handleX, trackY);
+    for (int i = 0; i <= 12; i++) {
+        float angle = 2.0f * 3.14159f * i / 12;
+        glVertex2f(handleX + handleRadius * cos(angle), trackY + handleRadius * sin(angle));
+    }
+    glEnd();
+    
+    // Draw value
+    char valueStr[32];
+    sprintf_s(valueStr, "%.2f", value);
+    drawText(trackEnd + 5, trackY + 5, valueStr);
+    
+    // Modify the value if the slider is being dragged
+    if (controlMousePressed && 
+        controlMouseY >= trackY - handleRadius && controlMouseY <= trackY + handleRadius) {
+        if (controlMouseX >= trackStart - handleRadius && controlMouseX <= trackEnd + handleRadius) {
+            // Compute new value based on mouse position
+            float normalizedPos = (controlMouseX - trackStart) / trackWidth;
+            normalizedPos = fmax(0.0f, fmin(1.0f, normalizedPos));
+            
+            double newValue = minVal + normalizedPos * (maxVal - minVal);
+            
+            // Round to nearest step
+            newValue = round(newValue / step) * step;
+            
+            // Update if changed
+            if (newValue != value) {
+                value = newValue;
+                changed = true;
+            }
+        }
+    }
+    
+    return changed;
+}
+
+// Draw an integer slider
+bool drawIntSlider(float x, float y, float width, float height, const char* label, 
+                  int& value, int minVal, int maxVal, bool highlighted) {
+    bool changed = false;
+    
+    // Draw slider background
+    if (highlighted) {
+        drawRect(x, y, width, height, 0.25f, 0.25f, 0.3f);
+    } else {
+        drawRect(x, y, width, height, 0.2f, 0.2f, 0.25f);
+    }
+    
+    // Draw slider label
+    drawText(x + 5, y + height - 5, label);
+    
+    // Calculate slider track and handle
+    float trackY = y + height / 2;
+    float trackHeight = 4;
+    float handleRadius = 8;
+    float trackStart = x + 10;
+    float trackWidth = width - 20;
+    float trackEnd = trackStart + trackWidth;
+    
+    // Draw track
+    drawRect(trackStart, trackY - trackHeight/2, trackWidth, trackHeight, 0.5f, 0.5f, 0.5f);
+    
+    // Calculate handle position
+    float normalizedVal = (value - minVal) / (float)(maxVal - minVal);
+    float handleX = trackStart + normalizedVal * trackWidth;
+    
+    // Draw handle
+    glColor3f(0.7f, 0.7f, 0.8f);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(handleX, trackY);
+    for (int i = 0; i <= 12; i++) {
+        float angle = 2.0f * 3.14159f * i / 12;
+        glVertex2f(handleX + handleRadius * cos(angle), trackY + handleRadius * sin(angle));
+    }
+    glEnd();
+    
+    // Draw value
+    char valueStr[32];
+    sprintf_s(valueStr, "%d", value);
+    drawText(trackEnd + 5, trackY + 5, valueStr);
+    
+    // Modify the value if the slider is being dragged
+    if (controlMousePressed && 
+        controlMouseY >= trackY - handleRadius && controlMouseY <= trackY + handleRadius) {
+        if (controlMouseX >= trackStart - handleRadius && controlMouseX <= trackEnd + handleRadius) {
+            // Compute new value based on mouse position
+            float normalizedPos = (controlMouseX - trackStart) / trackWidth;
+            normalizedPos = fmax(0.0f, fmin(1.0f, normalizedPos));
+            
+            int newValue = minVal + (int)(normalizedPos * (maxVal - minVal));
+            
+            // Update if changed
+            if (newValue != value) {
+                value = newValue;
+                changed = true;
+            }
+        }
+    }
+    
+    return changed;
+}
+
+// Draw a checkbox
+bool drawCheckbox(float x, float y, float size, const char* label, bool& value, bool highlighted) {
+    bool changed = false;
+    
+    // Draw checkbox border
+    if (highlighted) {
+        drawRect(x, y, size, size, 0.4f, 0.4f, 0.5f);
+    } else {
+        drawRect(x, y, size, size, 0.3f, 0.3f, 0.4f);
+    }
+    
+    // Draw checkbox fill if checked
+    if (value) {
+        drawRect(x + 2, y + 2, size - 4, size - 4, 0.2f, 0.6f, 0.8f);
+    }
+    
+    // Draw label
+    drawText(x + size + 5, y + size / 2 + 5, label);
+    
+    // Check if clicked
+    if (controlMousePressed &&
+        controlMouseX >= x && controlMouseX <= x + size &&
+        controlMouseY >= y && controlMouseY <= y + size) {
+        value = !value;
+        changed = true;
+        controlMousePressed = false;
+    }
+    
+    return changed;
+}
+
+// Draw a radio button group
+bool drawRadioGroup(float x, float y, float spacing, const char* groupLabel, 
+                   const std::vector<const char*>& options, int& selectedIndex, bool highlighted) {
+    bool changed = false;
+    
+    // Draw group label
+    drawText(x, y, groupLabel, highlighted ? 0.9f : 0.8f, highlighted ? 0.9f : 0.8f, highlighted ? 1.0f : 0.8f);
+    
+    float radioY = y + TEXT_SPACING;
+    float radioSize = 12;
+    
+    // Draw each radio button
+    for (int i = 0; i < options.size(); i++) {
+        // Draw radio button circle
+        glColor3f(0.6f, 0.6f, 0.6f);
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(x + radioSize/2, radioY + radioSize/2);
+        for (int j = 0; j <= 12; j++) {
+            float angle = 2.0f * 3.14159f * j / 12;
+            glVertex2f(x + radioSize/2 + radioSize/2 * cos(angle), 
+                      radioY + radioSize/2 + radioSize/2 * sin(angle));
+        }
+        glEnd();
+        
+        // Draw selection dot if selected
+        if (i == selectedIndex) {
+            glColor3f(0.2f, 0.6f, 0.8f);
+            glBegin(GL_TRIANGLE_FAN);
+            glVertex2f(x + radioSize/2, radioY + radioSize/2);
+            for (int j = 0; j <= 12; j++) {
+                float angle = 2.0f * 3.14159f * j / 12;
+                glVertex2f(x + radioSize/2 + radioSize/3 * cos(angle), 
+                          radioY + radioSize/2 + radioSize/3 * sin(angle));
+            }
+            glEnd();
+        }
+        
+        // Draw label
+        drawText(x + radioSize + 5, radioY + radioSize/2 + 5, options[i]);
+        
+        // Check if clicked
+        if (controlMousePressed &&
+            controlMouseX >= x && controlMouseX <= x + radioSize &&
+            controlMouseY >= radioY && controlMouseY <= radioY + radioSize) {
+            if (selectedIndex != i) {
+                selectedIndex = i;
+                changed = true;
+            }
+            controlMousePressed = false;
+        }
+        
+        radioY += spacing;
+    }
+    
+    return changed;
+}
+
+// Draw a numeric input field
+bool drawNumericInput(float x, float y, float width, float height, const char* label, 
+                     int& value, int minVal, int maxVal, bool highlighted) {
+    bool changed = false;
+    
+    // Draw input background
+    if (highlighted) {
+        drawRect(x, y, width, height, 0.25f, 0.25f, 0.3f);
+    } else {
+        drawRect(x, y, width, height, 0.2f, 0.2f, 0.25f);
+    }
+    
+    // Draw label
+    drawText(x + 5, y + height - 5, label);
+    
+    // Draw value
+    char valueStr[32];
+    sprintf_s(valueStr, "%d", value);
+    float valueWidth = glutBitmapLength(GLUT_BITMAP_HELVETICA_12, (const unsigned char*)valueStr);
+    drawText(x + width/2 - valueWidth/2, y + height/2 + 5, valueStr);
+    
+    // Draw increment/decrement buttons
+    float buttonWidth = 20;
+    float buttonHeight = height / 2 - 2;
+    
+    // Decrement button (-)
+    if (drawButton(x + width - buttonWidth - 5, y + 2, buttonWidth, buttonHeight, "-", 
+                  highlighted && controlMouseX >= x + width - buttonWidth - 5 && 
+                  controlMouseX <= x + width - 5 &&
+                  controlMouseY >= y + 2 && 
+                  controlMouseY <= y + 2 + buttonHeight)) {
+        value = max(minVal, value - 1);
+        changed = true;
+    }
+    
+    // Increment button (+)
+    if (drawButton(x + width - buttonWidth - 5, y + buttonHeight + 4, buttonWidth, buttonHeight, "+",
+                  highlighted && controlMouseX >= x + width - buttonWidth - 5 && 
+                  controlMouseX <= x + width - 5 &&
+                  controlMouseY >= y + buttonHeight + 4 && 
+                  controlMouseY <= y + 2*buttonHeight + 4)) {
+        value = min(maxVal, value + 1);
+        changed = true;
+    }
+    
+    return changed;
+}
+
+// Draw tab buttons
+bool drawTabs(float x, float y, float width, float height, const std::vector<const char*>& labels, int& selectedTab) {
+    bool changed = false;
+    int numTabs = static_cast<int>(labels.size());
+    float tabWidth = width / numTabs;
+    
+    // Draw tabs
+    for (int i = 0; i < numTabs; i++) {
+        bool isSelected = (i == selectedTab);
+        float r = isSelected ? 0.3f : 0.2f;
+        float g = isSelected ? 0.5f : 0.2f;
+        float b = isSelected ? 0.7f : 0.25f;
+        
+        // Draw tab background
+        drawRect(x + i * tabWidth, y, tabWidth, height, r, g, b);
+        
+        // Draw tab label
+        float labelWidth = glutBitmapLength(GLUT_BITMAP_HELVETICA_12, (const unsigned char*)labels[i]);
+        drawText(x + i * tabWidth + (tabWidth - labelWidth) / 2, y + height/2 + 5, labels[i]);
+        
+        // Check if clicked
+        if (controlMousePressed &&
+            controlMouseX >= x + i * tabWidth && controlMouseX <= x + (i+1) * tabWidth &&
+            controlMouseY >= y && controlMouseY <= y + height) {
+            selectedTab = i;
+            changed = true;
+            controlMousePressed = false;
+        }
+    }
+    
+    return changed;
+}
+
+// Draw a graph for packet delays
+void drawGraph(float x, float y, float width, float height, const char* title,
+              const std::deque<std::pair<int, double>>& data, 
+              float r = 0.2f, float g = 0.6f, float b = 0.8f) {
+    // Draw graph background
+    drawRect(x, y, width, height, 0.15f, 0.15f, 0.2f, 0.7f);
+    
+    // Draw title
+    drawText(x + 5, y + height - 15, title);
+    
+    // Check if we have data
+    if (data.empty()) {
+        drawText(x + width/2 - 40, y + height/2, "No data available");
+        return;
+    }
+    
+    // Find min and max values
+    int minPacketNum = data.front().first;
+    int maxPacketNum = data.back().first;
+    double maxDelay = 0.1; // Minimum scale to prevent division by zero
+    
+    for (const auto& point : data) {
+        if (point.second > maxDelay) {
+            maxDelay = point.second;
+        }
+    }
+    
+    // Add 10% margin to max delay
+    maxDelay *= 1.1;
+    
+    // Draw axes
+    glColor3f(0.6f, 0.6f, 0.6f);
+    glBegin(GL_LINES);
+    // X axis
+    glVertex2f(x + 10, y + 10);
+    glVertex2f(x + width - 10, y + 10);
+    // Y axis
+    glVertex2f(x + 10, y + 10);
+    glVertex2f(x + 10, y + height - 20);
+    glEnd();
+    
+    // Draw Y-axis scale
+    char scaleStr[32];
+    sprintf_s(scaleStr, "%.1f ms", maxDelay);
+    drawText(x + 15, y + height - 35, scaleStr, 0.7f, 0.7f, 0.7f);
+    
+    // Draw data points
+    float graphWidth = width - 20;
+    float graphHeight = height - 30;
+    
+    // Connect the points with lines
+    glColor3f(r, g, b);
+    glBegin(GL_LINE_STRIP);
+    
+    for (const auto& point : data) {
+        float xPos = x + 10 + graphWidth * (point.first - minPacketNum) / 
+                    (float)(maxPacketNum - minPacketNum + 1);
+        float yPos = y + 10 + graphHeight * point.second / maxDelay;
+        glVertex2f(xPos, yPos);
+    }
+    
+    glEnd();
+    
+    // Draw min and max packet numbers on x-axis
+    sprintf_s(scaleStr, "%d", minPacketNum);
+    drawText(x + 10, y + 5, scaleStr, 0.7f, 0.7f, 0.7f);
+    
+    sprintf_s(scaleStr, "%d", maxPacketNum);
+    drawText(x + width - 30, y + 5, scaleStr, 0.7f, 0.7f, 0.7f);
+}
+
+// Draw recent packets visualization (like in server)
+void drawPacketVisualization(float x, float y, float width, float height, const char* title,
+                            const std::deque<Packet>& packets) {
+    // Draw background
+    drawRect(x, y, width, height, 0.15f, 0.15f, 0.2f, 0.7f);
+    
+    // Draw title
+    drawText(x + 5, y + height - 15, title);
+    
+    // Check if we have data
+    if (packets.empty()) {
+        drawText(x + width/2 - 40, y + height/2, "No packets sent yet");
+        return;
+    }
+    
+    // Calculate parameters for visualization
+    int displayCount = min((int)packets.size(), MAX_DISPLAY_PACKETS);
+    float barSpacing = (width - 20) / displayCount;
+    float barWidth = barSpacing * 0.6f;
+    
+    // Find max magnitude for scaling
+    float maxMagnitude = 0.01f; // Prevent division by zero
+    
+    for (const auto& packet : packets) {
+        float magnitude = sqrt(packet.x*packet.x + packet.y*packet.y + packet.z*packet.z);
+        if (magnitude > maxMagnitude) {
+            maxMagnitude = magnitude;
+        }
+    }
+    
+    // Draw bars for each packet
+    int index = 0;
+    auto it = packets.end() - displayCount;
+    for (int i = 0; i < displayCount; i++, it++) {
+        const Packet& packet = *it;
+        
+        // Calculate magnitude
+        float magnitude = sqrt(packet.x*packet.x + packet.y*packet.y + packet.z*packet.z);
+        float barHeight = (height - 40) * (magnitude / maxMagnitude);
+        
+        // Calculate position
+        float barX = x + 10 + barSpacing * i;
+        float barY = y + 20;
+        
+        // Choose color based on packet number
+        int colorIndex = packet.packetNumber % 6;
+        float r = 0.2f, g = 0.2f, b = 0.7f;  // Default blue
+        
+        switch (colorIndex) {
+            case 0: r = 0.7f; g = 0.2f; b = 0.2f; break; // Red
+            case 1: r = 0.2f; g = 0.7f; b = 0.2f; break; // Green
+            case 2: r = 0.2f; g = 0.2f; b = 0.7f; break; // Blue
+            case 3: r = 0.7f; g = 0.7f; b = 0.2f; break; // Yellow
+            case 4: r = 0.7f; g = 0.2f; b = 0.7f; break; // Purple
+            case 5: r = 0.2f; g = 0.7f; b = 0.7f; break; // Cyan
+        }
+        
+        // Draw the bar
+        drawRect(barX, barY, barWidth, barHeight, r, g, b);
+        
+        // Draw packet number
+        if (i % 2 == 0) { // To prevent overlapping, only show every other number
+            char numStr[16];
+            sprintf_s(numStr, "%d", packet.packetNumber);
+            drawText(barX, barY + barHeight + 10, numStr, 0.7f, 0.7f, 0.7f);
+        }
+        
+        // Draw applied delay below
+        char delayStr[16];
+        sprintf_s(delayStr, "%.1f ms", packet.delay);
+        drawText(barX, barY - 15, delayStr, 0.7f, 0.7f, 0.7f);
+        
+        index++;
+    }
+}
+
+// Draw the delay control section
+void drawDelayControls(float x, float y, float width, float height) {
+    // Draw section background
+    drawRect(x, y, width, height, 0.18f, 0.18f, 0.22f);
+    drawText(x + 10, y + 20, "Delay Control", 0.9f, 0.9f, 1.0f);
+    
+    // Draw tabs for basic and advanced delay controls
+    std::vector<const char*> tabLabels = { "Basic Delay", "Advanced Delay" };
+    drawTabs(x + 10, y + 30, width - 20, 25, tabLabels, selectedDelayTab);
+    
+    // Get current delay parameters (for UI display)
+    DelayParams currentParams;
+    {
+        std::lock_guard<std::mutex> lock(delayMutex);
+        currentParams = delayParams;
+    }
+    
+    // Draw the master enable checkbox
+    bool enableChanged = drawCheckbox(x + 10, y + 65, 20, "Enable Delay", 
+                                     currentParams.enabled, 
+                                     controlMouseX >= x + 10 && controlMouseX <= x + 30 &&
+                                     controlMouseY >= y + 65 && controlMouseY <= y + 85);
+    
+    if (enableChanged) {
+        std::lock_guard<std::mutex> lock(delayMutex);
+        delayParams.enabled = currentParams.enabled;
+    }
+    
+    // Draw Haptic Rate control
+    bool rateChanged = drawNumericInput(x + width - 170, y + 65, 150, 25, 
+                                       "Haptic Rate (Hz):", currentParams.hapticRateHz, 10, 2000,
+                                       controlMouseX >= x + width - 170 && 
+                                       controlMouseX <= x + width - 20 &&
+                                       controlMouseY >= y + 65 && 
+                                       controlMouseY <= y + 90);
+    
+    if (rateChanged) {
+        std::lock_guard<std::mutex> lock(delayMutex);
+        delayParams.hapticRateHz = currentParams.hapticRateHz;
+    }
+    
+    // Based on selected tab, show different delay controls
+    if (selectedDelayTab == 0) {
+        // Basic delay controls
+        std::vector<const char*> delayOptions = {
+            "No Delay",
+            "Fixed Delay",
+            "Uniform Random Delay",
+            "Normal Random Delay",
+            "Increasing Delay",
+            "Network Simulation"
+        };
+        
+        bool modeChanged = drawRadioGroup(x + 10, y + 100, 22, "Delay Mode:", 
+                                         delayOptions, (int&)currentParams.mode,
+                                         controlMouseX >= x + 10 && 
+                                         controlMouseX <= x + 200 &&
+                                         controlMouseY >= y + 100 && 
+                                         controlMouseY <= y + 240);
+        
+        if (modeChanged) {
+            std::lock_guard<std::mutex> lock(delayMutex);
+            delayParams.mode = (DelayMode)currentParams.mode;
+            
+            // Reset current delay for increasing mode
+            if (delayParams.mode == INCREASING_DELAY) {
+                delayParams.currentDelayMs = 0;
+                delayParams.packetsSinceLastIncrease = 0;
+            }
+        }
+        
+        // Draw specific controls based on selected mode
+        float controlY = y + 230;
+        
+        switch (currentParams.mode) {
+            case FIXED_DELAY:
+                {
+                    bool changed = drawIntSlider(x + 10, controlY, width - 20, 25, 
+                                               "Fixed Delay (ms):", currentParams.fixedDelayMs, 0, 1000,
+                                               controlMouseX >= x + 10 && 
+                                               controlMouseX <= x + width - 10 &&
+                                               controlMouseY >= controlY && 
+                                               controlMouseY <= controlY + 25);
+                    
+                    if (changed) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.fixedDelayMs = currentParams.fixedDelayMs;
+                    }
+                }
+                break;
+                
+            case UNIFORM_RANDOM_DELAY:
+                {
+                    // Min delay
+                    bool minChanged = drawIntSlider(x + 10, controlY, width - 20, 25, 
+                                                  "Min Delay (ms):", currentParams.minRandomDelayMs, 0, 500,
+                                                  controlMouseX >= x + 10 && 
+                                                  controlMouseX <= x + width - 10 &&
+                                                  controlMouseY >= controlY && 
+                                                  controlMouseY <= controlY + 25);
+                    
+                    if (minChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.minRandomDelayMs = currentParams.minRandomDelayMs;
+                        
+                        // Ensure min <= max
+                        if (delayParams.minRandomDelayMs > delayParams.maxRandomDelayMs) {
+                            delayParams.maxRandomDelayMs = delayParams.minRandomDelayMs;
+                        }
+                    }
+                    
+                    // Max delay
+                    controlY += 35;
+                    bool maxChanged = drawIntSlider(x + 10, controlY, width - 20, 25, 
+                                                  "Max Delay (ms):", currentParams.maxRandomDelayMs, 
+                                                  currentParams.minRandomDelayMs, 1000,
+                                                  controlMouseX >= x + 10 && 
+                                                  controlMouseX <= x + width - 10 &&
+                                                  controlMouseY >= controlY && 
+                                                  controlMouseY <= controlY + 25);
+                    
+                    if (maxChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.maxRandomDelayMs = currentParams.maxRandomDelayMs;
+                    }
+                }
+                break;
+                
+            case NORMAL_RANDOM_DELAY:
+                {
+                    // Mean delay
+                    double meanDelay = currentParams.meanDelayMs;
+                    bool meanChanged = drawSlider(x + 10, controlY, width - 20, 25, 
+                                                "Mean Delay (ms):", meanDelay, 0, 500, 1.0,
+                                                controlMouseX >= x + 10 && 
+                                                controlMouseX <= x + width - 10 &&
+                                                controlMouseY >= controlY && 
+                                                controlMouseY <= controlY + 25);
+                    
+                    if (meanChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.meanDelayMs = meanDelay;
+                    }
+                    
+                    // Standard deviation
+                    controlY += 35;
+                    double stdDev = currentParams.stdDevDelayMs;
+                    bool stdDevChanged = drawSlider(x + 10, controlY, width - 20, 25, 
+                                                  "Std Deviation:", stdDev, 0, 100, 1.0,
+                                                  controlMouseX >= x + 10 && 
+                                                  controlMouseX <= x + width - 10 &&
+                                                  controlMouseY >= controlY && 
+                                                  controlMouseY <= controlY + 25);
+                    
+                    if (stdDevChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.stdDevDelayMs = stdDev;
+                    }
+                }
+                break;
+                
+            case INCREASING_DELAY:
+                {
+                    // Step size
+                    bool stepChanged = drawIntSlider(x + 10, controlY, width - 20, 25, 
+                                                   "Step Size (ms):", currentParams.increaseStepMs, 1, 50,
+                                                   controlMouseX >= x + 10 && 
+                                                   controlMouseX <= x + width - 10 &&
+                                                   controlMouseY >= controlY && 
+                                                   controlMouseY <= controlY + 25);
+                    
+                    if (stepChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.increaseStepMs = currentParams.increaseStepMs;
+                    }
+                    
+                    // Interval
+                    controlY += 35;
+                    bool intervalChanged = drawIntSlider(x + 10, controlY, width - 20, 25, 
+                                                       "Packets per Step:", currentParams.increaseIntervalPackets, 
+                                                       1, 1000,
+                                                       controlMouseX >= x + 10 && 
+                                                       controlMouseX <= x + width - 10 &&
+                                                       controlMouseY >= controlY && 
+                                                       controlMouseY <= controlY + 25);
+                    
+                    if (intervalChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.increaseIntervalPackets = currentParams.increaseIntervalPackets;
+                    }
+                    
+                    // Current delay info
+                    controlY += 35;
+                    char currentDelayStr[64];
+                    sprintf_s(currentDelayStr, "Current Delay: %d ms | Packets in Interval: %d / %d", 
+                             currentParams.currentDelayMs, currentParams.packetsSinceLastIncrease,
+                             currentParams.increaseIntervalPackets);
+                    drawText(x + 10, controlY + 10, currentDelayStr);
+                    
+                    // Reset button
+                    controlY += 25;
+                    if (drawButton(x + width - 100, controlY, 90, 25, "Reset Delay", 
+                                  controlMouseX >= x + width - 100 && 
+                                  controlMouseX <= x + width - 10 &&
+                                  controlMouseY >= controlY && 
+                                  controlMouseY <= controlY + 25)) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.currentDelayMs = 0;
+                        delayParams.packetsSinceLastIncrease = 0;
+                    }
+                }
+                break;
+                
+            case NETWORK_SIMULATION_DELAY:
+                {
+                    // Congestion level
+                    bool congestionChanged = drawIntSlider(x + 10, controlY, width - 20, 25, 
+                                                         "Congestion (0-10):", 
+                                                         currentParams.networkCongestionLevel, 0, 10,
+                                                         controlMouseX >= x + 10 && 
+                                                         controlMouseX <= x + width - 10 &&
+                                                         controlMouseY >= controlY && 
+                                                         controlMouseY <= controlY + 25);
+                    
+                    if (congestionChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.networkCongestionLevel = currentParams.networkCongestionLevel;
+                    }
+                    
+                    // Jitter level
+                    controlY += 35;
+                    bool jitterChanged = drawIntSlider(x + 10, controlY, width - 20, 25, 
+                                                     "Jitter (0-10):", currentParams.jitterLevel, 0, 10,
+                                                     controlMouseX >= x + 10 && 
+                                                     controlMouseX <= x + width - 10 &&
+                                                     controlMouseY >= controlY && 
+                                                     controlMouseY <= controlY + 25);
+                    
+                    if (jitterChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.jitterLevel = currentParams.jitterLevel;
+                    }
+                    
+                    // Packet loss
+                    controlY += 35;
+                    bool lossChanged = drawIntSlider(x + 10, controlY, width - 20, 25, 
+                                                   "Packet Loss (%):", currentParams.packetLossPercent, 0, 100,
+                                                   controlMouseX >= x + 10 && 
+                                                   controlMouseX <= x + width - 10 &&
+                                                   controlMouseY >= controlY && 
+                                                   controlMouseY <= controlY + 25);
+                    
+                    if (lossChanged) {
+                        std::lock_guard<std::mutex> lock(delayMutex);
+                        delayParams.packetLossPercent = currentParams.packetLossPercent;
+                    }
+                }
+                break;
+        }
+        
+        // Draw reset button at the bottom
+        if (drawButton(x + 10, y + height - 40, width - 20, 30, "Reset All Delay Settings", 
+                      controlMouseX >= x + 10 && controlMouseX <= x + width - 10 &&
+                      controlMouseY >= y + height - 40 && controlMouseY <= y + height - 10)) {
+            resetDelayParams();
+        }
+    }
+    else {
+        // Advanced delay controls will go here
+        // This could include custom delay patterns, imported delay profiles, etc.
+        drawText(x + 10, y + 150, "Advanced delay controls coming soon...");
+    }
+}
+
+// Render control window
+void renderControlWindow() {
+    // Get window size
+    int width, height;
+    glfwGetWindowSize(controlWindow, &width, &height);
+    
+    // Set up orthographic projection
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, width, height, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    
+    // Clear background
+    glClearColor(0.12f, 0.12f, 0.15f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    // Enable blending
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    // Draw title
+    drawText(20, 30, "Haptic Teleoperation Client Control Panel", 0.9f, 0.9f, 1.0f);
+    
+    // Connection status
+    drawRect(20, 50, width - 40, 50, 0.15f, 0.15f, 0.20f);
+    
+    // Get statistics
+    PacketStats currentStats;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        currentStats = stats;
+    }
+    
+    // Display connection and packet statistics
+    char statsText[256];
+    sprintf_s(statsText, "Connected to: %s:%d | Packets Sent: %d | Send Rate: %.1f packets/s",
+             DST_IP, DST_PORT, currentStats.totalPacketsSent, currentStats.avgSendRate);
+    drawText(30, 70, statsText);
+    
+    sprintf_s(statsText, "Feedback Received: %d | Avg Response Time: %.1f ms | Status: %s",
+             currentStats.totalFeedbackReceived, currentStats.avgResponseTime, statusMessage);
+    drawText(30, 90, statsText);
+    
+    //------------------------------------------------------------------------
+    // Delay Controls Section
+    //------------------------------------------------------------------------
+    float sectionY = 120;
+    drawDelayControls(20, sectionY, width - 40, 400);
+    
+    //------------------------------------------------------------------------
+    // Haptic Feedback Control Section
+    //------------------------------------------------------------------------
+    sectionY = 540;
+    drawRect(20, sectionY, width - 40, 140, 0.18f, 0.18f, 0.22f);
+    drawText(30, sectionY + 20, "Haptic Feedback Control", 0.9f, 0.9f, 1.0f);
+    
+    // Enable/Disable Feedback checkbox
+    bool highlightCheckbox = 
+        controlMouseX >= 30 && controlMouseX <= 30 + 20 &&
+        controlMouseY >= sectionY + 40 && controlMouseY <= sectionY + 40 + 20;
+        
+    bool tempEnableFeedback = enableHapticFeedback;
+    if (drawCheckbox(30, sectionY + 40, 20, "Enable Haptic Feedback", tempEnableFeedback, highlightCheckbox)) {
+        enableHapticFeedback = tempEnableFeedback;
+    }
+    
+    // Use server stiffness/damping checkbox
+    highlightCheckbox = 
+        controlMouseX >= 30 && controlMouseX <= 30 + 20 &&
+        controlMouseY >= sectionY + 70 && controlMouseY <= sectionY + 70 + 20;
+        
+    if (drawCheckbox(30, sectionY + 70, 20, "Use Server Stiffness/Damping", 
+                    hapticParams.useServerStiffness, highlightCheckbox)) {
+        // Value changed in the function
+    }
+    
+    // Feedback mode radio buttons
+    std::vector<const char*> feedbackOptions = {
+        "Position-based Feedback", 
+        "Force-based Feedback", 
+        "Stiffness/Damping Feedback"
+    };
+    
+    bool highlightRadio = 
+        controlMouseX >= 30 && controlMouseX <= 200 &&
+        controlMouseY >= sectionY + 100 && controlMouseY <= sectionY + 100 + 80;
+        
+    int tempFeedbackMode = feedbackMode;
+    if (drawRadioGroup(30, sectionY + 100, 20, "Feedback Mode:", feedbackOptions, tempFeedbackMode, highlightRadio)) {
+        feedbackMode = tempFeedbackMode;
+    }
+    
+    //------------------------------------------------------------------------
+    // Data Visualization Section
+    //------------------------------------------------------------------------
+    sectionY = 700;
+    drawRect(20, sectionY, width - 40, 250, 0.18f, 0.18f, 0.22f);
+    drawText(30, sectionY + 20, "Data Visualization", 0.9f, 0.9f, 1.0f);
+    
+    // Get recent packets and feedback for visualization
+    std::deque<Packet> recentPacketsCopy;
+    {
+        std::lock_guard<std::mutex> lock(packetMutex);
+        recentPacketsCopy = recentPackets;
+    }
+    
+    // Draw response time graph
+    std::deque<std::pair<int, double>> responseTimeDataCopy;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        responseTimeDataCopy = currentStats.responseTimeData;
+    }
+    
+    // Draw applied delay graph
+    std::deque<std::pair<int, double>> appliedDelayDataCopy;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        appliedDelayDataCopy = currentStats.appliedDelayData;
+    }
+    
+    // Draw the graphs in a grid layout
+    float graphWidth = (width - 60) / 2;
+    float graphHeight = 100;
+    
+    // Draw response time graph (top left)
+    drawGraph(30, sectionY + 40, graphWidth, graphHeight, 
+             "Response Time (ms)", responseTimeDataCopy, 0.2f, 0.6f, 0.8f);
+    
+    // Draw applied delay graph (top right)
+    drawGraph(40 + graphWidth, sectionY + 40, graphWidth, graphHeight, 
+             "Applied Delay (ms)", appliedDelayDataCopy, 0.8f, 0.4f, 0.2f);
+    
+    // Draw packet visualization (bottom)
+    drawPacketVisualization(30, sectionY + 50 + graphHeight, width - 60, graphHeight, 
+                          "Recent Packets with Applied Delays", recentPacketsCopy);
+    
+    // Reset the mouse click state
+    controlMousePressed = false;
+    
+    // Swap buffers
+    glfwSwapBuffers(controlWindow);
+}
+
+// Mouse button callback for control window
+void controlMouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+        controlMousePressed = true;
+    }
+}
+
+// Mouse position callback for control window
+void controlCursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
+    controlMouseX = xpos;
+    controlMouseY = ypos;
+}
+
+// Initialize the control window
+bool initControlWindow() {
+    // Create a window for GUI controls
+    glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+    controlWindow = glfwCreateWindow(CONTROL_WINDOW_WIDTH, CONTROL_WINDOW_HEIGHT, 
+                                    "Haptic Teleoperation Control", NULL, window);
+    
+    if (!controlWindow) {
+        strcpy_s(statusMessage, "Failed to create control window");
+        return false;
+    }
+    
+    // Set callbacks
+    glfwSetMouseButtonCallback(controlWindow, controlMouseButtonCallback);
+    glfwSetCursorPosCallback(controlWindow, controlCursorPosCallback);
+    
+    // Position the window
+    const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
+    glfwSetWindowPos(controlWindow, mode->width - CONTROL_WINDOW_WIDTH - 50, 50);
+    
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// MAIN FUNCTIONS
+//------------------------------------------------------------------------------
+// Initialize client extension
+bool initClientExtension() {
+    // Initialize random generators
+    uniformDist = std::uniform_real_distribution<>(0.0, 1.0);
+    normalDist = std::normal_distribution<>(0.0, 1.0);
+    
+    // Initialize delay parameters
+    resetDelayParams();
+    
+    // Initialize send socket
+    if (!initSendSocket()) {
+        return false;
+    }
+    
+    // Initialize feedback socket
+    if (!initFeedbackSocket()) {
+        return false;
+    }
+    
+    // Initialize control window
+    if (!initControlWindow()) {
+        return false;
+    }
+    
+    // Start the network thread
+    networkThread = new std::thread(networkCommunication);
+    
+    // Start the feedback thread
+    feedbackThread = new std::thread(receiveFeedback);
+    
+    return true;
+}
+
+// Update the control window
+void updateControlWindow() {
+    // Make sure window exists
+    if (!controlWindow) return;
+    
+    // Make current
+    glfwMakeContextCurrent(controlWindow);
+    
+    // Render the window
+    renderControlWindow();
+    
+    // Poll for events
+    glfwPollEvents();
+    
+    // Return to main window context
+    glfwMakeContextCurrent(window);
+}
+
+// Clean up resources
+void cleanupClientExtension() {
+    // Signal threads to stop
+    networkRunning = false;
+    feedbackRunning = false;
+    
+    // Wait for threads to finish
+    if (networkThread && networkThread->joinable()) {
+        networkThread->join();
+        delete networkThread;
+        networkThread = nullptr;
+    }
+    
+    if (feedbackThread && feedbackThread->joinable()) {
+        feedbackThread->join();
+        delete feedbackThread;
+        feedbackThread = nullptr;
+    }
+    
+    // Clean up sockets
+    if (clientSocket != INVALID_SOCKET) {
+        closesocket(clientSocket);
+        clientSocket = INVALID_SOCKET;
+    }
+    
+    if (feedbackSocket != INVALID_SOCKET) {
+        closesocket(feedbackSocket);
+        feedbackSocket = INVALID_SOCKET;
+    }
+    
+    // Destroy control window
+    if (controlWindow) {
+        glfwDestroyWindow(controlWindow);
+        controlWindow = nullptr;
+    }
+    
+    WSACleanup();
+}
+
+// This function initializes and updates the client extension.
+// Add these functions to the original code:
+
+// Add to main() after hapticsThread = new cThread()... line:
+//     if (!initClientExtension()) {
+//         cout << "Failed to initialize client extension!" << endl;
+//     }
+
+// Add to updateGraphics() at the end:
+//     updateControlWindow();
+
+// Add to close() after hapticsThread deletion:
+//     cleanupClientExtension();
