@@ -351,62 +351,27 @@ bool initFeedbackSocket() {
     // Create the UDP socket for receiving feedback
     feedbackSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (feedbackSocket == INVALID_SOCKET) {
-        sprintf_s(statusMessage, sizeof(statusMessage), "Failed to create feedback socket, error: %d", WSAGetLastError());
+        strcpy_s(statusMessage, "Failed to create feedback socket");
         return false;
     }
     
-    // Set socket to be reusable
-    BOOL bReuseAddr = TRUE;
-    if (setsockopt(feedbackSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&bReuseAddr, sizeof(bReuseAddr)) == SOCKET_ERROR) {
-        sprintf_s(statusMessage, sizeof(statusMessage), "Failed to set SO_REUSEADDR, error: %d", WSAGetLastError());
-        // Continue despite this error - not critical
-    }
-
-    // Try to bind to the feedback port
+    // Bind to the feedback port
     sockaddr_in recvAddr;
-    memset(&recvAddr, 0, sizeof(recvAddr));
     recvAddr.sin_family = AF_INET;
     recvAddr.sin_port = htons(LISTEN_PORT);
     recvAddr.sin_addr.s_addr = INADDR_ANY;
     
-    int bindResult = bind(feedbackSocket, (sockaddr*)&recvAddr, sizeof(recvAddr));
-    if (bindResult == SOCKET_ERROR) {
-        int error = WSAGetLastError();
-        sprintf_s(statusMessage, sizeof(statusMessage), "Failed to bind feedback socket, error: %d", error);
-        
-        if (error == WSAEADDRINUSE) {
-            // Port is already in use, try to find an alternative port
-            for (int altPort = LISTEN_PORT + 1; altPort < LISTEN_PORT + 10; altPort++) {
-                recvAddr.sin_port = htons(altPort);
-                if (bind(feedbackSocket, (sockaddr*)&recvAddr, sizeof(recvAddr)) != SOCKET_ERROR) {
-                    sprintf_s(statusMessage, sizeof(statusMessage), "Bound to alternative port: %d", altPort);
-                    // Successfully bound to alternative port
-                    std::cout << "Successfully bound to alternative port: " << altPort << std::endl;
-                    break;
-                }
-            }
-        } else {
-            // Some other binding error, clean up and return failure
-            closesocket(feedbackSocket);
-            feedbackSocket = INVALID_SOCKET;
-            return false;
-        }
-    }
-    
-    // Check if we have a valid socket after all binding attempts
-    if (feedbackSocket == INVALID_SOCKET) {
-        strcpy_s(statusMessage, "Failed to bind to any available port");
+    if (bind(feedbackSocket, (sockaddr*)&recvAddr, sizeof(recvAddr)) == SOCKET_ERROR) {
+        strcpy_s(statusMessage, "Failed to bind feedback socket");
+        closesocket(feedbackSocket);
+        feedbackSocket = INVALID_SOCKET;
         return false;
     }
     
     // Set non-blocking mode for the socket
     u_long mode = 1;
-    if (ioctlsocket(feedbackSocket, FIONBIO, &mode) == SOCKET_ERROR) {
-        sprintf_s(statusMessage, sizeof(statusMessage), "Failed to set non-blocking mode, error: %d", WSAGetLastError());
-        // Continue despite this error - we'll handle it in the receive loop
-    }
+    ioctlsocket(feedbackSocket, FIONBIO, &mode);
     
-    std::cout << "Feedback socket initialized successfully" << std::endl;
     return true;
 }
 
