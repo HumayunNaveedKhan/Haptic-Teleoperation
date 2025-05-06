@@ -38,10 +38,10 @@ using namespace std;
 //------------------------------------------------------------------------------
 char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";     // Will be fetched dynamically
 char SERVER_IP[INET_ADDRSTRLEN] = "169.254.213.206"; // Default server IP (will be configurable)
-const int SRC_PORT = 1000;                     // Source UDP Port
+const int SRC_PORT = 4000;                     // Source UDP Port
 const int DST_PORT = 4000;                     // Destination UDP Port
 const int BUFFER_SIZE = 1024;                  // Packet buffer size
-const int HAPTIC_RATE_HZ = 1000;               // Haptic device update rate in Hz
+const int HAPTIC_RATE_HZ = 100;               // Haptic device update rate in Hz
 
 // Network communication threads
 std::thread* sendNetworkThread = nullptr;
@@ -558,7 +558,7 @@ void receiveNetworkThread_func(void) {
             else if (bytesReceived == SOCKET_ERROR) {
                 int error = WSAGetLastError();
                 if (error != WSAEWOULDBLOCK) {
-                    cerr << "Error receiving packet: " << error << endl;
+                    //cerr << "Error receiving packet: " << error << endl;
                 }
             }
         }
@@ -1201,7 +1201,7 @@ void updateHaptics(void)
         const double WALL_BACK = -0.08;
         const double SPHERE_STIFFNESS = 1000.0;
         const double SPHERE_MASS = 0.04;
-        const double K_DAMPING = 0.996;
+        const double K_DAMPING = 0.998;
         const double K_MAGNET = 500.0;
         const double HAPTIC_STIFFNESS = 500.0;
 
