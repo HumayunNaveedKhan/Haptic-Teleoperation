@@ -1,1692 +1,1346 @@
 //------------------------------------------------------------------------------
-#define WIN32_LEAN_AND_MEAN  // Exclude rarely-used stuff from Windows headers
-#include <windows.h>
-#include <winsock2.h>  // Include before windows.h if both are needed
-#include <ws2tcpip.h>  // For additional socket functions
-#include "chai3d.h"
-//------------------------------------------------------------------------------
-#include <GLFW/glfw3.h>
-#include <iphlpapi.h>
-#include <thread>
-#include <random>
-#include <mutex>
-#include <deque>
-#include <fstream>
-//------------------------------------------------------------------------------
-using namespace chai3d;
-using namespace std;
+// Haptic Teleoperation Client - Single File Windows Implementation
+//
+// This file contains the complete implementation of a haptic teleoperation
+// client for Windows. It includes networking, GUI, and haptic device integration.
 //------------------------------------------------------------------------------
 
+//------------------------------------------------------------------------------
+// INCLUDES
+//------------------------------------------------------------------------------
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <iostream>
+#include <iomanip>
+#include <string>
+#include <sstream>
+#include <vector>
+#include <deque>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <ctime>
+#include <chrono>
+#include <algorithm>
+#include <fstream>
+#include <cmath>
+
+// Comment out these includes if CHAI3D is not available
+ #include "chai3d.h"
+ #include <GLFW/glfw3.h>
+
+// Link with Winsock library
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
 //------------------------------------------------------------------------------
-// NETWORK SETTINGS
+// FORWARD DECLARATIONS
 //------------------------------------------------------------------------------
-char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";  // Will be fetched dynamically
-char DST_IP[INET_ADDRSTRLEN] = "169.254.213.206";   // Destination IP (Receiver)
-const int SRC_PORT = 1000;                 // Source UDP Port
-const int DST_PORT = 4000;                 // Destination UDP Port
-const int BUFFER_SIZE = 1024;              // Packet buffer size
-const int HAPTIC_RATE_HZ = 1000;           // Haptic device update rate in Hz
-const int MAX_HISTORY_SIZE = 1000;         // Maximum history size for graphs
+class HapticTeleoperationClient;
+class NetworkManager;
+class FeedbackProcessor;
+class UserInterface;
 
-// Network communication thread flags
-volatile bool networkRunning = true;
-volatile bool networkConnected = false;
-std::thread* networkThread = nullptr;
-std::thread* receiverThread = nullptr;
-SOCKET clientSocket = INVALID_SOCKET;
+//------------------------------------------------------------------------------
+// CONSTANTS & ENUMS
+//------------------------------------------------------------------------------
+// Network settings
+const int SRC_PORT = 1000;          // Source UDP port
+const int DST_PORT = 4000;          // Destination UDP port
+const int BUFFER_SIZE = 1024;       // Packet buffer size
+const int HAPTIC_RATE_HZ = 1000;    // Haptic device update rate
+const int MAX_HISTORY_SIZE = 1000;  // Maximum history size for graphs
+const int MAX_DISPLAY_PACKETS = 100; // Maximum packets to display in GUI
 
-// Mutex for thread safety
-std::mutex dataMutex;
-std::mutex logMutex;
+// GUI modes
+enum GuiMode {
+    GUI_HIDDEN = 0,
+    GUI_MINIMAL = 1,
+    GUI_FULL = 2
+};
 
-// Recording functionality
-bool isRecording = false;
-bool isReplaying = false;
-std::ofstream recordFile;
-std::ifstream replayFile;
-std::vector<std::pair<double, Packet>> recordedData;
-size_t replayIndex = 0;
-double replayStartTime = 0;
+// Feedback types
+enum FeedbackType {
+    FEEDBACK_POSITION = 0,
+    FEEDBACK_FORCE = 1,
+    FEEDBACK_STIFFNESS_DAMPING = 2
+};
 
 //------------------------------------------------------------------------------
 // PACKET STRUCTURES
 //------------------------------------------------------------------------------
-struct Packet {
+// Client packet structure
+struct ClientPacket {
     int packetNumber;
-    float x, y, z;
-    float delay;
-    char timestamp[64];
-    char srcIP[INET_ADDRSTRLEN];
-    char dstIP[INET_ADDRSTRLEN];
-    int srcPort;
-    int dstPort;
+    float x, y, z;                // Position data
+    float delay;                  // Delay information in ms
+    char timestamp[64];           // Timestamp for synchronization
+    char srcIP[16];               // Source IP address
+    char dstIP[16];               // Destination IP address
+    int srcPort;                  // Source port
+    int dstPort;                  // Destination port
 };
 
-// Feedback packet structure (must match server's structure)
+// Feedback packet structure
 struct FeedbackPacket {
-    int packetNumber;
-    float fx, fy, fz;  // Force feedback
-    float px, py, pz;  // Actual position on server
-    float positionError;  // Error between commanded and actual position
-    float latency;  // Estimated latency in ms
-    char timestamp[64];
+    int packetNumber;             // Matching packet number from client
+    float fx, fy, fz;             // Force feedback
+    float px, py, pz;             // Actual position on server
+    float positionError;          // Error between commanded and actual position
+    float latency;                // Estimated latency in ms
+    char timestamp[64];           // Timestamp for synchronization
 };
 
-// Create storage for historical data for visualization
-std::deque<Packet> sentPacketsHistory;
-std::deque<FeedbackPacket> receivedPacketsHistory;
-std::deque<double> latencyHistory;
-std::deque<double> positionErrorHistory;
-
-// Current packet and feedback data
-Packet currentPacket;
-FeedbackPacket currentFeedback;
-int packetsReceived = 0;
-int packetsSent = 0;
-double averageLatency = 0;
-double averagePositionError = 0;
-
 //------------------------------------------------------------------------------
-// GENERAL SETTINGS
+// NETWORK MANAGER CLASS
 //------------------------------------------------------------------------------
-// stereo Mode
-cStereoMode stereoMode = C_STEREO_DISABLED;
+class NetworkManager {
+public:
+    // Constructor
+    NetworkManager()
+        : m_client(nullptr),
+        m_localPort(SRC_PORT),
+        m_serverPort(DST_PORT),
+        m_socket(INVALID_SOCKET),
+        m_threadRunning(false),
+        m_connected(false),
+        m_packetsSent(0),
+        m_packetsReceived(0)
+    {
+        // Initialize local IP
+        strcpy_s(m_localIP, "127.0.0.1");
 
-// fullscreen mode
-bool fullscreen = false;
+        // Initialize server IP
+        strcpy_s(m_serverIP, "127.0.0.1");
+    }
 
-// mirrored display
-bool mirroredDisplay = false;
+    // Destructor
+    ~NetworkManager() {
+        disconnect();
+    }
 
-// GUI display mode
-enum GuiMode {
-    GUI_HIDDEN,
-    GUI_MINIMAL,
-    GUI_FULL
+    // Initialize the network manager
+    bool initialize() {
+        // Initialize Windows socket API
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            std::cerr << "Failed to initialize Winsock" << std::endl;
+            return false;
+        }
+
+        // Get local IP address
+        getLocalIPAddress(m_localIP);
+
+        // Initialize socket
+        return initializeSocket();
+    }
+
+    // Connect to server
+    bool connect(const std::string& serverIP, int serverPort) {
+        if (m_connected) {
+            return true;  // Already connected
+        }
+
+        // Copy server IP and port
+        strcpy_s(m_serverIP, serverIP.c_str());
+        m_serverPort = serverPort;
+
+        // Set up server address
+        m_serverAddr.sin_family = AF_INET;
+        m_serverAddr.sin_port = htons(m_serverPort);
+        inet_pton(AF_INET, m_serverIP, &m_serverAddr.sin_addr);
+
+        // Start network threads
+        m_threadRunning = true;
+        m_networkThread = std::thread(&NetworkManager::networkThreadFunc, this);
+
+        m_connected = true;
+        return true;
+    }
+
+    // Disconnect from server
+    void disconnect() {
+        if (!m_connected) {
+            return;  // Not connected
+        }
+
+        // Stop threads
+        m_threadRunning = false;
+
+        if (m_networkThread.joinable()) {
+            m_networkThread.join();
+        }
+
+        // Close socket
+        closeSocket();
+
+        m_connected = false;
+    }
+
+    // Send packet to server
+    bool sendPacket(const ClientPacket& packet) {
+        if (!m_connected || m_socket == INVALID_SOCKET) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(m_socketMutex);
+
+        // Send packet
+        int bytesSent = sendto(
+            m_socket,
+            reinterpret_cast<const char*>(&packet),
+            sizeof(packet),
+            0,
+            reinterpret_cast<const sockaddr*>(&m_serverAddr),
+            sizeof(m_serverAddr)
+        );
+
+        if (bytesSent == SOCKET_ERROR) {
+            std::cerr << "Error sending packet: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+
+        m_packetsSent++;
+        return true;
+    }
+
+    // Set client reference
+    void setClient(HapticTeleoperationClient* client) {
+        m_client = client;
+    }
+
+    // Get connection status
+    bool isConnected() const {
+        return m_connected;
+    }
+
+    // Get local IP address
+    const char* getLocalIP() const {
+        return m_localIP;
+    }
+
+    // Get server IP address
+    const char* getServerIP() const {
+        return m_serverIP;
+    }
+
+    // Get packet statistics
+    void getPacketStats(int& sent, int& received) const {
+        sent = m_packetsSent;
+        received = m_packetsReceived;
+    }
+
+private:
+    // Initialize socket
+    bool initializeSocket() {
+        // Create UDP socket
+        m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (m_socket == INVALID_SOCKET) {
+            std::cerr << "Error creating socket: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+
+        // Bind to local port
+        sockaddr_in localAddr;
+        localAddr.sin_family = AF_INET;
+        localAddr.sin_addr.s_addr = INADDR_ANY;
+        localAddr.sin_port = htons(m_localPort);
+
+        if (bind(m_socket, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR) {
+            std::cerr << "Error binding socket: " << WSAGetLastError() << std::endl;
+            closeSocket();
+            return false;
+        }
+
+        // Set socket to non-blocking mode
+        u_long mode = 1;
+        if (ioctlsocket(m_socket, FIONBIO, &mode) == SOCKET_ERROR) {
+            std::cerr << "Error setting non-blocking mode: " << WSAGetLastError() << std::endl;
+            closeSocket();
+            return false;
+        }
+
+        return true;
+    }
+
+    // Close socket
+    void closeSocket() {
+        if (m_socket != INVALID_SOCKET) {
+            closesocket(m_socket);
+            m_socket = INVALID_SOCKET;
+        }
+    }
+
+    // Get local IP address
+    void getLocalIPAddress(char* ipBuffer) {
+        char hostname[256];
+        struct addrinfo hints {}, * info, * p;
+        struct sockaddr_in* sockaddr_ipv4;
+
+        if (gethostname(hostname, sizeof(hostname)) == 0) {
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_DGRAM;
+            hints.ai_flags = AI_PASSIVE;
+
+            if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
+                for (p = info; p != NULL; p = p->ai_next) {
+                    sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
+                    inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, 16);
+                    // Skip localhost address
+                    if (strcmp(ipBuffer, "127.0.0.1") != 0) {
+                        break;
+                    }
+                }
+                freeaddrinfo(info);
+            }
+        }
+    }
+
+    // Network thread function
+    void networkThreadFunc() {
+        char recvBuffer[BUFFER_SIZE];
+        sockaddr_in senderAddr;
+        int senderAddrLen = sizeof(senderAddr);
+
+        while (m_threadRunning) {
+            // Receive packet
+            int bytesReceived = recvfrom(
+                m_socket,
+                recvBuffer,
+                BUFFER_SIZE,
+                0,
+                reinterpret_cast<sockaddr*>(&senderAddr),
+                &senderAddrLen
+            );
+
+            if (bytesReceived > 0) {
+                m_packetsReceived++;
+
+                // Process feedback packet
+                if (bytesReceived == sizeof(FeedbackPacket) && m_client) {
+                    processFeedbackPacket(reinterpret_cast<FeedbackPacket*>(recvBuffer));
+                }
+            }
+            else if (bytesReceived == SOCKET_ERROR) {
+                int error = WSAGetLastError();
+                if (error != WSAEWOULDBLOCK) {
+                    std::cerr << "Error receiving packet: " << error << std::endl;
+                }
+            }
+
+            // Small sleep to prevent CPU hogging
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    // Process feedback packet
+    void processFeedbackPacket(FeedbackPacket* packet);
+
+    // Client reference
+    HapticTeleoperationClient* m_client;
+
+    // Network configuration
+    char m_localIP[16];
+    char m_serverIP[16];
+    int m_localPort;
+    int m_serverPort;
+
+    // Socket information
+    SOCKET m_socket;
+    sockaddr_in m_serverAddr;
+
+    // Thread management
+    std::thread m_networkThread;
+    std::atomic<bool> m_threadRunning;
+
+    // Connection status
+    std::atomic<bool> m_connected;
+
+    // Packet statistics
+    std::atomic<int> m_packetsSent;
+    std::atomic<int> m_packetsReceived;
+
+    // Mutex for thread safety
+    std::mutex m_socketMutex;
 };
-GuiMode currentGuiMode = GUI_MINIMAL;
-
-// Scaling factors for haptic device
-double positionScaling = 1.0;
-double forceScaling = 1.0;
 
 //------------------------------------------------------------------------------
-// DECLARED CONSTANTS
+// FEEDBACK PROCESSOR CLASS
 //------------------------------------------------------------------------------
-// number of spheres in the scene
-const int NUM_SPHERES = 3;
+class FeedbackProcessor {
+public:
+    // Constructor
+    FeedbackProcessor()
+        : m_client(nullptr),
+        m_feedbackType(FEEDBACK_POSITION),
+        m_feedbackEnabled(true),
+        m_stiffness(100.0),
+        m_damping(20.0),
+        m_positionError(0.0f),
+        m_averageLatency(0.0f),
+        m_packetsProcessed(0)
+    {
+        // Initialize arrays
+        for (int i = 0; i < 3; i++) {
+            m_currentForce[i] = 0.0f;
+            m_targetPosition[i] = 0.0f;
+        }
+    }
 
-// radius of each sphere
-const double SPHERE_RADIUS = 0.007;
+    // Destructor
+    ~FeedbackProcessor() {
+        // Clean up
+    }
 
-// GUI panel dimensions
-const double GUI_PANEL_WIDTH = 0.25;
-const double GUI_PANEL_HEIGHT = 0.5;
+    // Initialize the processor
+    bool initialize() {
+        return true;
+    }
 
-//------------------------------------------------------------------------------
-// DECLARED VARIABLES
-//------------------------------------------------------------------------------
-// a world that contains all objects of the virtual environment
-cWorld* world;
+    // Set client reference
+    void setClient(HapticTeleoperationClient* client) {
+        m_client = client;
+    }
 
-// a camera to render the world in the window display
-cCamera* camera;
+    // Process feedback packet
+    void processFeedback(const FeedbackPacket& packet) {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
 
-// a light source to illuminate the objects in the world
-cSpotLight* light;
+        // Store force values
+        m_currentForce[0] = packet.fx;
+        m_currentForce[1] = packet.fy;
+        m_currentForce[2] = packet.fz;
 
-// a haptic device handler
-cHapticDeviceHandler* handler;
+        // Store target position
+        m_targetPosition[0] = packet.px;
+        m_targetPosition[1] = packet.py;
+        m_targetPosition[2] = packet.pz;
 
-// a pointer to the current haptic device
-cGenericHapticDevicePtr hapticDevice;
+        // Store error and latency
+        m_positionError = packet.positionError;
 
-// highest stiffness the current haptic device can render
-double hapticDeviceMaxStiffness;
+        // Update statistics
+        updateStatistics(packet);
 
-// sphere objects
-cShapeSphere* spheres[NUM_SPHERES];
+        // Apply feedback based on type
+        if (m_feedbackEnabled) {
+            calculateForce();
+        }
 
-// linear velocity of each sphere
-cVector3d sphereVel[NUM_SPHERES];
+        m_packetsProcessed++;
+    }
 
-// a colored background
-cBackground* background;
+    // Set feedback type
+    void setFeedbackType(FeedbackType type) {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        m_feedbackType = type;
+    }
 
-// a font for rendering text
-cFontPtr font;
+    // Enable/disable feedback
+    void setFeedbackEnabled(bool enabled) {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        m_feedbackEnabled = enabled;
+    }
 
-// GUI panel
-cPanel* guiPanel;
-cPanel* graphPanel;
+    // Set stiffness parameter
+    void setStiffness(double stiffness) {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        m_stiffness = stiffness;
+    }
 
-// GUI buttons
-cMultiSegmentedLine* positionGraph;
-cMultiSegmentedLine* forceGraph;
-cMultiSegmentedLine* latencyGraph;
-cMultiSegmentedLine* errorGraph;
+    // Set damping parameter
+    void setDamping(double damping) {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        m_damping = damping;
+    }
 
-// GUI labels
-cLabel* labelRates;
-cLabel* labelMessage;
-cLabel* labelDeviceInfo;
-cLabel* labelNetworkStatus;
-cLabel* labelPacketStats;
-cLabel* labelPositionData;
-cLabel* labelForceData;
-cLabel* labelLatency;
-cLabel* labelError;
+    // Get current force feedback
+    void getCurrentForce(float& fx, float& fy, float& fz) const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        fx = m_currentForce[0];
+        fy = m_currentForce[1];
+        fz = m_currentForce[2];
+    }
 
-// GUI elements for interaction
-cLabel* labelTitle;
-cCheckBox* checkBoxShowGui;
-cCheckBox* checkBoxRecord;
-cCheckBox* checkBoxReplay;
-cSlider* sliderPositionScale;
-cSlider* sliderForceScale;
-cButton* buttonCalibrate;
-cButton* buttonConnect;
-cButton* buttonDisconnect;
+    // Get current target position
+    void getTargetPosition(float& x, float& y, float& z) const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        x = m_targetPosition[0];
+        y = m_targetPosition[1];
+        z = m_targetPosition[2];
+    }
 
-// Force feedback indicator
-cArrow* forceVector;
-cArrow* positionErrorVector;
+    // Get feedback type
+    FeedbackType getFeedbackType() const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        return m_feedbackType;
+    }
 
-// a flag that indicates if the haptic simulation is currently running
-bool simulationRunning = false;
+    // Get feedback enabled state
+    bool isFeedbackEnabled() const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        return m_feedbackEnabled;
+    }
 
-// a flag that indicates if the haptic simulation has terminated
-bool simulationFinished = true;
+    // Get stiffness
+    double getStiffness() const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        return m_stiffness;
+    }
 
-// a frequency counter to measure the simulation graphic rate
-cFrequencyCounter freqCounterGraphics;
+    // Get damping
+    double getDamping() const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        return m_damping;
+    }
 
-// a frequency counter to measure the simulation haptic rate
-cFrequencyCounter freqCounterHaptics;
+    // Get position error
+    float getPositionError() const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        return m_positionError;
+    }
 
-// a frequency counter to measure the network rate
-cFrequencyCounter freqCounterNetwork;
+    // Get average latency
+    float getAverageLatency() const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        return m_averageLatency;
+    }
 
-// haptic thread
-cThread* hapticsThread;
+private:
+    // Calculate force feedback based on position error
+    void calculateForce() {
+        // Force calculation is implemented in the haptic loop
+        // This method just handles special processing if needed
+    }
 
-// a handle to window display context
-GLFWwindow* window = NULL;
+    // Update statistics
+    void updateStatistics(const FeedbackPacket& packet) {
+        // Add packet to history
+        m_packetHistory.push_back(packet);
+        if (m_packetHistory.size() > MAX_HISTORY_SIZE) {
+            m_packetHistory.pop_front();
+        }
 
-// current width of window
-int width = 0;
+        // Calculate average latency
+        float totalLatency = 0.0f;
+        for (const auto& p : m_packetHistory) {
+            totalLatency += p.latency;
+        }
+        m_averageLatency = totalLatency / m_packetHistory.size();
+    }
 
-// current height of window
-int height = 0;
+    // Client reference
+    HapticTeleoperationClient* m_client;
 
-// swap interval for the display context (vertical synchronization)
-int swapInterval = 1;
+    // Feedback parameters
+    FeedbackType m_feedbackType;
+    bool m_feedbackEnabled;
+    double m_stiffness;
+    double m_damping;
 
-// root resource path
-string resourceRoot;
+    // Current feedback values
+    float m_currentForce[3];
+    float m_targetPosition[3];
+    float m_positionError;
+    float m_averageLatency;
 
-// packet counter for network communication
-int packetNumber = 0;
+    // Packet history for statistics
+    std::deque<FeedbackPacket> m_packetHistory;
+    std::atomic<int> m_packetsProcessed;
 
-//------------------------------------------------------------------------------
-// DECLARED MACROS
-//------------------------------------------------------------------------------
-// convert to resource path
-#define RESOURCE_PATH(p)    (char*)((resourceRoot+string(p)).c_str())
-
-//------------------------------------------------------------------------------
-// DECLARED FUNCTIONS
-//------------------------------------------------------------------------------
-// callback when the window display is resized
-void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
-
-// callback when an error GLFW occurs
-void errorCallback(int error, const char* a_description);
-
-// callback when a key is pressed
-void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
-
-// callback when mouse button is pressed
-void mouseButtonCallback(GLFWwindow* a_window, int a_button, int a_action, int a_mods);
-
-// this function renders the scene
-void updateGraphics(void);
-
-// this function contains the main haptics simulation loop
-void updateHaptics(void);
-
-// this function handles network communication - sending
-void networkCommunication(void);
-
-// this function handles network communication - receiving
-void networkReceiver(void);
-
-// this function initializes the GUI
-void initializeGUI(void);
-
-// this function updates the GUI
-void updateGUI(void);
-
-// this function handles GUI events
-void handleGUIEvents(void);
-
-// this function updates the graphs
-void updateGraphs(void);
-
-// this function closes the application
-void close(void);
-
-// function to get local IP address
-void getLocalIP(char* ipBuffer);
-
-// function to get current timestamp
-void getTimestamp(char* timestamp);
-
-// function to start recording
-void startRecording(void);
-
-// function to stop recording
-void stopRecording(void);
-
-// function to start replay
-void startReplay(void);
-
-// function to stop replay
-void stopReplay(void);
-
-// function to connect to server
-void connectToServer(void);
-
-// function to disconnect from server
-void disconnectFromServer(void);
-
-// function to calibrate haptic device
-void calibrateDevice(void);
-
-// function to log message
-void logMessage(const std::string& message);
+    // Thread safety
+    mutable std::mutex m_dataMutex;
+};
 
 //------------------------------------------------------------------------------
-// IMPLEMENTATION OF FUNCTIONS
+// USER INTERFACE CLASS
 //------------------------------------------------------------------------------
+class UserInterface {
+public:
+    // Constructor
+    UserInterface()
+        : m_client(nullptr),
+        m_visible(true),
+        m_mode(GUI_MINIMAL),
+        m_positionX(0.0f),
+        m_positionY(0.0f),
+        m_positionZ(0.0f),
+        m_forceX(0.0f),
+        m_forceY(0.0f),
+        m_forceZ(0.0f),
+        m_packetsSent(0),
+        m_packetsReceived(0),
+        m_latency(0.0f),
+        m_stiffness(100.0),
+        m_damping(20.0),
+        m_feedbackType(FEEDBACK_POSITION),
+        m_feedbackEnabled(true),
+        m_positionScale(1.0f),
+        m_forceScale(1.0f)
+    {
+    }
 
-void getLocalIP(char* ipBuffer) {
-    char hostname[256];
-    struct addrinfo hints {}, * info, * p;
-    struct sockaddr_in* sockaddr_ipv4;
+    // Destructor
+    ~UserInterface() {
+        // Clean up
+    }
 
-    if (gethostname(hostname, sizeof(hostname)) == 0) {
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_DGRAM;
-        hints.ai_flags = AI_PASSIVE;
+    // Initialize the user interface
+    bool initialize() {
+        // Initialize UI components
+        initializeComponents();
+        return true;
+    }
 
-        if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
-            for (p = info; p != NULL; p = p->ai_next) {
-                sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
-                inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, INET_ADDRSTRLEN);
+    // Set client reference
+    void setClient(HapticTeleoperationClient* client) {
+        m_client = client;
+    }
+
+    // Update user interface
+    void update() {
+        // Update UI state
+    }
+
+    // Render user interface
+    void render() {
+        // Simple console-based UI for now
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+
+        system("cls");  // Clear console
+
+        // Display title and mode
+        std::cout << "===== HAPTIC TELEOPERATION CLIENT =====\n";
+        std::cout << "Mode: " << (m_mode == GUI_HIDDEN ? "Hidden" : (m_mode == GUI_MINIMAL ? "Minimal" : "Full")) << "\n\n";
+
+        // Display position and force
+        std::cout << "Position: (" << std::fixed << std::setprecision(3)
+            << m_positionX << ", " << m_positionY << ", " << m_positionZ << ")\n";
+
+        std::cout << "Force: (" << std::fixed << std::setprecision(3)
+            << m_forceX << ", " << m_forceY << ", " << m_forceZ << ")\n\n";
+
+        // Display network statistics
+        std::cout << "Network Statistics:\n";
+        std::cout << "  Packets Sent: " << m_packetsSent << "\n";
+        std::cout << "  Packets Received: " << m_packetsReceived << "\n";
+        std::cout << "  Latency: " << std::fixed << std::setprecision(2) << m_latency << " ms\n\n";
+
+        // Display haptic parameters
+        std::cout << "Haptic Parameters:\n";
+        std::cout << "  Stiffness: " << std::fixed << std::setprecision(1) << m_stiffness << "\n";
+        std::cout << "  Damping: " << std::fixed << std::setprecision(1) << m_damping << "\n";
+        std::cout << "  Feedback Type: " << (m_feedbackType == FEEDBACK_POSITION ? "Position" :
+            (m_feedbackType == FEEDBACK_FORCE ? "Force" : "Stiffness/Damping")) << "\n";
+        std::cout << "  Feedback Enabled: " << (m_feedbackEnabled ? "Yes" : "No") << "\n\n";
+
+        // Display scaling
+        std::cout << "Scaling:\n";
+        std::cout << "  Position Scale: " << std::fixed << std::setprecision(2) << m_positionScale << "\n";
+        std::cout << "  Force Scale: " << std::fixed << std::setprecision(2) << m_forceScale << "\n\n";
+
+        // Display message
+        if (!m_message.empty()) {
+            std::cout << "Message: " << m_message << "\n\n";
+        }
+
+        // Display commands
+        std::cout << "Commands:\n";
+        std::cout << "  [G] Toggle GUI Mode        [F] Toggle Feedback\n";
+        std::cout << "  [T] Change Feedback Type   [+/-] Adjust Stiffness\n";
+        std::cout << "  [D/C] Adjust Damping       [R] Reset Position\n";
+        std::cout << "  [Q] Quit\n";
+    }
+
+    // Process user input
+    void processInput() {
+        // Process keyboard input
+        if (_kbhit()) {
+            char key = _getch();
+
+            switch (key) {
+            case 'g':
+            case 'G':
+                // Toggle GUI mode
+                toggleGuiMode();
+                break;
+
+            case 'f':
+            case 'F':
+                // Toggle feedback
+                toggleFeedback();
+                break;
+
+            case 't':
+            case 'T':
+                // Change feedback type
+                cycleFeedbackType();
+                break;
+
+            case '+':
+                // Increase stiffness
+                adjustStiffness(10.0);
+                break;
+
+            case '-':
+                // Decrease stiffness
+                adjustStiffness(-10.0);
+                break;
+
+            case 'd':
+            case 'D':
+                // Increase damping
+                adjustDamping(5.0);
+                break;
+
+            case 'c':
+            case 'C':
+                // Decrease damping
+                adjustDamping(-5.0);
+                break;
+
+            case 'r':
+            case 'R':
+                // Reset position
+                resetPosition();
+                break;
+
+            case 'q':
+            case 'Q':
+                // Quit application
+                onButtonPressed(0); // Quit button ID
                 break;
             }
-            freeaddrinfo(info);
-        }
-    }
-}
-
-void getTimestamp(char* timestamp) {
-    time_t now = time(0);
-    struct tm tstruct;
-    localtime_s(&tstruct, &now);
-    strftime(timestamp, 64, "%Y-%m-%d %X", &tstruct);
-}
-
-void logMessage(const std::string& message) {
-    std::lock_guard<std::mutex> lock(logMutex);
-    std::cout << message << std::endl;
-    
-    // Update the message label in the GUI
-    if (labelMessage) {
-        labelMessage->setText(message);
-    }
-}
-
-void networkCommunication(void) {
-    WSADATA wsaData;
-    sockaddr_in serverAddr;
-    
-    // Initialize Winsock
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        logMessage("WSAStartup failed: " + std::to_string(WSAGetLastError()));
-        return;
-    }
-
-    // Create the UDP socket
-    clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (clientSocket == INVALID_SOCKET) {
-        logMessage("Socket creation failed: " + std::to_string(WSAGetLastError()));
-        WSACleanup();
-        return;
-    }
-
-    // Set up the server address
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(DST_PORT);
-    if (inet_pton(AF_INET, DST_IP, &serverAddr.sin_addr) <= 0) {
-        logMessage("Invalid destination IP");
-        closesocket(clientSocket);
-        WSACleanup();
-        return;
-    }
-
-    // Set socket to non-blocking mode
-    u_long iMode = 1;
-    ioctlsocket(clientSocket, FIONBIO, &iMode);
-
-    logMessage("Network thread initialized. Sending to " + std::string(DST_IP) + ":" + std::to_string(DST_PORT));
-    networkConnected = true;
-
-    // Set thread priority
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-
-    // High-precision timer for timing
-    LARGE_INTEGER frequency;
-    LARGE_INTEGER startTime, endTime;
-    double elapsedMs;
-    QueryPerformanceFrequency(&frequency);
-
-    // Start receiver thread
-    receiverThread = new std::thread(networkReceiver);
-
-    // Sending loop based on haptic rate
-    while (networkRunning) {
-        QueryPerformanceCounter(&startTime);
-
-        if (isReplaying) {
-            // In replay mode, use recorded data
-            double currentTime = ((double)startTime.QuadPart / frequency.QuadPart) - replayStartTime;
-            
-            // Find the appropriate packet for the current time
-            if (replayIndex < recordedData.size()) {
-                if (currentTime >= recordedData[replayIndex].first) {
-                    std::lock_guard<std::mutex> lock(dataMutex);
-                    currentPacket = recordedData[replayIndex].second;
-                    replayIndex++;
-                    
-                    // Send packet over UDP
-                    sendto(clientSocket, reinterpret_cast<char*>(&currentPacket), sizeof(Packet), 0,
-                        (sockaddr*)&serverAddr, sizeof(serverAddr));
-                    
-                    packetsSent++;
-                    freqCounterNetwork.signal(1);
-                    
-                    // Add to history
-                    sentPacketsHistory.push_back(currentPacket);
-                    if (sentPacketsHistory.size() > MAX_HISTORY_SIZE) {
-                        sentPacketsHistory.pop_front();
-                    }
-                }
-            } else {
-                // End of replay
-                stopReplay();
-            }
-        } else {
-            // Get haptic device position directly
-            cVector3d position;
-            if (hapticDevice && hapticDevice->getPosition(position)) {
-                // Apply position scaling
-                position *= positionScaling;
-                
-                // Fill packet data
-                std::lock_guard<std::mutex> lock(dataMutex);
-                currentPacket.packetNumber = ++packetNumber;
-                currentPacket.x = static_cast<float>(position.x());
-                currentPacket.y = static_cast<float>(position.y());
-                currentPacket.z = static_cast<float>(position.z());
-                currentPacket.delay = 1000.0f / HAPTIC_RATE_HZ;
-
-                getTimestamp(currentPacket.timestamp);
-                strcpy_s(currentPacket.srcIP, SRC_IP);
-                strcpy_s(currentPacket.dstIP, DST_IP);
-                currentPacket.srcPort = SRC_PORT;
-                currentPacket.dstPort = DST_PORT;
-
-                // Record if enabled
-                if (isRecording) {
-                    double timestamp = (double)startTime.QuadPart / frequency.QuadPart;
-                    recordedData.push_back(std::make_pair(timestamp - replayStartTime, currentPacket));
-                    recordFile.write(reinterpret_cast<char*>(&currentPacket), sizeof(Packet));
-                }
-
-                // Send packet over UDP
-                if (networkConnected) {
-                    sendto(clientSocket, reinterpret_cast<char*>(&currentPacket), sizeof(Packet), 0,
-                        (sockaddr*)&serverAddr, sizeof(serverAddr));
-                    
-                    packetsSent++;
-                    freqCounterNetwork.signal(1);
-                    
-                    // Add to history
-                    sentPacketsHistory.push_back(currentPacket);
-                    if (sentPacketsHistory.size() > MAX_HISTORY_SIZE) {
-                        sentPacketsHistory.pop_front();
-                    }
-                }
-            }
-        }
-
-        // Calculate time taken and sleep for the remaining interval
-        QueryPerformanceCounter(&endTime);
-        elapsedMs = ((endTime.QuadPart - startTime.QuadPart) * 1000.0) / frequency.QuadPart;
-        
-        int sleepTime = (1000 / HAPTIC_RATE_HZ) - static_cast<int>(elapsedMs);
-        if (sleepTime > 0) {
-            Sleep(sleepTime);
         }
     }
 
-    // Cleanup socket
-    networkConnected = false;
-    closesocket(clientSocket);
-    WSACleanup();
-    
-    // Wait for receiver thread to terminate
-    if (receiverThread && receiverThread->joinable()) {
-        receiverThread->join();
-        delete receiverThread;
-        receiverThread = nullptr;
+    // Show or hide UI
+    void setVisible(bool visible) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_visible = visible;
     }
-    
-    logMessage("Network communication stopped");
-}
 
-void networkReceiver(void) {
-    // Set thread priority
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    
-    char recvBuffer[BUFFER_SIZE];
-    sockaddr_in senderAddr;
-    int senderAddrLen = sizeof(senderAddr);
-    int bytesReceived;
-    
-    // High-precision timer for timing
-    LARGE_INTEGER frequency;
-    LARGE_INTEGER startTime, currentTime;
-    QueryPerformanceFrequency(&frequency);
-    QueryPerformanceCounter(&startTime);
-    
-    logMessage("Network receiver started");
-    
-    while (networkRunning && networkConnected) {
-        // Receive data from server
-        bytesReceived = recvfrom(clientSocket, recvBuffer, BUFFER_SIZE, 0, 
-                               (sockaddr*)&senderAddr, &senderAddrLen);
-                               
-        if (bytesReceived > 0) {
-            // Process received packet
-            if (bytesReceived == sizeof(FeedbackPacket)) {
-                std::lock_guard<std::mutex> lock(dataMutex);
-                
-                // Copy packet data
-                FeedbackPacket* feedback = reinterpret_cast<FeedbackPacket*>(recvBuffer);
-                memcpy(&currentFeedback, feedback, sizeof(FeedbackPacket));
-                
-                // Update statistics
-                packetsReceived++;
-                
-                // Calculate latency
-                QueryPerformanceCounter(&currentTime);
-                double currentTimeSec = (double)(currentTime.QuadPart - startTime.QuadPart) / frequency.QuadPart;
-                
-                // Add to history
-                receivedPacketsHistory.push_back(currentFeedback);
-                latencyHistory.push_back(currentFeedback.latency);
-                positionErrorHistory.push_back(currentFeedback.positionError);
-                
-                // Limit history size
-                if (receivedPacketsHistory.size() > MAX_HISTORY_SIZE) {
-                    receivedPacketsHistory.pop_front();
-                }
-                if (latencyHistory.size() > MAX_HISTORY_SIZE) {
-                    latencyHistory.pop_front();
-                }
-                if (positionErrorHistory.size() > MAX_HISTORY_SIZE) {
-                    positionErrorHistory.pop_front();
-                }
-                
-                // Calculate average latency and position error
-                double totalLatency = 0.0;
-                double totalError = 0.0;
-                
-                for (const auto& latency : latencyHistory) {
-                    totalLatency += latency;
-                }
-                
-                for (const auto& error : positionErrorHistory) {
-                    totalError += error;
-                }
-                
-                if (!latencyHistory.empty()) {
-                    averageLatency = totalLatency / latencyHistory.size();
-                }
-                
-                if (!positionErrorHistory.empty()) {
-                    averagePositionError = totalError / positionErrorHistory.size();
-                }
-            }
-        }
-        
-        // Short sleep to prevent CPU hogging
-        Sleep(1);
+    // Set UI mode (minimal/full)
+    void setMode(int mode) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_mode = mode;
     }
-    
-    logMessage("Network receiver stopped");
-}
 
-void initializeGUI(void) {
-    // Create GUI panel
-    guiPanel = new cPanel();
-    camera->m_frontLayer->addChild(guiPanel);
-    guiPanel->setLocalPos(10, 10);
-    guiPanel->setSize(300, 400);
-    guiPanel->setColor(cColorf(0.8f, 0.8f, 0.8f, 0.5f));
-    
-    // Create graph panel
-    graphPanel = new cPanel();
-    camera->m_frontLayer->addChild(graphPanel);
-    graphPanel->setLocalPos(320, 10);
-    graphPanel->setSize(300, 400);
-    graphPanel->setColor(cColorf(0.7f, 0.7f, 0.7f, 0.5f));
-    
-    // Create title
-    labelTitle = new cLabel(font);
-    guiPanel->addChild(labelTitle);
-    labelTitle->setText("Haptic Teleoperation Client");
-    labelTitle->setLocalPos(10, 10);
-    labelTitle->setFontScale(1.2);
-    labelTitle->m_fontColor.setBlack();
-    
-    // Create device info label
-    labelDeviceInfo = new cLabel(font);
-    guiPanel->addChild(labelDeviceInfo);
-    labelDeviceInfo->setLocalPos(10, 40);
-    labelDeviceInfo->m_fontColor.setBlack();
-    
-    // Create network status label
-    labelNetworkStatus = new cLabel(font);
-    guiPanel->addChild(labelNetworkStatus);
-    labelNetworkStatus->setLocalPos(10, 70);
-    labelNetworkStatus->m_fontColor.setBlack();
-    
-    // Create packet stats label
-    labelPacketStats = new cLabel(font);
-    guiPanel->addChild(labelPacketStats);
-    labelPacketStats->setLocalPos(10, 100);
-    labelPacketStats->m_fontColor.setBlack();
-    
-    // Create position data label
-    labelPositionData = new cLabel(font);
-    guiPanel->addChild(labelPositionData);
-    labelPositionData->setLocalPos(10, 130);
-    labelPositionData->m_fontColor.setBlack();
-    
-    // Create force data label
-    labelForceData = new cLabel(font);
-    guiPanel->addChild(labelForceData);
-    labelForceData->setLocalPos(10, 160);
-    labelForceData->m_fontColor.setBlack();
-    
-    // Create latency label
-    labelLatency = new cLabel(font);
-    guiPanel->addChild(labelLatency);
-    labelLatency->setLocalPos(10, 190);
-    labelLatency->m_fontColor.setBlack();
-    
-    // Create error label
-    labelError = new cLabel(font);
-    guiPanel->addChild(labelError);
-    labelError->setLocalPos(10, 220);
-    labelError->m_fontColor.setBlack();
-    
-    // Create position scale slider
-    sliderPositionScale = new cSlider();
-    guiPanel->addChild(sliderPositionScale);
-    sliderPositionScale->setLocalPos(10, 250);
-    sliderPositionScale->setRange(0.1, 2.0);
-    sliderPositionScale->setValue(positionScaling);
-    sliderPositionScale->m_colorHandle.setRed();
-    sliderPositionScale->m_colorLine.setGrayLevel(0.5);
-    
-    // Create label for position scale
-    cLabel* labelPositionScale = new cLabel(font);
-    guiPanel->addChild(labelPositionScale);
-    labelPositionScale->setText("Position Scale");
-    labelPositionScale->setLocalPos(150, 250);
-    labelPositionScale->m_fontColor.setBlack();
-    
-    // Create force scale slider
-    sliderForceScale = new cSlider();
-    guiPanel->addChild(sliderForceScale);
-    sliderForceScale->setLocalPos(10, 280);
-    sliderForceScale->setRange(0.1, 2.0);
-    sliderForceScale->setValue(forceScaling);
-    sliderForceScale->m_colorHandle.setRed();
-    sliderForceScale->m_colorLine.setGrayLevel(0.5);
-    
-    // Create label for force scale
-    cLabel* labelForceScale = new cLabel(font);
-    guiPanel->addChild(labelForceScale);
-    labelForceScale->setText("Force Scale");
-    labelForceScale->setLocalPos(150, 280);
-    labelForceScale->m_fontColor.setBlack();
-    
-    // Create calibrate button
-    buttonCalibrate = new cButton();
-    guiPanel->addChild(buttonCalibrate);
-    buttonCalibrate->setLocalPos(10, 310);
-    buttonCalibrate->setSize(80, 30);
-    buttonCalibrate->m_colorBoxTopLeft.setRed();
-    buttonCalibrate->m_colorBoxBottomRight.setRed();
-    buttonCalibrate->setFontColor(cColorf(1.0, 1.0, 1.0));
-    buttonCalibrate->setText("Calibrate");
-    
-    // Create connect button
-    buttonConnect = new cButton();
-    guiPanel->addChild(buttonConnect);
-    buttonConnect->setLocalPos(100, 310);
-    buttonConnect->setSize(80, 30);
-    buttonConnect->m_colorBoxTopLeft.setGreen();
-    buttonConnect->m_colorBoxBottomRight.setGreen();
-    buttonConnect->setFontColor(cColorf(1.0, 1.0, 1.0));
-    buttonConnect->setText("Connect");
-    
-    // Create disconnect button
-    buttonDisconnect = new cButton();
-    guiPanel->addChild(buttonDisconnect);
-    buttonDisconnect->setLocalPos(190, 310);
-    buttonDisconnect->setSize(80, 30);
-    buttonDisconnect->m_colorBoxTopLeft.setRed();
-    buttonDisconnect->m_colorBoxBottomRight.setRed();
-    buttonDisconnect->setFontColor(cColorf(1.0, 1.0, 1.0));
-    buttonDisconnect->setText("Disconnect");
-    
-    // Create record checkbox
-    checkBoxRecord = new cCheckBox();
-    guiPanel->addChild(checkBoxRecord);
-    checkBoxRecord->setLocalPos(10, 350);
-    checkBoxRecord->setText("Record");
-    checkBoxRecord->m_colorBoxTopLeft.setRed();
-    checkBoxRecord->m_colorBoxBottomRight.setRed();
-    checkBoxRecord->m_colorTick.setWhite();
-    
-    // Create replay checkbox
-    checkBoxReplay = new cCheckBox();
-    guiPanel->addChild(checkBoxReplay);
-    checkBoxReplay->setLocalPos(100, 350);
-    checkBoxReplay->setText("Replay");
-    checkBoxReplay->m_colorBoxTopLeft.setGreen();
-    checkBoxReplay->m_colorBoxBottomRight.setGreen();
-    checkBoxReplay->m_colorTick.setWhite();
-    
-    // Create show GUI checkbox
-    checkBoxShowGui = new cCheckBox();
-    guiPanel->addChild(checkBoxShowGui);
-    checkBoxShowGui->setLocalPos(190, 350);
-    checkBoxShowGui->setText("Show GUI");
-    checkBoxShowGui->m_colorBoxTopLeft.setBlue();
-    checkBoxShowGui->m_colorBoxBottomRight.setBlue();
-    checkBoxShowGui->m_colorTick.setWhite();
-    checkBoxShowGui->setCheck(true);
-    
-    // Create position graph
-    positionGraph = new cMultiSegmentedLine();
-    graphPanel->addChild(positionGraph);
-    positionGraph->setLocalPos(10, 30);
-    positionGraph->m_colorPointA.setRed();
-    positionGraph->m_colorPointB.setBlue();
-    
-    // Create force graph
-    forceGraph = new cMultiSegmentedLine();
-    graphPanel->addChild(forceGraph);
-    forceGraph->setLocalPos(10, 130);
-    forceGraph->m_colorPointA.setGreen();
-    forceGraph->m_colorPointB.setYellow();
-    
-    // Create latency graph
-    latencyGraph = new cMultiSegmentedLine();
-    graphPanel->addChild(latencyGraph);
-    latencyGraph->setLocalPos(10, 230);
-    latencyGraph->m_colorPointA.setPurple();
-    latencyGraph->m_colorPointB.setOrange();
-    
-    // Create error graph
-    errorGraph = new cMultiSegmentedLine();
-    graphPanel->addChild(errorGraph);
-    errorGraph->setLocalPos(10, 330);
-    errorGraph->m_colorPointA.setCyan();
-    errorGraph->m_colorPointB.setGray();
-    
-    // Create graph labels
-    cLabel* labelPosGraph = new cLabel(font);
-    graphPanel->addChild(labelPosGraph);
-    labelPosGraph->setText("Position");
-    labelPosGraph->setLocalPos(10, 10);
-    labelPosGraph->m_fontColor.setBlack();
-    
-    cLabel* labelForceGraph = new cLabel(font);
-    graphPanel->addChild(labelForceGraph);
-    labelForceGraph->setText("Force");
-    labelForceGraph->setLocalPos(10, 110);
-    labelForceGraph->m_fontColor.setBlack();
-    
-    cLabel* labelLatencyGraph = new cLabel(font);
-    graphPanel->addChild(labelLatencyGraph);
-    labelLatencyGraph->setText("Latency");
-    labelLatencyGraph->setLocalPos(10, 210);
-    labelLatencyGraph->m_fontColor.setBlack();
-    
-    cLabel* labelErrorGraph = new cLabel(font);
-    graphPanel->addChild(labelErrorGraph);
-    labelErrorGraph->setText("Position Error");
-    labelErrorGraph->setLocalPos(10, 310);
-    labelErrorGraph->m_fontColor.setBlack();
-    
-    // Create force vector indicator
-    forceVector = new cArrow();
-    world->addChild(forceVector);
-    forceVector->setRadius(0.01);
-    forceVector->m_material->setGreen();
-    
-    // Create position error vector indicator
-    positionErrorVector = new cArrow();
-    world->addChild(positionErrorVector);
-    positionErrorVector->setRadius(0.01);
-    positionErrorVector->m_material->setRed();
-    
-    // Initialize GUI mode (show or hide)
-    guiPanel->setEnabled(true);
-    graphPanel->setEnabled(true);
-    
-    // Update GUI with initial values
-    updateGUI();
-}
+    // Set message to display
+    void setMessage(const std::string& message) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_message = message;
+    }
 
-void updateGUI(void) {
-    // Update GUI based on current mode
-    bool showGui = (currentGuiMode != GUI_HIDDEN);
-    guiPanel->setEnabled(showGui);
-    graphPanel->setEnabled(showGui && currentGuiMode == GUI_FULL);
-    
-    // Update device information
-    if (hapticDevice) {
-        string deviceName;
-        hapticDevice->getSpecifications().getModelName(deviceName);
-        
-        cVector3d pos;
-        hapticDevice->getPosition(pos);
-        
-        std::stringstream ss;
-        ss << "Device: " << deviceName << "\n";
-        ss << "Max Stiffness: " << hapticDeviceMaxStiffness << " N/m";
-        labelDeviceInfo->setText(ss.str());
-    } else {
-        labelDeviceInfo->setText("No haptic device connected");
-    }
-    
-    // Update network status
-    {
-        std::stringstream ss;
-        ss << "Network: " << (networkConnected ? "Connected" : "Disconnected") << "\n";
-        ss << "Local IP: " << SRC_IP << ":" << SRC_PORT << "\n";
-        ss << "Remote IP: " << DST_IP << ":" << DST_PORT;
-        labelNetworkStatus->setText(ss.str());
-    }
-    
-    // Update packet statistics
-    {
-        std::stringstream ss;
-        ss << "Packets Sent: " << packetsSent << "\n";
-        ss << "Packets Received: " << packetsReceived << "\n";
-        ss << "Send Rate: " << freqCounterNetwork.getFrequency() << " Hz";
-        labelPacketStats->setText(ss.str());
-    }
-    
-    // Update position data
-    {
-        std::lock_guard<std::mutex> lock(dataMutex);
-        std::stringstream ss;
-        ss << "Position: ";
-        ss << std::fixed << std::setprecision(3);
-        ss << "(" << currentPacket.x << ", ";
-        ss << currentPacket.y << ", ";
-        ss << currentPacket.z << ")";
-        labelPositionData->setText(ss.str());
-    }
-    
-    // Update force data
-    {
-        std::lock_guard<std::mutex> lock(dataMutex);
-        std::stringstream ss;
-        ss << "Force: ";
-        ss << std::fixed << std::setprecision(3);
-        ss << "(" << currentFeedback.fx << ", ";
-        ss << currentFeedback.fy << ", ";
-        ss << currentFeedback.fz << ")";
-        labelForceData->setText(ss.str());
-    }
-    
-    // Update latency information
-    {
-        std::stringstream ss;
-        ss << "Latency: " << std::fixed << std::setprecision(2);
-        ss << averageLatency << " ms";
-        labelLatency->setText(ss.str());
-    }
-    
-    // Update error information
-    {
-        std::stringstream ss;
-        ss << "Position Error: " << std::fixed << std::setprecision(4);
-        ss << averagePositionError << " m";
-        labelError->setText(ss.str());
-    }
-    
-    // Update frequency counter
-    {
-        std::stringstream ss;
-        ss << "Graphics: " << std::fixed << std::setprecision(0);
-        ss << freqCounterGraphics.getFrequency() << " Hz\n";
-        ss << "Haptics: " << freqCounterHaptics.getFrequency() << " Hz\n";
-        ss << "Network: " << freqCounterNetwork.getFrequency() << " Hz";
-        if (labelRates) {
-            labelRates->setText(ss.str());
+    // Handle slider events
+    void onSliderChanged(int id, float value) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+
+        switch (id) {
+        case 0: // Position Scale
+            m_positionScale = value;
+            break;
+
+        case 1: // Force Scale
+            m_forceScale = value;
+            break;
         }
     }
-    
-    // Update sliders
-    positionScaling = sliderPositionScale->getValue();
-    forceScaling = sliderForceScale->getValue();
-    
-    // Update force vector visualization
-    if (forceVector) {
-        cVector3d force(currentFeedback.fx, currentFeedback.fy, currentFeedback.fz);
-        cVector3d pos(currentPacket.x, currentPacket.y, currentPacket.z);
-        
-        // Scale force for better visualization
-        force *= 0.1 * forceScaling;
-        
-        forceVector->setLocalPos(pos);
-        forceVector->setDirection(force);
-        forceVector->setEnabled(force.length() > 0.001);
-    }
-    
-    // Update position error vector visualization
-    if (positionErrorVector) {
-        cVector3d commandedPos(currentPacket.x, currentPacket.y, currentPacket.z);
-        cVector3d actualPos(currentFeedback.px, currentFeedback.py, currentFeedback.pz);
-        cVector3d errorVector = actualPos - commandedPos;
-        
-        // Scale error for better visualization
-        errorVector *= 5.0;
-        
-        positionErrorVector->setLocalPos(commandedPos);
-        positionErrorVector->setDirection(errorVector);
-        positionErrorVector->setEnabled(errorVector.length() > 0.001);
-    }
-}
 
-void updateGraphs(void) {
-    // Only update if GUI is fully visible
-    if (currentGuiMode != GUI_FULL) {
-        return;
-    }
-    
-    const int MAX_GRAPH_POINTS = 100;
-    const double GRAPH_WIDTH = 280.0;
-    const double GRAPH_HEIGHT = 70.0;
-    const double X_SPACING = GRAPH_WIDTH / MAX_GRAPH_POINTS;
-    
-    // Clear existing graph data
-    positionGraph->clear();
-    forceGraph->clear();
-    latencyGraph->clear();
-    errorGraph->clear();
-    
-    // Update position graph - last MAX_GRAPH_POINTS packets
-    {
-        std::lock_guard<std::mutex> lock(dataMutex);
-        int numPoints = std::min(static_cast<int>(sentPacketsHistory.size()), MAX_GRAPH_POINTS);
-        
-        if (numPoints > 0) {
-            // Find min/max values for scaling
-            float minX = sentPacketsHistory[sentPacketsHistory.size() - numPoints].x;
-            float maxX = minX;
-            float minY = sentPacketsHistory[sentPacketsHistory.size() - numPoints].y;
-            float maxY = minY;
-            float minZ = sentPacketsHistory[sentPacketsHistory.size() - numPoints].z;
-            float maxZ = minZ;
-            
-            for (size_t i = sentPacketsHistory.size() - numPoints; i < sentPacketsHistory.size(); i++) {
-                minX = std::min(minX, sentPacketsHistory[i].x);
-                maxX = std::max(maxX, sentPacketsHistory[i].x);
-                minY = std::min(minY, sentPacketsHistory[i].y);
-                maxY = std::max(maxY, sentPacketsHistory[i].y);
-                minZ = std::min(minZ, sentPacketsHistory[i].z);
-                maxZ = std::max(maxZ, sentPacketsHistory[i].z);
-            }
-            
-            // Add a small margin
-            float xRange = std::max(0.001f, maxX - minX) * 1.1f;
-            float yRange = std::max(0.001f, maxY - minY) * 1.1f;
-            float zRange = std::max(0.001f, maxZ - minZ) * 1.1f;
-            
-            minX -= xRange * 0.05f;
-            maxX += xRange * 0.05f;
-            minY -= yRange * 0.05f;
-            maxY += yRange * 0.05f;
-            minZ -= zRange * 0.05f;
-            maxZ += zRange * 0.05f;
-            
-            // Plot the data
-            for (int i = 0; i < numPoints; i++) {
-                double x = i * X_SPACING;
-                const Packet& pkt = sentPacketsHistory[sentPacketsHistory.size() - numPoints + i];
-                
-                // Normalize to graph height
-                double yX = ((pkt.x - minX) / (maxX - minX)) * GRAPH_HEIGHT;
-                double yY = ((pkt.y - minY) / (maxY - minY)) * GRAPH_HEIGHT;
-                double yZ = ((pkt.z - minZ) / (maxZ - minZ)) * GRAPH_HEIGHT;
-                
-                // Add points for each dimension
-                positionGraph->newVertex(x, yX);
-                positionGraph->newVertex(x, yY);
-                positionGraph->newVertex(x, yZ);
-            }
-        }
-    }
-    
-    // Update force graph
-    {
-        std::lock_guard<std::mutex> lock(dataMutex);
-        int numPoints = std::min(static_cast<int>(receivedPacketsHistory.size()), MAX_GRAPH_POINTS);
-        
-        if (numPoints > 0) {
-            // Find min/max values for scaling
-            float minFx = receivedPacketsHistory[receivedPacketsHistory.size() - numPoints].fx;
-            float maxFx = minFx;
-            float minFy = receivedPacketsHistory[receivedPacketsHistory.size() - numPoints].fy;
-            float maxFy = minFy;
-            float minFz = receivedPacketsHistory[receivedPacketsHistory.size() - numPoints].fz;
-            float maxFz = minFz;
-            
-            for (size_t i = receivedPacketsHistory.size() - numPoints; i < receivedPacketsHistory.size(); i++) {
-                minFx = std::min(minFx, receivedPacketsHistory[i].fx);
-                maxFx = std::max(maxFx, receivedPacketsHistory[i].fx);
-                minFy = std::min(minFy, receivedPacketsHistory[i].fy);
-                maxFy = std::max(maxFy, receivedPacketsHistory[i].fy);
-                minFz = std::min(minFz, receivedPacketsHistory[i].fz);
-                maxFz = std::max(maxFz, receivedPacketsHistory[i].fz);
-            }
-            
-            // Add a small margin
-            float fxRange = std::max(0.001f, maxFx - minFx) * 1.1f;
-            float fyRange = std::max(0.001f, maxFy - minFy) * 1.1f;
-            float fzRange = std::max(0.001f, maxFz - minFz) * 1.1f;
-            
-            minFx -= fxRange * 0.05f;
-            maxFx += fxRange * 0.05f;
-            minFy -= fyRange * 0.05f;
-            maxFy += fyRange * 0.05f;
-            minFz -= fzRange * 0.05f;
-            maxFz += fzRange * 0.05f;
-            
-            // Plot the data
-            for (int i = 0; i < numPoints; i++) {
-                double x = i * X_SPACING;
-                const FeedbackPacket& pkt = receivedPacketsHistory[receivedPacketsHistory.size() - numPoints + i];
-                
-                // Normalize to graph height
-                double yFx = ((pkt.fx - minFx) / (maxFx - minFx)) * GRAPH_HEIGHT;
-                double yFy = ((pkt.fy - minFy) / (maxFy - minFy)) * GRAPH_HEIGHT;
-                double yFz = ((pkt.fz - minFz) / (maxFz - minFz)) * GRAPH_HEIGHT;
-                
-                // Add points for each dimension
-                forceGraph->newVertex(x, yFx);
-                forceGraph->newVertex(x, yFy);
-                forceGraph->newVertex(x, yFz);
-            }
-        }
-    }
-    
-    // Update latency graph
-    {
-        int numPoints = std::min(static_cast<int>(latencyHistory.size()), MAX_GRAPH_POINTS);
-        
-        if (numPoints > 0) {
-            // Find min/max values for scaling
-            double minLatency = latencyHistory[latencyHistory.size() - numPoints];
-            double maxLatency = minLatency;
-            
-            for (size_t i = latencyHistory.size() - numPoints; i < latencyHistory.size(); i++) {
-                minLatency = std::min(minLatency, latencyHistory[i]);
-                maxLatency = std::max(maxLatency, latencyHistory[i]);
-            }
-            
-            // Add a small margin
-            double latencyRange = std::max(0.1, maxLatency - minLatency) * 1.1;
-            minLatency = std::max(0.0, minLatency - latencyRange * 0.05);
-            maxLatency += latencyRange * 0.05;
-            
-            // Plot the data
-            for (int i = 0; i < numPoints; i++) {
-                double x = i * X_SPACING;
-                double latency = latencyHistory[latencyHistory.size() - numPoints + i];
-                
-                // Normalize to graph height
-                double y = ((latency - minLatency) / (maxLatency - minLatency)) * GRAPH_HEIGHT;
-                
-                latencyGraph->newVertex(x, y);
-            }
-        }
-    }
-    
-    // Update error graph
-    {
-        int numPoints = std::min(static_cast<int>(positionErrorHistory.size()), MAX_GRAPH_POINTS);
-        
-        if (numPoints > 0) {
-            // Find min/max values for scaling
-            double minError = positionErrorHistory[positionErrorHistory.size() - numPoints];
-            double maxError = minError;
-            
-            for (size_t i = positionErrorHistory.size() - numPoints; i < positionErrorHistory.size(); i++) {
-                minError = std::min(minError, positionErrorHistory[i]);
-                maxError = std::max(maxError, positionErrorHistory[i]);
-            }
-            
-            // Add a small margin
-            double errorRange = std::max(0.0001, maxError - minError) * 1.1;
-            minError = std::max(0.0, minError - errorRange * 0.05);
-            maxError += errorRange * 0.05;
-            
-            // Plot the data
-            for (int i = 0; i < numPoints; i++) {
-                double x = i * X_SPACING;
-                double error = positionErrorHistory[positionErrorHistory.size() - numPoints + i];
-                
-                // Normalize to graph height
-                double y = ((error - minError) / (maxError - minError)) * GRAPH_HEIGHT;
-                
-                errorGraph->newVertex(x, y);
-            }
-        }
-    }
-}
+    // Handle button events
+    void onButtonPressed(int id);
 
-void handleGUIEvents(void) {
-    // Check calibrate button
-    if (buttonCalibrate->getState() == true) {
-        buttonCalibrate->setState(false);
-        calibrateDevice();
-    }
-    
-    // Check connect button
-    if (buttonConnect->getState() == true) {
-        buttonConnect->setState(false);
-        connectToServer();
-    }
-    
-    // Check disconnect button
-    if (buttonDisconnect->getState() == true) {
-        buttonDisconnect->setState(false);
-        disconnectFromServer();
-    }
-    
-    // Check record checkbox
-    if (checkBoxRecord->getState() != isRecording) {
-        if (checkBoxRecord->getState()) {
-            startRecording();
-        } else {
-            stopRecording();
+    // Handle checkbox events
+    void onCheckboxChanged(int id, bool checked) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+
+        switch (id) {
+        case 0: // Feedback Enabled
+            m_feedbackEnabled = checked;
+            break;
         }
     }
-    
-    // Check replay checkbox
-    if (checkBoxReplay->getState() != isReplaying) {
-        if (checkBoxReplay->getState()) {
-            startReplay();
-        } else {
-            stopReplay();
-        }
-    }
-    
-    // Check GUI visibility checkbox
-    if (checkBoxShowGui->getState()) {
-        // Toggle between minimal and full GUI
-        if (currentGuiMode == GUI_HIDDEN) {
-            currentGuiMode = GUI_MINIMAL;
-        } else if (currentGuiMode == GUI_MINIMAL) {
-            currentGuiMode = GUI_FULL;
-        } else {
-            currentGuiMode = GUI_MINIMAL;
-        }
-    } else {
-        currentGuiMode = GUI_HIDDEN;
-    }
-}
 
-void calibrateDevice(void) {
-    if (hapticDevice) {
-        logMessage("Calibrating haptic device...");
-        hapticDevice->calibrate();
-        logMessage("Calibration complete");
-    } else {
-        logMessage("No haptic device connected");
+    // Update position display
+    void updatePositionDisplay(float x, float y, float z) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_positionX = x;
+        m_positionY = y;
+        m_positionZ = z;
     }
-}
 
-void connectToServer(void) {
-    if (!networkConnected) {
-        logMessage("Connecting to server at " + std::string(DST_IP) + ":" + std::to_string(DST_PORT) + "...");
-        
-        // Start network communication thread
-        networkRunning = true;
-        networkThread = new std::thread(networkCommunication);
-    } else {
-        logMessage("Already connected");
+    // Update force display
+    void updateForceDisplay(float fx, float fy, float fz) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_forceX = fx;
+        m_forceY = fy;
+        m_forceZ = fz;
     }
-}
 
-void disconnectFromServer(void) {
-    if (networkConnected) {
-        logMessage("Disconnecting from server...");
-        
-        // Stop network thread
-        networkRunning = false;
-        
-        // Wait for thread to terminate
-        if (networkThread && networkThread->joinable()) {
-            networkThread->join();
-            delete networkThread;
-            networkThread = nullptr;
-        }
-        
-        networkConnected = false;
-        logMessage("Disconnected from server");
-    } else {
-        logMessage("Not connected");
+    // Update network statistics
+    void updateNetworkStats(int sent, int received, float latency) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_packetsSent = sent;
+        m_packetsReceived = received;
+        m_latency = latency;
     }
-}
 
-void startRecording(void) {
-    if (!isRecording) {
-        logMessage("Starting recording...");
-        
-        // Open record file
-        std::string filename = "haptic_recording_" + std::to_string(time(nullptr)) + ".dat";
-        recordFile.open(filename, std::ios::binary);
-        
-        if (recordFile.is_open()) {
-            isRecording = true;
-            recordedData.clear();
-            
-            // Store starting time
-            LARGE_INTEGER frequency, startTime;
-            QueryPerformanceFrequency(&frequency);
-            QueryPerformanceCounter(&startTime);
-            replayStartTime = (double)startTime.QuadPart / frequency.QuadPart;
-            
-            logMessage("Recording started. Saving to " + filename);
-            checkBoxRecord->setCheck(true);
-        } else {
-            logMessage("Failed to open recording file");
-            checkBoxRecord->setCheck(false);
-        }
+    // Update haptic parameters
+    void updateHapticParams(double stiffness, double damping, FeedbackType type) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_stiffness = stiffness;
+        m_damping = damping;
+        m_feedbackType = type;
     }
-}
 
-void stopRecording(void) {
-    if (isRecording) {
-        logMessage("Stopping recording...");
-        
-        // Close record file
-        if (recordFile.is_open()) {
-            recordFile.close();
-        }
-        
-        isRecording = false;
-        logMessage("Recording stopped. Captured " + std::to_string(recordedData.size()) + " packets");
-        checkBoxRecord->setCheck(false);
+private:
+    // Initialize UI components
+    void initializeComponents() {
+        // Simple console UI initialization
     }
-}
 
-void startReplay(void) {
-    if (!isReplaying && !recordedData.empty()) {
-        logMessage("Starting replay...");
-        
-        // Reset replay index
-        replayIndex = 0;
-        
-        // Record current time as replay start
-        LARGE_INTEGER frequency, startTime;
-        QueryPerformanceFrequency(&frequency);
-        QueryPerformanceCounter(&startTime);
-        replayStartTime = (double)startTime.QuadPart / frequency.QuadPart;
-        
-        isReplaying = true;
-        logMessage("Replay started. Playing " + std::to_string(recordedData.size()) + " packets");
-        checkBoxReplay->setCheck(true);
-    } else if (recordedData.empty()) {
-        logMessage("No recorded data available for replay");
-        checkBoxReplay->setCheck(false);
+    // Create visualization graphs
+    void createGraphs() {
+        // Console doesn't support graphs
     }
-}
 
-void stopReplay(void) {
-    if (isReplaying) {
-        logMessage("Stopping replay...");
-        isReplaying = false;
-        logMessage("Replay stopped");
-        checkBoxReplay->setCheck(false);
+    // Update graphs with new data
+    void updateGraphs() {
+        // Console doesn't support graphs
     }
-}
+
+    // Toggle GUI mode
+    void toggleGuiMode() {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_mode = (m_mode + 1) % 3; // Cycle through modes
+    }
+
+    // Toggle feedback
+    void toggleFeedback() {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_feedbackEnabled = !m_feedbackEnabled;
+    }
+
+    // Cycle feedback type
+    void cycleFeedbackType() {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_feedbackType = static_cast<FeedbackType>((m_feedbackType + 1) % 3);
+    }
+
+    // Adjust stiffness
+    void adjustStiffness(double delta) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_stiffness += delta;
+        m_stiffness = std::max(0.0, std::min(200.0, m_stiffness)); // Clamp value
+    }
+
+    // Adjust damping
+    void adjustDamping(double delta) {
+        std::lock_guard<std::mutex> lock(m_uiMutex);
+        m_damping += delta;
+        m_damping = std::max(0.0, std::min(50.0, m_damping)); // Clamp value
+    }
+
+    // Reset position
+    void resetPosition() {
+        // This needs to be implemented in the client
+    }
+
+    // Client reference
+    HapticTeleoperationClient* m_client;
+
+    // UI state
+    bool m_visible;
+    int m_mode; // 0 = hidden, 1 = minimal, 2 = full
+
+    // UI components
+    std::string m_message;
+
+    // Position data for display
+    float m_positionX, m_positionY, m_positionZ;
+
+    // Force data for display
+    float m_forceX, m_forceY, m_forceZ;
+
+    // Network statistics
+    int m_packetsSent;
+    int m_packetsReceived;
+    float m_latency;
+
+    // Haptic parameters
+    double m_stiffness;
+    double m_damping;
+    FeedbackType m_feedbackType;
+    bool m_feedbackEnabled;
+
+    // Position scale
+    float m_positionScale;
+
+    // Force scale
+    float m_forceScale;
+
+    // Thread safety
+    mutable std::mutex m_uiMutex;
+};
 
 //------------------------------------------------------------------------------
-// MAIN HAPTIC LOOP
+// HAPTIC TELEOPERATION CLIENT CLASS
 //------------------------------------------------------------------------------
-void updateHaptics(void) {
-    // simulation in now running
-    simulationRunning = true;
-    simulationFinished = false;
+class HapticTeleoperationClient {
+public:
+    //--------------------------------------------------------------------------
+    // CONSTRUCTOR & DESTRUCTOR
+    //--------------------------------------------------------------------------
+    HapticTeleoperationClient()
+        : m_simulationRunning(false),
+        m_simulationFinished(true),
+        m_position{ 0.0f, 0.0f, 0.0f },
+        m_force{ 0.0f, 0.0f, 0.0f },
+        m_velocityDamping(0.95f),
+        m_deviceMass(1.0f)
+    {
+        // Set up network manager, feedback processor, and UI
+        m_networkManager.setClient(this);
+        m_feedbackProcessor.setClient(this);
+        m_userInterface.setClient(this);
 
-    // main haptic simulation loop
-    while(simulationRunning) {
-        // signal frequency counter
-        freqCounterHaptics.signal(1);
+        // Initialize packet counter
+        m_packetCounter = 0;
 
-        // read position from device
-        cVector3d position;
-        hapticDevice->getPosition(position);
-        
-        // Scale position for workspace scaling
-        position *= positionScaling;
+        // Get timestamp for file naming
+        char timestamp[64];
+        getTimestamp(timestamp);
+        std::string timeStr(timestamp);
+        std::replace(timeStr.begin(), timeStr.end(), ':', '-');
 
-        // read orientation from device
-        cMatrix3d rotation;
-        hapticDevice->getRotation(rotation);
+        // Initialize recording file name
+        m_recordingFileName = "haptic_recording_" + timeStr + ".dat";
 
-        // read gripper position
-        double gripperAngle;
-        hapticDevice->getGripperAngleRad(gripperAngle);
+        // Initialize velocity
+        m_velocity[0] = m_velocity[1] = m_velocity[2] = 0.0f;
+    }
 
-        // read linear velocity from device
-        cVector3d linearVelocity;
-        hapticDevice->getLinearVelocity(linearVelocity);
+    // Destructor
+    ~HapticTeleoperationClient() {
+        close();
+    }
 
-        // process force feedback
-        cVector3d force(0, 0, 0);
-        
-        {
-            // Lock mutex to safely access feedback data
-            std::lock_guard<std::mutex> lock(dataMutex);
-            
-            // If we have feedback from server, apply it
-            if (networkConnected && packetsReceived > 0) {
-                force.set(currentFeedback.fx, currentFeedback.fy, currentFeedback.fz);
-                
-                // Scale force based on user setting
-                force *= forceScaling;
-                
-                // Safety: Clamp force to device maximum
-                double forceMagnitude = force.length();
-                if (forceMagnitude > hapticDeviceMaxStiffness) {
-                    force *= hapticDeviceMaxStiffness / forceMagnitude;
-                }
-            }
+    //--------------------------------------------------------------------------
+    // INITIALIZATION & RUN
+    //--------------------------------------------------------------------------
+    // Initialize the client
+    bool initialize() {
+        // Initialize network manager
+        if (!m_networkManager.initialize()) {
+            std::cerr << "Failed to initialize network manager" << std::endl;
+            return false;
         }
 
-        // send forces to device
-        hapticDevice->setForce(force);
-    }
-    
-    // exit haptics thread
-    simulationFinished = true;
-}
+        // Initialize feedback processor
+        if (!m_feedbackProcessor.initialize()) {
+            std::cerr << "Failed to initialize feedback processor" << std::endl;
+            return false;
+        }
 
-//------------------------------------------------------------------------------
-// GRAPHICS LOOP
-//------------------------------------------------------------------------------
-void updateGraphics(void) {
-    // update shadow maps (if any)
-    world->updateShadowMaps(false, mirroredDisplay);
-    
-    // handle GUI events
-    handleGUIEvents();
-    
-    // update GUI
-    updateGUI();
-    
-    // update graphs
-    updateGraphs();
-    
-    // signal frequency counter
-    freqCounterGraphics.signal(1);
-    
-    // render world
-    camera->renderView(width, height);
-    
-    // swap buffers
-    glfwSwapBuffers(window);
-    
-    // wait until all GL commands are completed
-    glFinish();
-    
-    // check for any OpenGL errors
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        std::cout << "OpenGL Error: " << err << std::endl;
-    }
-}
+        // Initialize user interface
+        if (!m_userInterface.initialize()) {
+            std::cerr << "Failed to initialize user interface" << std::endl;
+            return false;
+        }
 
-//------------------------------------------------------------------------------
-// WINDOW SIZE CALLBACK
-//------------------------------------------------------------------------------
-void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
-    // update window size
-    width = a_width;
-    height = a_height;
-}
+        // Connect to server
+        if (!m_networkManager.connect("127.0.0.1", DST_PORT)) {
+            std::cerr << "Failed to connect to server" << std::endl;
+            // Don't return false here, we can connect later
+        }
 
-//------------------------------------------------------------------------------
-// KEY CALLBACK
-//------------------------------------------------------------------------------
-void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
-    // filter calls that only include a key press
-    if ((a_action != GLFW_PRESS) && (a_action != GLFW_REPEAT)) {
-        return;
+        return true;
     }
 
-    // option - exit
-    else if ((a_key == GLFW_KEY_ESCAPE) || (a_key == GLFW_KEY_Q)) {
-        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+    // Run the client application
+    void run() {
+        std::cout << "Starting haptic teleoperation client..." << std::endl;
+
+        // Start haptic simulation
+        startHapticSimulation();
+
+        // Main loop
+        bool running = true;
+        auto lastUpdate = std::chrono::high_resolution_clock::now();
+
+        while (running) {
+            // Calculate elapsed time
+            auto currentTime = std::chrono::high_resolution_clock::now();
+            auto elapsedTime = std::chrono::duration<float>(currentTime - lastUpdate).count();
+            lastUpdate = currentTime;
+
+            // Update interface
+            m_userInterface.update();
+
+            // Process user input
+            m_userInterface.processInput();
+
+            // Send haptic device position to server
+            sendPositionData();
+
+            // Render user interface
+            m_userInterface.render();
+
+            // Sleep to limit update rate
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        // Cleanup when done
+        close();
     }
 
-    // option - toggle fullscreen
-    else if (a_key == GLFW_KEY_F) {
-        // toggle state variable
-        fullscreen = !fullscreen;
+    //--------------------------------------------------------------------------
+    // NETWORK & FEEDBACK
+    //--------------------------------------------------------------------------
+    // Process feedback from network
+    void processFeedback(const FeedbackPacket& feedback) {
+        // Pass to feedback processor
+        m_feedbackProcessor.processFeedback(feedback);
 
-        // get handle to monitor
-        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        // Update UI with latest values
+        float fx, fy, fz;
+        m_feedbackProcessor.getCurrentForce(fx, fy, fz);
+        m_userInterface.updateForceDisplay(fx, fy, fz);
 
-        // get information about monitor
-        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        // Update network statistics
+        int sent, received;
+        m_networkManager.getPacketStats(sent, received);
+        m_userInterface.updateNetworkStats(sent, received, m_feedbackProcessor.getAverageLatency());
 
-        // set fullscreen or window mode
-        if (fullscreen) {
-            glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
-            glfwSwapInterval(swapInterval);
+        // Update haptic parameters
+        m_userInterface.updateHapticParams(
+            m_feedbackProcessor.getStiffness(),
+            m_feedbackProcessor.getDamping(),
+            m_feedbackProcessor.getFeedbackType()
+        );
+    }
+
+    //--------------------------------------------------------------------------
+    // HAPTIC SIMULATION
+    //--------------------------------------------------------------------------
+    // Start haptic simulation
+    void startHapticSimulation() {
+        if (m_simulationRunning) {
+            return;  // Already running
+        }
+
+        m_simulationRunning = true;
+        m_simulationFinished = false;
+
+        // Start haptic thread
+        m_hapticThread = std::thread(&HapticTeleoperationClient::hapticLoop, this);
+    }
+
+    // Stop haptic simulation
+    void stopHapticSimulation() {
+        if (!m_simulationRunning) {
+            return;  // Not running
+        }
+
+        m_simulationRunning = false;
+
+        // Wait for haptic thread to finish
+        if (m_hapticThread.joinable()) {
+            m_hapticThread.join();
+        }
+
+        m_simulationFinished = true;
+    }
+
+    // Main haptic loop
+    void hapticLoop() {
+        std::cout << "Haptic loop started" << std::endl;
+
+        // Haptic update rate in seconds
+        const float updateRate = 1.0f / HAPTIC_RATE_HZ;
+
+        // Timestamp tracking
+        auto lastUpdate = std::chrono::high_resolution_clock::now();
+
+        while (m_simulationRunning) {
+            // Calculate elapsed time
+            auto currentTime = std::chrono::high_resolution_clock::now();
+            float dt = std::chrono::duration<float>(currentTime - lastUpdate).count();
+            lastUpdate = currentTime;
+
+            // Limit dt to prevent instability
+            if (dt > 0.05f) dt = 0.05f;
+
+            // Lock for thread safety
+            std::lock_guard<std::mutex> lock(m_positionMutex);
+
+            // Apply force to simulated device 
+            // (in real implementation this would interact with a physical haptic device)
+            float force[3];
+            m_feedbackProcessor.getCurrentForce(force[0], force[1], force[2]);
+
+            // Scale force based on feedback type
+            switch (m_feedbackProcessor.getFeedbackType()) {
+            case FEEDBACK_POSITION:
+                // Force is already set directly
+                break;
+
+            case FEEDBACK_FORCE:
+                // Use received force directly
+                break;
+
+            case FEEDBACK_STIFFNESS_DAMPING:
+                // Calculate spring-damper force
+                float stiffness = static_cast<float>(m_feedbackProcessor.getStiffness());
+                float damping = static_cast<float>(m_feedbackProcessor.getDamping());
+
+                // Spring force (attraction to origin)
+                force[0] = -stiffness * m_position[0];
+                force[1] = -stiffness * m_position[1];
+                force[2] = -stiffness * m_position[2];
+
+                // Damping force
+                force[0] -= damping * m_velocity[0];
+                force[1] -= damping * m_velocity[1];
+                force[2] -= damping * m_velocity[2];
+                break;
+            }
+
+            // Simple physics simulation
+            // F = m * a; a = F / m
+            float acceleration[3] = {
+                force[0] / m_deviceMass,
+                force[1] / m_deviceMass,
+                force[2] / m_deviceMass
+            };
+
+            // Update velocity (v = v + a * dt)
+            m_velocity[0] += acceleration[0] * dt;
+            m_velocity[1] += acceleration[1] * dt;
+            m_velocity[2] += acceleration[2] * dt;
+
+            // Apply some damping to prevent unbounded movement
+            m_velocity[0] *= m_velocityDamping;
+            m_velocity[1] *= m_velocityDamping;
+            m_velocity[2] *= m_velocityDamping;
+
+            // Update position (p = p + v * dt)
+            m_position[0] += m_velocity[0] * dt;
+            m_position[1] += m_velocity[1] * dt;
+            m_position[2] += m_velocity[2] * dt;
+
+            // Update UI with new position
+            m_userInterface.updatePositionDisplay(m_position[0], m_position[1], m_position[2]);
+
+            // Sleep to maintain update rate
+            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(updateRate * 1000000)));
+        }
+
+        std::cout << "Haptic loop stopped" << std::endl;
+    }
+
+    //--------------------------------------------------------------------------
+    // PARAMETER CONTROL
+    //--------------------------------------------------------------------------
+    // Set haptic stiffness
+    void setHapticStiffness(double stiffness) {
+        m_feedbackProcessor.setStiffness(stiffness);
+    }
+
+    // Set haptic damping
+    void setHapticDamping(double damping) {
+        m_feedbackProcessor.setDamping(damping);
+    }
+
+    // Set feedback type
+    void setFeedbackType(FeedbackType type) {
+        m_feedbackProcessor.setFeedbackType(type);
+    }
+
+    // Enable/disable feedback
+    void setFeedbackEnabled(bool enabled) {
+        m_feedbackProcessor.setFeedbackEnabled(enabled);
+    }
+
+    //--------------------------------------------------------------------------
+    // UTILITY FUNCTIONS
+    //--------------------------------------------------------------------------
+    // Send position data to server
+    void sendPositionData() {
+        if (!m_networkManager.isConnected()) {
+            return;
+        }
+
+        // Lock position data
+        std::lock_guard<std::mutex> lock(m_positionMutex);
+
+        // Create packet
+        ClientPacket packet;
+        packet.packetNumber = ++m_packetCounter;
+        packet.x = m_position[0];
+        packet.y = m_position[1];
+        packet.z = m_position[2];
+        packet.delay = 1000.0f / HAPTIC_RATE_HZ; // Time between packets in ms
+
+        // Set timestamps and network info
+        getTimestamp(packet.timestamp);
+        strcpy_s(packet.srcIP, m_networkManager.getLocalIP());
+        strcpy_s(packet.dstIP, m_networkManager.getServerIP());
+        packet.srcPort = SRC_PORT;
+        packet.dstPort = DST_PORT;
+
+        // Send packet
+        m_networkManager.sendPacket(packet);
+
+        // Record packet if recording is enabled
+        if (m_isRecording && m_recordFile.is_open()) {
+            m_recordFile.write(reinterpret_cast<const char*>(&packet), sizeof(packet));
+        }
+    }
+
+    // Start recording
+    void startRecording() {
+        if (m_isRecording) {
+            return; // Already recording
+        }
+
+        m_recordFile.open(m_recordingFileName, std::ios::binary);
+        if (m_recordFile.is_open()) {
+            m_isRecording = true;
+            m_userInterface.setMessage("Recording started: " + m_recordingFileName);
+            std::cout << "Recording started: " << m_recordingFileName << std::endl;
         }
         else {
-            int w = 0.8 * mode->height;
-            int h = 0.5 * mode->height;
-            int x = 0.5 * (mode->width - w);
-            int y = 0.5 * (mode->height - h);
-            glfwSetWindowMonitor(window, NULL, x, y, w, h, mode->refreshRate);
-            glfwSwapInterval(swapInterval);
+            m_userInterface.setMessage("Failed to open recording file");
+            std::cerr << "Failed to open recording file" << std::endl;
         }
     }
 
-    // option - toggle GUI visibility
-    else if (a_key == GLFW_KEY_G) {
-        // cycle through GUI modes
-        currentGuiMode = static_cast<GuiMode>((currentGuiMode + 1) % 3);
-        checkBoxShowGui->setCheck(currentGuiMode != GUI_HIDDEN);
+    // Stop recording
+    void stopRecording() {
+        if (!m_isRecording) {
+            return; // Not recording
+        }
+
+        if (m_recordFile.is_open()) {
+            m_recordFile.close();
+        }
+
+        m_isRecording = false;
+        m_userInterface.setMessage("Recording stopped");
+        std::cout << "Recording stopped" << std::endl;
     }
 
-    // option - start/stop recording
-    else if (a_key == GLFW_KEY_R) {
-        if (isRecording) {
+    // Get current timestamp
+    static void getTimestamp(char* timestamp) {
+        time_t now = time(nullptr);
+        struct tm timeinfo;
+        localtime_s(&timeinfo, &now);
+        strftime(timestamp, 64, "%Y-%m-%d %H:%M:%S", &timeinfo);
+    }
+
+    // Close the application
+    void close() {
+        // Stop recording if active
+        if (m_isRecording) {
             stopRecording();
-        } else {
-            startRecording();
         }
+
+        // Stop haptic simulation
+        stopHapticSimulation();
+
+        // Disconnect from server
+        m_networkManager.disconnect();
+
+        std::cout << "Client shutdown complete" << std::endl;
     }
 
-    // option - start/stop replay
-    else if (a_key == GLFW_KEY_P) {
-        if (isReplaying) {
-            stopReplay();
-        } else {
-            startReplay();
-        }
-    }
+private:
+    //--------------------------------------------------------------------------
+    // PRIVATE PROPERTIES
+    //--------------------------------------------------------------------------
+    // Network manager
+    NetworkManager m_networkManager;
 
-    // option - connect/disconnect
-    else if (a_key == GLFW_KEY_C) {
-        if (networkConnected) {
-            disconnectFromServer();
-        } else {
-            connectToServer();
-        }
-    }
+    // Feedback processor
+    FeedbackProcessor m_feedbackProcessor;
 
-    // option - calibrate device
-    else if (a_key == GLFW_KEY_SPACE) {
-        calibrateDevice();
+    // User interface
+    UserInterface m_userInterface;
+
+    // Haptic thread
+    std::thread m_hapticThread;
+
+    // Simulation flags
+    bool m_simulationRunning;
+    bool m_simulationFinished;
+
+    // Device physics simulation properties
+    float m_position[3];
+    float m_velocity[3];
+    float m_force[3];
+    float m_velocityDamping;
+    float m_deviceMass;
+
+    // Thread safety
+    std::mutex m_positionMutex;
+
+    // Recording
+    bool m_isRecording = false;
+    std::ofstream m_recordFile;
+    std::string m_recordingFileName;
+
+    // Packet counter
+    int m_packetCounter;
+};
+
+//------------------------------------------------------------------------------
+// IMPLEMENT FORWARD REFERENCES
+//------------------------------------------------------------------------------
+// Process feedback packet in NetworkManager
+void NetworkManager::processFeedbackPacket(FeedbackPacket* packet) {
+    if (m_client) {
+        // Pass feedback packet to client
+        m_client->processFeedback(*packet);
     }
 }
 
-//------------------------------------------------------------------------------
-// MOUSE BUTTON CALLBACK
-//------------------------------------------------------------------------------
-void mouseButtonCallback(GLFWwindow* a_window, int a_button, int a_action, int a_mods) {
-    // handle mouse button events
-    if (a_button == GLFW_MOUSE_BUTTON_LEFT && a_action == GLFW_PRESS) {
-        // get cursor position
-        double x, y;
-        glfwGetCursorPos(window, &x, &y);
-        
-        // check if click is on a GUI element
-        cCollisionResult result;
-        bool hit = camera->selectFrontLayer(x, y, result);
-        
-        if (hit) {
-            // check if clicked on a button or slider
-            cGenericObject* object = result.m_object;
-            if (object) {
-                cButton* button = dynamic_cast<cButton*>(object);
-                if (button) {
-                    button->setState(true);
-                }
-                
-                cSlider* slider = dynamic_cast<cSlider*>(object);
-                if (slider) {
-                    // Handle slider interaction
-                    double value = slider->getValueFromPosition(result.m_localPos);
-                    slider->setValue(value);
-                }
-                
-                cCheckBox* checkbox = dynamic_cast<cCheckBox*>(object);
-                if (checkbox) {
-                    checkbox->setCheck(!checkbox->getCheck());
-                }
-            }
+// Handle button events in UserInterface
+void UserInterface::onButtonPressed(int id) {
+    std::lock_guard<std::mutex> lock(m_uiMutex);
+
+    if (m_client) {
+        switch (id) {
+        case 0: // Quit button
+            exit(0);
+            break;
         }
     }
-}
-
-//------------------------------------------------------------------------------
-// ERROR CALLBACK
-//------------------------------------------------------------------------------
-void errorCallback(int a_error, const char* a_description) {
-    std::cout << "Error: " << a_description << std::endl;
 }
 
 //------------------------------------------------------------------------------
 // MAIN FUNCTION
 //------------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
-    //--------------------------------------------------------------------------
-    // INITIALIZATION
-    //--------------------------------------------------------------------------
+    std::cout << "Haptic Teleoperation Client - Windows Implementation" << std::endl;
+    std::cout << "Copyright (c) 2023" << std::endl << std::endl;
 
-    std::cout << std::endl;
-    std::cout << "Haptic Teleoperation Client" << std::endl;
-    std::cout << "--------------------------------" << std::endl << std::endl;
+    // Create client
+    HapticTeleoperationClient client;
 
-    //--------------------------------------------------------------------------
-    // PARSE COMMAND LINE OPTIONS
-    //--------------------------------------------------------------------------
-    
-    // parse first arg to try and locate resources
-    resourceRoot = string(argv[0]).substr(0, string(argv[0]).find_last_of("/\\") + 1);
-
-    // get server IP address if provided
-    if (argc > 1) {
-        strcpy_s(DST_IP, argv[1]);
+    // Initialize client
+    if (!client.initialize()) {
+        std::cerr << "Failed to initialize client" << std::endl;
+        return 1;
     }
 
-    //--------------------------------------------------------------------------
-    // OPEN GL - WINDOW DISPLAY
-    //--------------------------------------------------------------------------
+    // Run client (blocking call)
+    client.run();
 
-    // initialize GLFW library
-    if (!glfwInit()) {
-        std::cout << "Failed to initialize GLFW library" << std::endl;
-        return -1;
-    }
-
-    // set error callback
-    glfwSetErrorCallback(errorCallback);
-
-    // compute desired size of window
-    const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
-    int w = 0.8 * mode->height;
-    int h = 0.5 * mode->height;
-    int x = 0.5 * (mode->width - w);
-    int y = 0.5 * (mode->height - h);
-
-    // set OpenGL version
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
-
-    // set active stereo mode
-    if (stereoMode == C_STEREO_ACTIVE) {
-        glfwWindowHint(GLFW_STEREO, GL_TRUE);
-    }
-    else {
-        glfwWindowHint(GLFW_STEREO, GL_FALSE);
-    }
-
-    // create display context
-    window = glfwCreateWindow(w, h, "Haptic Teleoperation Client", NULL, NULL);
-    if (!window) {
-        std::cout << "Failed to create window" << std::endl;
-        return -1;
-    }
-
-    // get width and height of window
-    glfwGetWindowSize(window, &width, &height);
-
-    // set position of window
-    glfwSetWindowPos(window, x, y);
-
-    // set key callback
-    glfwSetKeyCallback(window, keyCallback);
-
-    // set mouse button callback
-    glfwSetMouseButtonCallback(window, mouseButtonCallback);
-
-    // set resize callback
-    glfwSetWindowSizeCallback(window, windowSizeCallback);
-
-    // set current display context
-    glfwMakeContextCurrent(window);
-
-    // sets the swap interval for the current display context
-    glfwSwapInterval(swapInterval);
-
-    //--------------------------------------------------------------------------
-    // WORLD - CAMERA - LIGHTING
-    //--------------------------------------------------------------------------
-
-    // create a new world.
-    world = new cWorld();
-
-    // set the background color of the environment
-    world->m_backgroundColor.setWhite();
-
-    // create a camera and insert it into the virtual world
-    camera = new cCamera(world);
-    world->addChild(camera);
-
-    // position and orient the camera
-    camera->set(cVector3d(0.3, 0.0, 0.0),    // camera position (eye)
-                cVector3d(0.0, 0.0, 0.0),    // look at position (target)
-                cVector3d(0.0, 0.0, 1.0));   // direction of the "up" vector
-
-    // set the near and far clipping planes of the camera
-    camera->
-
-
-
-/*Haptic Teleoperation Client Enhancement Prompt
-Objective
-Enhance the existing haptic teleoperation client code to include a GUI for displaying feedback data received from the server and controlling the haptic device, without changing the core functionality of the client.
-Requirements
-1. GUI Integration
-* Create a graphical interface similar to the server-side visualization but optimized for client operations
-* Maintain all existing client functionality for sending position data to the server
-* Display in real-time both outgoing position data and incoming force feedback data
-2. Feedback Data Visualization
-* Create visual representation of force feedback data received from the server
-* Display position error between commanded and actual position
-* Implement sliding graphs similar to the server for packet visualization
-* Show haptic device state (position, force vectors) in an intuitive way
-3. Control Elements
-* Add GUI controls for adjusting local parameters (such as position scaling, etc.)
-* Include connection status indicators for both network and haptic device
-* Implement packet statistics display (packets sent/received, timing)
-* Create options to record and replay sessions
-4. Technical Implementation
-* Use the same UDP communication on port 4000 as the server
-* Create separate high-priority threads for:
-   * Network communication
-   * Haptic device interaction
-   * GUI rendering
-* Ensure the feedback processing doesn't interfere with the existing functionality
-5. Haptic Device Integration
-* Display device status and capabilities
-* Implement calibration options if needed
-* Support the same Force Dimension haptic devices as the server
-6. Synchronization Features
-* Add visual indicators for network latency
-* Implement jitter buffer visualization
-* Show timing relationship between sent commands and received feedback
-Code Structure Guidelines
-* Maintain compatible Packet and FeedbackPacket structures as defined in the server
-* Create separate modules for:
-   * Network handling
-   * Haptic device interface
-   * GUI and visualization
-   * Data processing
-* Use similar thread priority management to ensure real-time performance
-Additional Considerations
-* Maintain a clean separation between existing functionality and new features
-* Enable all visualization components to be toggled on/off
-* Add logging capabilities for debugging and performance analysis
-* Consider optional data export features for offline analysis
-The enhanced client should work seamlessly with the existing server implementation, focusing on visualizing the bidirectional data flow while maintaining the real-time performance of the haptic teleoperation system.EditI'll help you enhance the haptic teleoperation client with a GUI for displaying feedback data received from the server and controlling the haptic device. This will require extending the existing code while maintaining all core functionality.
-Looking at the code you've provided, I can see this is a C++ application using CHAI3D for haptic rendering and GLFW for windowing, with UDP-based communication for teleoperation. Let's create a comprehensive enhancement plan.
-Analysis of Current Code
-The existing code includes:
-
-A virtual environment with spheres that can be manipulated
-Haptic device integration via CHAI3D
-One-way UDP communication sending position data to a server
-Graphics rendering using OpenGL/GLFW
-
-The client is currently sending position data to the server but doesn't appear to receive or process any feedback data. We'll need to add bidirectional communication and visualization of that data.
-Enhanced Client Implementation
-Here's my implementation plan for the enhanced client:*/
+    return 0;
+}
