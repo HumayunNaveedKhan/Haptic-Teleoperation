@@ -1,14 +1,20 @@
 //------------------------------------------------------------------------------
-// Haptic Teleoperation Client - Single File Windows Implementation
+// Fixed Windows Haptic Teleoperation Client
+// 
+// Complete integrated version with:
+// 1. Console output for basic information
+// 2. 3D visualization for haptic magnets
+// 3. Analytics for haptic data, feedback, and metrics
 //
-// This file contains the complete implementation of a haptic teleoperation
-// client for Windows. It includes networking, GUI, and haptic device integration.
+// Features:
+// - Separate sockets for sending and receiving
+// - Automatic IP address detection
+// - Fixed socket comparison error
 //------------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
 // INCLUDES
 //------------------------------------------------------------------------------
-
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -29,22 +35,12 @@
 #include <algorithm>
 #include <fstream>
 #include <cmath>
-
-// Comment out these includes if CHAI3D is not available
- #include "chai3d.h"
- #include <GLFW/glfw3.h>
+#include <conio.h>  // For _kbhit and _getch
+#include <random>
 
 // Link with Winsock library
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
-
-//------------------------------------------------------------------------------
-// FORWARD DECLARATIONS
-//------------------------------------------------------------------------------
-class HapticTeleoperationClient;
-class NetworkManager;
-class FeedbackProcessor;
-class UserInterface;
 
 //------------------------------------------------------------------------------
 // CONSTANTS & ENUMS
@@ -56,6 +52,9 @@ const int BUFFER_SIZE = 1024;       // Packet buffer size
 const int HAPTIC_RATE_HZ = 1000;    // Haptic device update rate
 const int MAX_HISTORY_SIZE = 1000;  // Maximum history size for graphs
 const int MAX_DISPLAY_PACKETS = 100; // Maximum packets to display in GUI
+
+// Default server address (to be replaced with actual server IP)
+const char DEFAULT_SERVER_IP[] = "169.254.213.206";
 
 // GUI modes
 enum GuiMode {
@@ -70,6 +69,24 @@ enum FeedbackType {
     FEEDBACK_FORCE = 1,
     FEEDBACK_STIFFNESS_DAMPING = 2
 };
+
+// Analytics tabs
+enum AnalyticsTab {
+    TAB_POSITION = 0,
+    TAB_FORCE = 1,
+    TAB_NETWORK = 2,
+    TAB_PERFORMANCE = 3
+};
+
+//------------------------------------------------------------------------------
+// FORWARD DECLARATIONS
+//------------------------------------------------------------------------------
+class HapticClient;
+class NetworkManager;
+class FeedbackProcessor;
+class ConsoleInterface;
+class AnalyticsInterface;
+class MagnetsVisualizer;
 
 //------------------------------------------------------------------------------
 // PACKET STRUCTURES
@@ -106,7 +123,8 @@ public:
         : m_client(nullptr),
         m_localPort(SRC_PORT),
         m_serverPort(DST_PORT),
-        m_socket(INVALID_SOCKET),
+        m_sendSocket(INVALID_SOCKET),
+        m_receiveSocket(INVALID_SOCKET),
         m_threadRunning(false),
         m_connected(false),
         m_packetsSent(0),
@@ -116,7 +134,7 @@ public:
         strcpy_s(m_localIP, "127.0.0.1");
 
         // Initialize server IP
-        strcpy_s(m_serverIP, "127.0.0.1");
+        strcpy_s(m_serverIP, DEFAULT_SERVER_IP);
     }
 
     // Destructor
@@ -129,15 +147,20 @@ public:
         // Initialize Windows socket API
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            std::cerr << "Failed to initialize Winsock" << std::endl;
+            std::cerr << "Failed to initialize Winsock: " << WSAGetLastError() << std::endl;
             return false;
         }
 
         // Get local IP address
-        getLocalIPAddress(m_localIP);
+        if (!getLocalIPAddress(m_localIP)) {
+            std::cerr << "Warning: Failed to get local IP, using default" << std::endl;
+            strcpy_s(m_localIP, "127.0.0.1");
+        }
 
-        // Initialize socket
-        return initializeSocket();
+        std::cout << "Local IP: " << m_localIP << std::endl;
+
+        // Initialize sockets
+        return initializeSockets();
     }
 
     // Connect to server
@@ -150,10 +173,15 @@ public:
         strcpy_s(m_serverIP, serverIP.c_str());
         m_serverPort = serverPort;
 
+        std::cout << "Connecting to server: " << m_serverIP << ":" << m_serverPort << std::endl;
+
         // Set up server address
         m_serverAddr.sin_family = AF_INET;
         m_serverAddr.sin_port = htons(m_serverPort);
-        inet_pton(AF_INET, m_serverIP, &m_serverAddr.sin_addr);
+        if (inet_pton(AF_INET, m_serverIP, &m_serverAddr.sin_addr) != 1) {
+            std::cerr << "Invalid address format: " << m_serverIP << std::endl;
+            return false;
+        }
 
         // Start network threads
         m_threadRunning = true;
@@ -176,15 +204,15 @@ public:
             m_networkThread.join();
         }
 
-        // Close socket
-        closeSocket();
+        // Close sockets
+        closeSockets();
 
         m_connected = false;
     }
 
     // Send packet to server
     bool sendPacket(const ClientPacket& packet) {
-        if (!m_connected || m_socket == INVALID_SOCKET) {
+        if (!m_connected || m_sendSocket == INVALID_SOCKET) {
             return false;
         }
 
@@ -192,7 +220,7 @@ public:
 
         // Send packet
         int bytesSent = sendto(
-            m_socket,
+            m_sendSocket,
             reinterpret_cast<const char*>(&packet),
             sizeof(packet),
             0,
@@ -210,7 +238,7 @@ public:
     }
 
     // Set client reference
-    void setClient(HapticTeleoperationClient* client) {
+    void setClient(HapticClient* client) {
         m_client = client;
     }
 
@@ -235,51 +263,122 @@ public:
         received = m_packetsReceived;
     }
 
+    // Set server IP directly (for manual configuration)
+    void setServerIP(const std::string& serverIP) {
+        strcpy_s(m_serverIP, serverIP.c_str());
+
+        // Update server address
+        m_serverAddr.sin_family = AF_INET;
+        m_serverAddr.sin_port = htons(m_serverPort);
+        inet_pton(AF_INET, m_serverIP, &m_serverAddr.sin_addr);
+    }
+
 private:
-    // Initialize socket
-    bool initializeSocket() {
-        // Create UDP socket
-        m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (m_socket == INVALID_SOCKET) {
-            std::cerr << "Error creating socket: " << WSAGetLastError() << std::endl;
+    // Initialize sockets
+    bool initializeSockets() {
+        // Create UDP send socket
+        m_sendSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (m_sendSocket == INVALID_SOCKET) {
+            std::cerr << "Error creating send socket: " << WSAGetLastError() << std::endl;
             return false;
         }
 
-        // Bind to local port
+        // Create UDP receive socket
+        m_receiveSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (m_receiveSocket == INVALID_SOCKET) {
+            std::cerr << "Error creating receive socket: " << WSAGetLastError() << std::endl;
+            closesocket(m_sendSocket);
+            m_sendSocket = INVALID_SOCKET;
+            return false;
+        }
+
+        // Bind receive socket to local port
         sockaddr_in localAddr;
         localAddr.sin_family = AF_INET;
         localAddr.sin_addr.s_addr = INADDR_ANY;
         localAddr.sin_port = htons(m_localPort);
 
-        if (bind(m_socket, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR) {
-            std::cerr << "Error binding socket: " << WSAGetLastError() << std::endl;
-            closeSocket();
+        if (bind(m_receiveSocket, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR) {
+            std::cerr << "Error binding receive socket: " << WSAGetLastError() << std::endl;
+            closeSockets();
             return false;
         }
 
-        // Set socket to non-blocking mode
+        // Set receive socket to non-blocking mode
         u_long mode = 1;
-        if (ioctlsocket(m_socket, FIONBIO, &mode) == SOCKET_ERROR) {
+        if (ioctlsocket(m_receiveSocket, FIONBIO, &mode) == SOCKET_ERROR) {
             std::cerr << "Error setting non-blocking mode: " << WSAGetLastError() << std::endl;
-            closeSocket();
+            closeSockets();
             return false;
         }
 
         return true;
     }
 
-    // Close socket
-    void closeSocket() {
-        if (m_socket != INVALID_SOCKET) {
-            closesocket(m_socket);
-            m_socket = INVALID_SOCKET;
+    // Close sockets
+    void closeSockets() {
+        if (m_sendSocket != INVALID_SOCKET) {
+            closesocket(m_sendSocket);
+            m_sendSocket = INVALID_SOCKET;
+        }
+
+        if (m_receiveSocket != INVALID_SOCKET) {
+            closesocket(m_receiveSocket);
+            m_receiveSocket = INVALID_SOCKET;
         }
     }
 
-    // Get local IP address
-    void getLocalIPAddress(char* ipBuffer) {
+    // Get local IP address using Windows API
+    bool getLocalIPAddress(char* ipBuffer) {
+        // This implementation uses GetAdaptersAddresses to get the active IP
+        ULONG outBufLen = 0;
+        PIP_ADAPTER_ADDRESSES pAddresses = nullptr;
+        DWORD dwRetVal = 0;
+
+        // First call to get the required buffer size
+        dwRetVal = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &outBufLen);
+
+        if (dwRetVal == ERROR_BUFFER_OVERFLOW) {
+            pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(outBufLen);
+            if (pAddresses == nullptr) {
+                return false;
+            }
+
+            // Second call to get the actual data
+            dwRetVal = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, pAddresses, &outBufLen);
+
+            if (dwRetVal == NO_ERROR) {
+                // Iterate through interfaces
+                for (PIP_ADAPTER_ADDRESSES pCurrAddresses = pAddresses; pCurrAddresses != nullptr; pCurrAddresses = pCurrAddresses->Next) {
+                    // Skip loopback adapters
+                    if (pCurrAddresses->IfType == IF_TYPE_SOFTWARE_LOOPBACK) {
+                        continue;
+                    }
+
+                    // Skip adapters that are not operational
+                    if (pCurrAddresses->OperStatus != IfOperStatusUp) {
+                        continue;
+                    }
+
+                    // Get linked IP address
+                    for (PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurrAddresses->FirstUnicastAddress; pUnicast != nullptr; pUnicast = pUnicast->Next) {
+                        if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+                            sockaddr_in* sa_in = (sockaddr_in*)pUnicast->Address.lpSockaddr;
+                            // Convert to string
+                            inet_ntop(AF_INET, &(sa_in->sin_addr), ipBuffer, 16);
+                            free(pAddresses);
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            free(pAddresses);
+        }
+
+        // Fallback method using gethostname if the above method fails
         char hostname[256];
-        struct addrinfo hints {}, * info, * p;
+        struct addrinfo hints {}, * info = nullptr, * p = nullptr;
         struct sockaddr_in* sockaddr_ipv4;
 
         if (gethostname(hostname, sizeof(hostname)) == 0) {
@@ -287,18 +386,21 @@ private:
             hints.ai_socktype = SOCK_DGRAM;
             hints.ai_flags = AI_PASSIVE;
 
-            if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
-                for (p = info; p != NULL; p = p->ai_next) {
+            if (getaddrinfo(hostname, nullptr, &hints, &info) == 0) {
+                for (p = info; p != nullptr; p = p->ai_next) {
                     sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
                     inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, 16);
                     // Skip localhost address
                     if (strcmp(ipBuffer, "127.0.0.1") != 0) {
-                        break;
+                        freeaddrinfo(info);
+                        return true;
                     }
                 }
                 freeaddrinfo(info);
             }
         }
+
+        return false;
     }
 
     // Network thread function
@@ -310,7 +412,7 @@ private:
         while (m_threadRunning) {
             // Receive packet
             int bytesReceived = recvfrom(
-                m_socket,
+                m_receiveSocket,
                 recvBuffer,
                 BUFFER_SIZE,
                 0,
@@ -342,7 +444,7 @@ private:
     void processFeedbackPacket(FeedbackPacket* packet);
 
     // Client reference
-    HapticTeleoperationClient* m_client;
+    HapticClient* m_client;
 
     // Network configuration
     char m_localIP[16];
@@ -351,7 +453,8 @@ private:
     int m_serverPort;
 
     // Socket information
-    SOCKET m_socket;
+    SOCKET m_sendSocket;
+    SOCKET m_receiveSocket;
     sockaddr_in m_serverAddr;
 
     // Thread management
@@ -390,6 +493,9 @@ public:
             m_currentForce[i] = 0.0f;
             m_targetPosition[i] = 0.0f;
         }
+
+        // Initialize min/max tracking
+        resetMinMaxValues();
     }
 
     // Destructor
@@ -403,7 +509,7 @@ public:
     }
 
     // Set client reference
-    void setClient(HapticTeleoperationClient* client) {
+    void setClient(HapticClient* client) {
         m_client = client;
     }
 
@@ -426,6 +532,10 @@ public:
 
         // Update statistics
         updateStatistics(packet);
+
+        // Update min/max values for position
+        updateMinMaxValues(m_targetPosition[0], m_targetPosition[1], m_targetPosition[2],
+            m_currentForce[0], m_currentForce[1], m_currentForce[2]);
 
         // Apply feedback based on type
         if (m_feedbackEnabled) {
@@ -475,6 +585,37 @@ public:
         z = m_targetPosition[2];
     }
 
+    // Get Min/Max position values
+    void getMinMaxPosition(float& minX, float& maxX, float& minY, float& maxY, float& minZ, float& maxZ) const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        minX = m_minPositionX;
+        maxX = m_maxPositionX;
+        minY = m_minPositionY;
+        maxY = m_maxPositionY;
+        minZ = m_minPositionZ;
+        maxZ = m_maxPositionZ;
+    }
+
+    // Get Min/Max force values
+    void getMinMaxForce(float& minFx, float& maxFx, float& minFy, float& maxFy, float& minFz, float& maxFz) const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        minFx = m_minForceX;
+        maxFx = m_maxForceX;
+        minFy = m_minForceY;
+        maxFy = m_maxForceY;
+        minFz = m_minForceZ;
+        maxFz = m_maxForceZ;
+    }
+
+    // Reset min/max tracking
+    void resetMinMaxValues() {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        m_minPositionX = m_minPositionY = m_minPositionZ = std::numeric_limits<float>::max();
+        m_maxPositionX = m_maxPositionY = m_maxPositionZ = std::numeric_limits<float>::lowest();
+        m_minForceX = m_minForceY = m_minForceZ = std::numeric_limits<float>::max();
+        m_maxForceX = m_maxForceY = m_maxForceZ = std::numeric_limits<float>::lowest();
+    }
+
     // Get feedback type
     FeedbackType getFeedbackType() const {
         std::lock_guard<std::mutex> lock(m_dataMutex);
@@ -511,6 +652,86 @@ public:
         return m_averageLatency;
     }
 
+    // Get position history for graphs
+    std::vector<float> getPositionHistory(int axis) const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        std::vector<float> history;
+        history.reserve(m_packetHistory.size());
+
+        for (const auto& packet : m_packetHistory) {
+            if (axis == 0) history.push_back(packet.px);
+            else if (axis == 1) history.push_back(packet.py);
+            else if (axis == 2) history.push_back(packet.pz);
+        }
+        return history;
+    }
+
+    // Get force history for graphs
+    std::vector<float> getForceHistory(int axis) const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        std::vector<float> history;
+        history.reserve(m_packetHistory.size());
+
+        for (const auto& packet : m_packetHistory) {
+            if (axis == 0) history.push_back(packet.fx);
+            else if (axis == 1) history.push_back(packet.fy);
+            else if (axis == 2) history.push_back(packet.fz);
+        }
+        return history;
+    }
+
+    // Get latency history for graphs
+    std::vector<float> getLatencyHistory() const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        std::vector<float> history;
+        history.reserve(m_packetHistory.size());
+
+        for (const auto& packet : m_packetHistory) {
+            history.push_back(packet.latency);
+        }
+        return history;
+    }
+
+    // Get error history for graphs
+    std::vector<float> getErrorHistory() const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        std::vector<float> history;
+        history.reserve(m_packetHistory.size());
+
+        for (const auto& packet : m_packetHistory) {
+            history.push_back(packet.positionError);
+        }
+        return history;
+    }
+
+    // Save data to CSV
+    bool saveDataToCSV(const std::string& filename) const {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        try {
+            std::ofstream file(filename);
+            if (!file.is_open()) return false;
+
+            // Write header
+            file << "PacketNumber,PosX,PosY,PosZ,ForceX,ForceY,ForceZ,PositionError,Latency,Timestamp\n";
+
+            // Write data
+            for (const auto& packet : m_packetHistory) {
+                file << packet.packetNumber << ","
+                    << packet.px << "," << packet.py << "," << packet.pz << ","
+                    << packet.fx << "," << packet.fy << "," << packet.fz << ","
+                    << packet.positionError << "," << packet.latency << ","
+                    << packet.timestamp << "\n";
+            }
+
+            file.close();
+            return true;
+        }
+        catch (std::exception& e) {
+            std::cerr << "Error saving data: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
 private:
     // Calculate force feedback based on position error
     void calculateForce() {
@@ -534,8 +755,25 @@ private:
         m_averageLatency = totalLatency / m_packetHistory.size();
     }
 
+    // Update min/max values
+    void updateMinMaxValues(float posX, float posY, float posZ, float forceX, float forceY, float forceZ) {
+        m_minPositionX = std::min(m_minPositionX, posX);
+        m_maxPositionX = std::max(m_maxPositionX, posX);
+        m_minPositionY = std::min(m_minPositionY, posY);
+        m_maxPositionY = std::max(m_maxPositionY, posY);
+        m_minPositionZ = std::min(m_minPositionZ, posZ);
+        m_maxPositionZ = std::max(m_maxPositionZ, posZ);
+
+        m_minForceX = std::min(m_minForceX, forceX);
+        m_maxForceX = std::max(m_maxForceX, forceX);
+        m_minForceY = std::min(m_minForceY, forceY);
+        m_maxForceY = std::max(m_maxForceY, forceY);
+        m_minForceZ = std::min(m_minForceZ, forceZ);
+        m_maxForceZ = std::max(m_maxForceZ, forceZ);
+    }
+
     // Client reference
-    HapticTeleoperationClient* m_client;
+    HapticClient* m_client;
 
     // Feedback parameters
     FeedbackType m_feedbackType;
@@ -549,6 +787,16 @@ private:
     float m_positionError;
     float m_averageLatency;
 
+    // Min/Max tracking for position
+    float m_minPositionX, m_maxPositionX;
+    float m_minPositionY, m_maxPositionY;
+    float m_minPositionZ, m_maxPositionZ;
+
+    // Min/Max tracking for force
+    float m_minForceX, m_maxForceX;
+    float m_minForceY, m_maxForceY;
+    float m_minForceZ, m_maxForceZ;
+
     // Packet history for statistics
     std::deque<FeedbackPacket> m_packetHistory;
     std::atomic<int> m_packetsProcessed;
@@ -558,64 +806,45 @@ private:
 };
 
 //------------------------------------------------------------------------------
-// USER INTERFACE CLASS
+// CONSOLE INTERFACE CLASS
 //------------------------------------------------------------------------------
-class UserInterface {
+class ConsoleInterface {
 public:
     // Constructor
-    UserInterface()
+    ConsoleInterface()
         : m_client(nullptr),
         m_visible(true),
-        m_mode(GUI_MINIMAL),
-        m_positionX(0.0f),
-        m_positionY(0.0f),
-        m_positionZ(0.0f),
-        m_forceX(0.0f),
-        m_forceY(0.0f),
-        m_forceZ(0.0f),
-        m_packetsSent(0),
-        m_packetsReceived(0),
-        m_latency(0.0f),
-        m_stiffness(100.0),
-        m_damping(20.0),
-        m_feedbackType(FEEDBACK_POSITION),
-        m_feedbackEnabled(true),
-        m_positionScale(1.0f),
-        m_forceScale(1.0f)
+        m_mode(GUI_MINIMAL)
     {
     }
 
     // Destructor
-    ~UserInterface() {
+    ~ConsoleInterface() {
         // Clean up
     }
 
-    // Initialize the user interface
+    // Initialize
     bool initialize() {
-        // Initialize UI components
-        initializeComponents();
         return true;
     }
 
     // Set client reference
-    void setClient(HapticTeleoperationClient* client) {
+    void setClient(HapticClient* client) {
         m_client = client;
     }
 
-    // Update user interface
+    // Update
     void update() {
-        // Update UI state
+        // Update state
     }
 
-    // Render user interface
+    // Render console output
     void render() {
-        // Simple console-based UI for now
-        std::lock_guard<std::mutex> lock(m_uiMutex);
+        if (!m_visible) return;
 
         system("cls");  // Clear console
 
-        // Display title and mode
-        std::cout << "===== HAPTIC TELEOPERATION CLIENT =====\n";
+        std::cout << "====== HAPTIC TELEOPERATION CLIENT ======\n";
         std::cout << "Mode: " << (m_mode == GUI_HIDDEN ? "Hidden" : (m_mode == GUI_MINIMAL ? "Minimal" : "Full")) << "\n\n";
 
         // Display position and force
@@ -639,11 +868,6 @@ public:
             (m_feedbackType == FEEDBACK_FORCE ? "Force" : "Stiffness/Damping")) << "\n";
         std::cout << "  Feedback Enabled: " << (m_feedbackEnabled ? "Yes" : "No") << "\n\n";
 
-        // Display scaling
-        std::cout << "Scaling:\n";
-        std::cout << "  Position Scale: " << std::fixed << std::setprecision(2) << m_positionScale << "\n";
-        std::cout << "  Force Scale: " << std::fixed << std::setprecision(2) << m_forceScale << "\n\n";
-
         // Display message
         if (!m_message.empty()) {
             std::cout << "Message: " << m_message << "\n\n";
@@ -651,124 +875,33 @@ public:
 
         // Display commands
         std::cout << "Commands:\n";
-        std::cout << "  [G] Toggle GUI Mode        [F] Toggle Feedback\n";
-        std::cout << "  [T] Change Feedback Type   [+/-] Adjust Stiffness\n";
-        std::cout << "  [D/C] Adjust Damping       [R] Reset Position\n";
-        std::cout << "  [Q] Quit\n";
+        std::cout << "  [a] Toggle Analytics GUI    [v] Toggle 3D Visualization\n";
+        std::cout << "  [f] Toggle Feedback        [t] Change Feedback Type\n";
+        std::cout << "  [+/-] Adjust Stiffness     [d/c] Adjust Damping\n";
+        std::cout << "  [s] Save Data to CSV       [q] Quit\n";
+        std::cout << "  [i] Configure Server IP\n";
     }
 
-    // Process user input
-    void processInput() {
-        // Process keyboard input
-        if (_kbhit()) {
-            char key = _getch();
+    // Process input
+    void processInput();
 
-            switch (key) {
-            case 'g':
-            case 'G':
-                // Toggle GUI mode
-                toggleGuiMode();
-                break;
-
-            case 'f':
-            case 'F':
-                // Toggle feedback
-                toggleFeedback();
-                break;
-
-            case 't':
-            case 'T':
-                // Change feedback type
-                cycleFeedbackType();
-                break;
-
-            case '+':
-                // Increase stiffness
-                adjustStiffness(10.0);
-                break;
-
-            case '-':
-                // Decrease stiffness
-                adjustStiffness(-10.0);
-                break;
-
-            case 'd':
-            case 'D':
-                // Increase damping
-                adjustDamping(5.0);
-                break;
-
-            case 'c':
-            case 'C':
-                // Decrease damping
-                adjustDamping(-5.0);
-                break;
-
-            case 'r':
-            case 'R':
-                // Reset position
-                resetPosition();
-                break;
-
-            case 'q':
-            case 'Q':
-                // Quit application
-                onButtonPressed(0); // Quit button ID
-                break;
-            }
-        }
-    }
-
-    // Show or hide UI
+    // Set visibility
     void setVisible(bool visible) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
         m_visible = visible;
     }
 
-    // Set UI mode (minimal/full)
+    // Set mode
     void setMode(int mode) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
         m_mode = mode;
     }
 
-    // Set message to display
+    // Set message
     void setMessage(const std::string& message) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
         m_message = message;
-    }
-
-    // Handle slider events
-    void onSliderChanged(int id, float value) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
-
-        switch (id) {
-        case 0: // Position Scale
-            m_positionScale = value;
-            break;
-
-        case 1: // Force Scale
-            m_forceScale = value;
-            break;
-        }
-    }
-
-    // Handle button events
-    void onButtonPressed(int id);
-
-    // Handle checkbox events
-    void onCheckboxChanged(int id, bool checked) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
-
-        switch (id) {
-        case 0: // Feedback Enabled
-            m_feedbackEnabled = checked;
-            break;
-        }
     }
 
     // Update position display
     void updatePositionDisplay(float x, float y, float z) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
         m_positionX = x;
         m_positionY = y;
         m_positionZ = z;
@@ -776,7 +909,6 @@ public:
 
     // Update force display
     void updateForceDisplay(float fx, float fy, float fz) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
         m_forceX = fx;
         m_forceY = fy;
         m_forceZ = fz;
@@ -784,130 +916,447 @@ public:
 
     // Update network statistics
     void updateNetworkStats(int sent, int received, float latency) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
         m_packetsSent = sent;
         m_packetsReceived = received;
         m_latency = latency;
     }
 
     // Update haptic parameters
-    void updateHapticParams(double stiffness, double damping, FeedbackType type) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
+    void updateHapticParams(double stiffness, double damping, FeedbackType type, bool enabled) {
         m_stiffness = stiffness;
         m_damping = damping;
         m_feedbackType = type;
+        m_feedbackEnabled = enabled;
     }
 
 private:
-    // Initialize UI components
-    void initializeComponents() {
-        // Simple console UI initialization
-    }
-
-    // Create visualization graphs
-    void createGraphs() {
-        // Console doesn't support graphs
-    }
-
-    // Update graphs with new data
-    void updateGraphs() {
-        // Console doesn't support graphs
-    }
-
-    // Toggle GUI mode
-    void toggleGuiMode() {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
-        m_mode = (m_mode + 1) % 3; // Cycle through modes
-    }
-
-    // Toggle feedback
-    void toggleFeedback() {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
-        m_feedbackEnabled = !m_feedbackEnabled;
-    }
-
-    // Cycle feedback type
-    void cycleFeedbackType() {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
-        m_feedbackType = static_cast<FeedbackType>((m_feedbackType + 1) % 3);
-    }
-
-    // Adjust stiffness
-    void adjustStiffness(double delta) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
-        m_stiffness += delta;
-        m_stiffness = std::max(0.0, std::min(200.0, m_stiffness)); // Clamp value
-    }
-
-    // Adjust damping
-    void adjustDamping(double delta) {
-        std::lock_guard<std::mutex> lock(m_uiMutex);
-        m_damping += delta;
-        m_damping = std::max(0.0, std::min(50.0, m_damping)); // Clamp value
-    }
-
-    // Reset position
-    void resetPosition() {
-        // This needs to be implemented in the client
-    }
-
     // Client reference
-    HapticTeleoperationClient* m_client;
+    HapticClient* m_client;
 
-    // UI state
+    // Console state
     bool m_visible;
-    int m_mode; // 0 = hidden, 1 = minimal, 2 = full
-
-    // UI components
+    int m_mode;
     std::string m_message;
 
-    // Position data for display
-    float m_positionX, m_positionY, m_positionZ;
-
-    // Force data for display
-    float m_forceX, m_forceY, m_forceZ;
-
-    // Network statistics
-    int m_packetsSent;
-    int m_packetsReceived;
-    float m_latency;
-
-    // Haptic parameters
-    double m_stiffness;
-    double m_damping;
-    FeedbackType m_feedbackType;
-    bool m_feedbackEnabled;
-
-    // Position scale
-    float m_positionScale;
-
-    // Force scale
-    float m_forceScale;
-
-    // Thread safety
-    mutable std::mutex m_uiMutex;
+    // Data for display
+    float m_positionX = 0.0f;
+    float m_positionY = 0.0f;
+    float m_positionZ = 0.0f;
+    float m_forceX = 0.0f;
+    float m_forceY = 0.0f;
+    float m_forceZ = 0.0f;
+    int m_packetsSent = 0;
+    int m_packetsReceived = 0;
+    float m_latency = 0.0f;
+    double m_stiffness = 100.0;
+    double m_damping = 20.0;
+    FeedbackType m_feedbackType = FEEDBACK_POSITION;
+    bool m_feedbackEnabled = true;
 };
 
 //------------------------------------------------------------------------------
-// HAPTIC TELEOPERATION CLIENT CLASS
+// ANALYTICS INTERFACE CLASS
 //------------------------------------------------------------------------------
-class HapticTeleoperationClient {
+class AnalyticsInterface {
 public:
-    //--------------------------------------------------------------------------
-    // CONSTRUCTOR & DESTRUCTOR
-    //--------------------------------------------------------------------------
-    HapticTeleoperationClient()
+    // Constructor
+    AnalyticsInterface()
+        : m_client(nullptr),
+        m_visible(false),
+        m_currentTab(TAB_POSITION)
+    {
+    }
+
+    // Destructor
+    ~AnalyticsInterface() {
+        // Clean up
+    }
+
+    // Initialize
+    bool initialize() {
+        return true;
+    }
+
+    // Set client reference
+    void setClient(HapticClient* client) {
+        m_client = client;
+    }
+
+    // Update
+    void update() {
+        // Update analytics data
+    }
+
+    // Render analytics interface
+    void render() {
+        if (!m_visible) return;
+
+        system("cls");  // Clear console
+
+        std::cout << "====== HAPTIC TELEOPERATION ANALYTICS ======\n";
+        std::cout << "Tab: " << getTabName() << " [Press 1-4 to change]\n";
+
+        // Display tab-specific content
+        switch (m_currentTab) {
+        case TAB_POSITION:
+            renderPositionTab();
+            break;
+
+        case TAB_FORCE:
+            renderForceTab();
+            break;
+
+        case TAB_NETWORK:
+            renderNetworkTab();
+            break;
+
+        case TAB_PERFORMANCE:
+            renderPerformanceTab();
+            break;
+        }
+
+        // Display commands
+        std::cout << "COMMANDS:\n";
+        std::cout << "  1-4: Change tab  t: Toggle feedback type  f: Toggle feedback\n";
+        std::cout << "  +/-: Adjust stiffness  d/c: Adjust damping  s: Save data to CSV\n";
+        std::cout << "  q: Quit application\n";
+        std::cout << "Run 'a' in main console to show this analytics view\n";
+    }
+
+    // Process input
+    void processInput();
+
+    // Toggle visibility
+    void toggleVisibility() {
+        m_visible = !m_visible;
+    }
+
+    // Set visibility
+    void setVisible(bool visible) {
+        m_visible = visible;
+    }
+
+    // Check if visible
+    bool isVisible() const {
+        return m_visible;
+    }
+
+    // Set current tab
+    void setTab(AnalyticsTab tab) {
+        m_currentTab = tab;
+    }
+
+    // Get current tab
+    AnalyticsTab getCurrentTab() const {
+        return m_currentTab;
+    }
+
+    // Set position data
+    void setPositionData(float x, float y, float z,
+        float minX, float maxX,
+        float minY, float maxY,
+        float minZ, float maxZ) {
+        m_positionX = x;
+        m_positionY = y;
+        m_positionZ = z;
+        m_minPosX = minX;
+        m_maxPosX = maxX;
+        m_minPosY = minY;
+        m_maxPosY = maxY;
+        m_minPosZ = minZ;
+        m_maxPosZ = maxZ;
+    }
+
+    // Set force data
+    void setForceData(float fx, float fy, float fz,
+        float minFx, float maxFx,
+        float minFy, float maxFy,
+        float minFz, float maxFz) {
+        m_forceX = fx;
+        m_forceY = fy;
+        m_forceZ = fz;
+        m_minForceX = minFx;
+        m_maxForceX = maxFx;
+        m_minForceY = minFy;
+        m_maxForceY = maxFy;
+        m_minForceZ = minFz;
+        m_maxForceZ = maxFz;
+    }
+
+    // Set network data
+    void setNetworkData(int sent, int received, float latency, float error) {
+        m_packetsSent = sent;
+        m_packetsReceived = received;
+        m_latency = latency;
+        m_positionError = error;
+    }
+
+    // Set haptic parameters
+    void setHapticParams(double stiffness, double damping, FeedbackType type, bool enabled) {
+        m_stiffness = stiffness;
+        m_damping = damping;
+        m_feedbackType = type;
+        m_feedbackEnabled = enabled;
+    }
+
+private:
+    // Render position tab
+    void renderPositionTab() {
+        std::cout << "--- POSITION DATA ---\n";
+        std::cout << "Current Position: (" << m_positionX << ", " << m_positionY << ", " << m_positionZ << ")\n";
+        std::cout << "Min X: " << m_minPosX << "\n";
+        std::cout << "Max X: " << m_maxPosX << "\n";
+        std::cout << "Min Y: " << m_minPosY << "\n";
+        std::cout << "Max Y: " << m_maxPosY << "\n";
+        std::cout << "Min Z: " << m_minPosZ << "\n";
+        std::cout << "Max Z: " << m_maxPosZ << "\n";
+    }
+
+    // Render force tab
+    void renderForceTab() {
+        std::cout << "--- FORCE DATA ---\n";
+        std::cout << "Current Force: (" << m_forceX << ", " << m_forceY << ", " << m_forceZ << ")\n";
+        std::cout << "Min Fx: " << m_minForceX << "\n";
+        std::cout << "Max Fx: " << m_maxForceX << "\n";
+        std::cout << "Min Fy: " << m_minForceY << "\n";
+        std::cout << "Max Fy: " << m_maxForceY << "\n";
+        std::cout << "Min Fz: " << m_minForceZ << "\n";
+        std::cout << "Max Fz: " << m_maxForceZ << "\n";
+    }
+
+    // Render network tab
+    void renderNetworkTab() {
+        std::cout << "--- NETWORK DATA ---\n";
+        std::cout << "Packets Sent: " << m_packetsSent << "\n";
+        std::cout << "Packets Received: " << m_packetsReceived << "\n";
+        std::cout << "Current Latency: " << m_latency << " ms\n";
+        std::cout << "Packet Loss: " << calculatePacketLoss() << "%\n";
+    }
+
+    // Render performance tab
+    void renderPerformanceTab() {
+        std::cout << "--- PERFORMANCE DATA ---\n";
+        std::cout << "Position Error: " << m_positionError << "\n";
+        std::cout << "Feedback Type: " << getFeedbackTypeName() << "\n";
+        std::cout << "Stiffness: " << m_stiffness << "\n";
+        std::cout << "Damping: " << m_damping << "\n";
+        std::cout << "Feedback Enabled: " << (m_feedbackEnabled ? "Yes" : "No") << "\n";
+    }
+
+    // Calculate packet loss percentage
+    float calculatePacketLoss() {
+        if (m_packetsSent == 0) return 0.0f;
+        return 100.0f * (1.0f - static_cast<float>(m_packetsReceived) / m_packetsSent);
+    }
+
+    // Get tab name as string
+    std::string getTabName() const {
+        switch (m_currentTab) {
+        case TAB_POSITION: return "Position";
+        case TAB_FORCE: return "Force";
+        case TAB_NETWORK: return "Network";
+        case TAB_PERFORMANCE: return "Performance";
+        default: return "Unknown";
+        }
+    }
+
+    // Get feedback type as string
+    std::string getFeedbackTypeName() const {
+        switch (m_feedbackType) {
+        case FEEDBACK_POSITION: return "Position";
+        case FEEDBACK_FORCE: return "Force";
+        case FEEDBACK_STIFFNESS_DAMPING: return "Stiffness/Damping";
+        default: return "Unknown";
+        }
+    }
+
+    // Client reference
+    HapticClient* m_client;
+
+    // Analytics state
+    bool m_visible;
+    AnalyticsTab m_currentTab;
+
+    // Position data
+    float m_positionX = 0.0f;
+    float m_positionY = 0.0f;
+    float m_positionZ = 0.0f;
+    float m_minPosX = 0.0f;
+    float m_maxPosX = 0.0f;
+    float m_minPosY = 0.0f;
+    float m_maxPosY = 0.0f;
+    float m_minPosZ = 0.0f;
+    float m_maxPosZ = 0.0f;
+
+    // Force data
+    float m_forceX = 0.0f;
+    float m_forceY = 0.0f;
+    float m_forceZ = 0.0f;
+    float m_minForceX = 0.0f;
+    float m_maxForceX = 0.0f;
+    float m_minForceY = 0.0f;
+    float m_maxForceY = 0.0f;
+    float m_minForceZ = 0.0f;
+    float m_maxForceZ = 0.0f;
+
+    // Network data
+    int m_packetsSent = 0;
+    int m_packetsReceived = 0;
+    float m_latency = 0.0f;
+    float m_positionError = 0.0f;
+
+    // Haptic parameters
+    double m_stiffness = 100.0;
+    double m_damping = 20.0;
+    FeedbackType m_feedbackType = FEEDBACK_POSITION;
+    bool m_feedbackEnabled = true;
+};
+
+//------------------------------------------------------------------------------
+// MAGNETS VISUALIZER CLASS
+//------------------------------------------------------------------------------
+class MagnetsVisualizer {
+public:
+    // Constructor
+    MagnetsVisualizer()
+        : m_client(nullptr),
+        m_initialized(false),
+        m_visible(false)
+    {
+    }
+
+    // Destructor
+    ~MagnetsVisualizer() {
+        shutdown();
+    }
+
+    // Initialize the visualizer
+    bool initialize() {
+        if (m_initialized) {
+            return true;
+        }
+
+        // This will initialize the visualization thread
+        m_visThread = std::thread(&MagnetsVisualizer::visualizationThread, this);
+        m_initialized = true;
+        setVisible(true);
+
+        return true;
+    }
+
+    // Set client reference
+    void setClient(HapticClient* client) {
+        m_client = client;
+    }
+
+    // Update sphere positions
+    void updateSpherePositions(const float* positions, int sphereCount) {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+
+        m_sphereCount = std::min(sphereCount, MAX_SPHERES);
+
+        for (int i = 0; i < m_sphereCount; ++i) {
+            m_spherePositions[i * 3] = positions[i * 3];     // x
+            m_spherePositions[i * 3 + 1] = positions[i * 3 + 1]; // y
+            m_spherePositions[i * 3 + 2] = positions[i * 3 + 2]; // z
+        }
+    }
+
+    // Update device position
+    void updateDevicePosition(float x, float y, float z) {
+        std::lock_guard<std::mutex> lock(m_dataMutex);
+        m_devicePosition[0] = x;
+        m_devicePosition[1] = y;
+        m_devicePosition[2] = z;
+    }
+
+    // Set visibility
+    void setVisible(bool visible) {
+        m_visible = visible;
+    }
+
+    // Check if visible
+    bool isVisible() const {
+        return m_visible;
+    }
+
+    // Shutdown the visualizer
+    void shutdown() {
+        if (!m_initialized) {
+            return;
+        }
+
+        m_initialized = false;
+
+        if (m_visThread.joinable()) {
+            m_visThread.join();
+        }
+    }
+
+private:
+    // Visualization thread
+    void visualizationThread() {
+        // In a real implementation, this would use CHAI3D or a similar
+        // library to create a window and render 3D spheres
+
+        // Here we'll simulate the visualization with a console window
+        while (m_initialized) {
+            if (m_visible) {
+                renderSimulatedView();
+            }
+
+            // Sleep to limit update rate
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    // Render a simulated view for testing
+    void renderSimulatedView() {
+        // In the final implementation, this would use CHAI3D to render in 3D
+        // For now, we'll just simulate it
+    }
+
+    // Constants
+    static const int MAX_SPHERES = 10;
+
+    // Client reference
+    HapticClient* m_client;
+
+    // Thread management
+    std::thread m_visThread;
+    std::atomic<bool> m_initialized;
+    std::atomic<bool> m_visible;
+
+    // Visualization data
+    int m_sphereCount = 0;
+    float m_spherePositions[MAX_SPHERES * 3] = { 0 };  // x,y,z for each sphere
+    float m_devicePosition[3] = { 0 };                // x,y,z for device
+
+    // Mutex for thread safety
+    std::mutex m_dataMutex;
+};
+
+//------------------------------------------------------------------------------
+// HAPTIC CLIENT CLASS
+//------------------------------------------------------------------------------
+class HapticClient {
+public:
+    // Constructor
+    HapticClient()
         : m_simulationRunning(false),
         m_simulationFinished(true),
+        m_analyticsActive(false),
         m_position{ 0.0f, 0.0f, 0.0f },
         m_force{ 0.0f, 0.0f, 0.0f },
         m_velocityDamping(0.95f),
         m_deviceMass(1.0f)
     {
-        // Set up network manager, feedback processor, and UI
+        // Set up references
         m_networkManager.setClient(this);
         m_feedbackProcessor.setClient(this);
-        m_userInterface.setClient(this);
+        m_consoleInterface.setClient(this);
+        m_analyticsInterface.setClient(this);
+        m_magnetsVisualizer.setClient(this);
 
         // Initialize packet counter
         m_packetCounter = 0;
@@ -919,21 +1368,18 @@ public:
         std::replace(timeStr.begin(), timeStr.end(), ':', '-');
 
         // Initialize recording file name
-        m_recordingFileName = "haptic_recording_" + timeStr + ".dat";
+        m_recordingFileName = "haptic_recording_" + timeStr + ".csv";
 
         // Initialize velocity
         m_velocity[0] = m_velocity[1] = m_velocity[2] = 0.0f;
     }
 
     // Destructor
-    ~HapticTeleoperationClient() {
+    ~HapticClient() {
         close();
     }
 
-    //--------------------------------------------------------------------------
-    // INITIALIZATION & RUN
-    //--------------------------------------------------------------------------
-    // Initialize the client
+    // Initialize
     bool initialize() {
         // Initialize network manager
         if (!m_networkManager.initialize()) {
@@ -947,14 +1393,26 @@ public:
             return false;
         }
 
-        // Initialize user interface
-        if (!m_userInterface.initialize()) {
-            std::cerr << "Failed to initialize user interface" << std::endl;
+        // Initialize console interface
+        if (!m_consoleInterface.initialize()) {
+            std::cerr << "Failed to initialize console interface" << std::endl;
             return false;
         }
 
+        // Initialize analytics interface
+        if (!m_analyticsInterface.initialize()) {
+            std::cerr << "Failed to initialize analytics interface" << std::endl;
+            return false;
+        }
+
+        // Initialize magnets visualizer
+        if (!m_magnetsVisualizer.initialize()) {
+            std::cerr << "Failed to initialize magnets visualizer" << std::endl;
+            // This is not critical, so we don't return false
+        }
+
         // Connect to server
-        if (!m_networkManager.connect("127.0.0.1", DST_PORT)) {
+        if (!m_networkManager.connect(DEFAULT_SERVER_IP, DST_PORT)) {
             std::cerr << "Failed to connect to server" << std::endl;
             // Don't return false here, we can connect later
         }
@@ -962,7 +1420,7 @@ public:
         return true;
     }
 
-    // Run the client application
+    // Run the client
     void run() {
         std::cout << "Starting haptic teleoperation client..." << std::endl;
 
@@ -979,17 +1437,22 @@ public:
             auto elapsedTime = std::chrono::duration<float>(currentTime - lastUpdate).count();
             lastUpdate = currentTime;
 
-            // Update interface
-            m_userInterface.update();
+            // Process user input and update UI state
+            processInput();
 
-            // Process user input
-            m_userInterface.processInput();
+            // Update interfaces
+            updateInterfaces();
 
             // Send haptic device position to server
             sendPositionData();
 
-            // Render user interface
-            m_userInterface.render();
+            // Render the appropriate interface
+            if (m_analyticsActive) {
+                m_analyticsInterface.render();
+            }
+            else {
+                m_consoleInterface.render();
+            }
 
             // Sleep to limit update rate
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -999,35 +1462,15 @@ public:
         close();
     }
 
-    //--------------------------------------------------------------------------
-    // NETWORK & FEEDBACK
-    //--------------------------------------------------------------------------
     // Process feedback from network
     void processFeedback(const FeedbackPacket& feedback) {
         // Pass to feedback processor
         m_feedbackProcessor.processFeedback(feedback);
 
-        // Update UI with latest values
-        float fx, fy, fz;
-        m_feedbackProcessor.getCurrentForce(fx, fy, fz);
-        m_userInterface.updateForceDisplay(fx, fy, fz);
-
-        // Update network statistics
-        int sent, received;
-        m_networkManager.getPacketStats(sent, received);
-        m_userInterface.updateNetworkStats(sent, received, m_feedbackProcessor.getAverageLatency());
-
-        // Update haptic parameters
-        m_userInterface.updateHapticParams(
-            m_feedbackProcessor.getStiffness(),
-            m_feedbackProcessor.getDamping(),
-            m_feedbackProcessor.getFeedbackType()
-        );
+        // Update interfaces with new data
+        updateInterfaceData();
     }
 
-    //--------------------------------------------------------------------------
-    // HAPTIC SIMULATION
-    //--------------------------------------------------------------------------
     // Start haptic simulation
     void startHapticSimulation() {
         if (m_simulationRunning) {
@@ -1038,7 +1481,7 @@ public:
         m_simulationFinished = false;
 
         // Start haptic thread
-        m_hapticThread = std::thread(&HapticTeleoperationClient::hapticLoop, this);
+        m_hapticThread = std::thread(&HapticClient::hapticLoop, this);
     }
 
     // Stop haptic simulation
@@ -1055,6 +1498,223 @@ public:
         }
 
         m_simulationFinished = true;
+    }
+
+    // Toggle analytics view
+    void toggleAnalyticsView() {
+        m_analyticsActive = !m_analyticsActive;
+        m_analyticsInterface.setVisible(m_analyticsActive);
+    }
+
+    // Toggle 3D visualization
+    void toggle3DVisualization() {
+        m_magnetsVisualizer.setVisible(!m_magnetsVisualizer.isVisible());
+    }
+
+    // Set feedback type
+    void setFeedbackType(FeedbackType type) {
+        m_feedbackProcessor.setFeedbackType(type);
+    }
+
+    // Enable/disable feedback
+    void setFeedbackEnabled(bool enabled) {
+        m_feedbackProcessor.setFeedbackEnabled(enabled);
+    }
+
+    // Set haptic stiffness
+    void setHapticStiffness(double stiffness) {
+        m_feedbackProcessor.setStiffness(stiffness);
+    }
+
+    // Set haptic damping
+    void setHapticDamping(double damping) {
+        m_feedbackProcessor.setDamping(damping);
+    }
+
+    // Save data to CSV
+    void saveDataToCSV() {
+        if (m_feedbackProcessor.saveDataToCSV(m_recordingFileName)) {
+            std::string message = "Data saved to " + m_recordingFileName;
+            m_consoleInterface.setMessage(message);
+        }
+        else {
+            m_consoleInterface.setMessage("Failed to save data");
+        }
+    }
+
+    // Reset position
+    void resetPosition() {
+        std::lock_guard<std::mutex> lock(m_positionMutex);
+        m_position[0] = m_position[1] = m_position[2] = 0.0f;
+        m_velocity[0] = m_velocity[1] = m_velocity[2] = 0.0f;
+    }
+
+    // Configure server IP
+    void configureServerIP() {
+        system("cls");
+        std::cout << "===== SERVER IP CONFIGURATION =====\n\n";
+        std::cout << "Current server IP: " << m_networkManager.getServerIP() << "\n";
+        std::cout << "Enter new server IP (or press Enter to keep current): ";
+
+        char buffer[16];
+        std::cin.getline(buffer, 16);
+
+        if (strlen(buffer) > 0) {
+            m_networkManager.setServerIP(buffer);
+            std::cout << "\nServer IP updated to: " << m_networkManager.getServerIP() << "\n";
+
+            // Attempt to reconnect
+            m_networkManager.disconnect();
+            if (m_networkManager.connect(m_networkManager.getServerIP(), DST_PORT)) {
+                std::cout << "Successfully reconnected to server\n";
+            }
+            else {
+                std::cout << "Failed to connect to new server IP\n";
+            }
+        }
+
+        std::cout << "\nPress any key to continue...";
+        _getch();
+    }
+
+private:
+    // Process user input
+    void processInput() {
+        if (_kbhit()) {
+            char key = _getch();
+
+            // Handle global keys
+            switch (key) {
+            case 'a':
+            case 'A':
+                toggleAnalyticsView();
+                break;
+
+            case 'v':
+            case 'V':
+                toggle3DVisualization();
+                break;
+
+            case 'q':
+            case 'Q':
+                exit(0);
+                break;
+
+            case 'f':
+            case 'F':
+                setFeedbackEnabled(!m_feedbackProcessor.isFeedbackEnabled());
+                break;
+
+            case 't':
+            case 'T': {
+                FeedbackType currentType = m_feedbackProcessor.getFeedbackType();
+                FeedbackType newType = static_cast<FeedbackType>((currentType + 1) % 3);
+                setFeedbackType(newType);
+                break;
+            }
+
+            case '+':
+                setHapticStiffness(m_feedbackProcessor.getStiffness() + 10.0);
+                break;
+
+            case '-':
+                setHapticStiffness(std::max(0.0, m_feedbackProcessor.getStiffness() - 10.0));
+                break;
+
+            case 'd':
+            case 'D':
+                setHapticDamping(m_feedbackProcessor.getDamping() + 5.0);
+                break;
+
+            case 'c':
+            case 'C':
+                setHapticDamping(std::max(0.0, m_feedbackProcessor.getDamping() - 5.0));
+                break;
+
+            case 's':
+            case 'S':
+                saveDataToCSV();
+                break;
+
+            case 'r':
+            case 'R':
+                resetPosition();
+                break;
+
+            case 'i':
+            case 'I':
+                configureServerIP();
+                break;
+
+                // Handle analytics-specific keys when analytics is active
+            case '1':
+            case '2':
+            case '3':
+            case '4':
+                if (m_analyticsActive) {
+                    m_analyticsInterface.setTab(static_cast<AnalyticsTab>(key - '1'));
+                }
+                break;
+            }
+        }
+    }
+
+    // Update interfaces
+    void updateInterfaces() {
+        m_consoleInterface.update();
+        m_analyticsInterface.update();
+    }
+
+    // Update interface data with latest values
+    void updateInterfaceData() {
+        // Get current data
+        float posX, posY, posZ;
+        m_feedbackProcessor.getTargetPosition(posX, posY, posZ);
+
+        float forceX, forceY, forceZ;
+        m_feedbackProcessor.getCurrentForce(forceX, forceY, forceZ);
+
+        int packetsSent, packetsReceived;
+        m_networkManager.getPacketStats(packetsSent, packetsReceived);
+
+        float latency = m_feedbackProcessor.getAverageLatency();
+        float error = m_feedbackProcessor.getPositionError();
+
+        double stiffness = m_feedbackProcessor.getStiffness();
+        double damping = m_feedbackProcessor.getDamping();
+        FeedbackType feedbackType = m_feedbackProcessor.getFeedbackType();
+        bool feedbackEnabled = m_feedbackProcessor.isFeedbackEnabled();
+
+        // Get min/max values
+        float minPosX, maxPosX, minPosY, maxPosY, minPosZ, maxPosZ;
+        m_feedbackProcessor.getMinMaxPosition(minPosX, maxPosX, minPosY, maxPosY, minPosZ, maxPosZ);
+
+        float minForceX, maxForceX, minForceY, maxForceY, minForceZ, maxForceZ;
+        m_feedbackProcessor.getMinMaxForce(minForceX, maxForceX, minForceY, maxForceY, minForceZ, maxForceZ);
+
+        // Update console interface
+        m_consoleInterface.updatePositionDisplay(posX, posY, posZ);
+        m_consoleInterface.updateForceDisplay(forceX, forceY, forceZ);
+        m_consoleInterface.updateNetworkStats(packetsSent, packetsReceived, latency);
+        m_consoleInterface.updateHapticParams(stiffness, damping, feedbackType, feedbackEnabled);
+
+        // Update analytics interface
+        m_analyticsInterface.setPositionData(posX, posY, posZ, minPosX, maxPosX, minPosY, maxPosY, minPosZ, maxPosZ);
+        m_analyticsInterface.setForceData(forceX, forceY, forceZ, minForceX, maxForceX, minForceY, maxForceY, minForceZ, maxForceZ);
+        m_analyticsInterface.setNetworkData(packetsSent, packetsReceived, latency, error);
+        m_analyticsInterface.setHapticParams(stiffness, damping, feedbackType, feedbackEnabled);
+
+        // Update magnets visualizer
+        m_magnetsVisualizer.updateDevicePosition(m_position[0], m_position[1], m_position[2]);
+
+        // Create some sphere positions for visualization
+        // In a real application, these would come from the physics simulation
+        float spherePositions[9] = {  // 3 spheres * 3 coordinates
+            0.1f, 0.0f, 0.0f,        // Sphere 1
+            0.0f, 0.1f, 0.0f,        // Sphere 2
+            0.0f, 0.0f, 0.1f         // Sphere 3
+        };
+        m_magnetsVisualizer.updateSpherePositions(spherePositions, 3);
     }
 
     // Main haptic loop
@@ -1135,7 +1795,7 @@ public:
             m_position[2] += m_velocity[2] * dt;
 
             // Update UI with new position
-            m_userInterface.updatePositionDisplay(m_position[0], m_position[1], m_position[2]);
+            m_consoleInterface.updatePositionDisplay(m_position[0], m_position[1], m_position[2]);
 
             // Sleep to maintain update rate
             std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(updateRate * 1000000)));
@@ -1144,32 +1804,6 @@ public:
         std::cout << "Haptic loop stopped" << std::endl;
     }
 
-    //--------------------------------------------------------------------------
-    // PARAMETER CONTROL
-    //--------------------------------------------------------------------------
-    // Set haptic stiffness
-    void setHapticStiffness(double stiffness) {
-        m_feedbackProcessor.setStiffness(stiffness);
-    }
-
-    // Set haptic damping
-    void setHapticDamping(double damping) {
-        m_feedbackProcessor.setDamping(damping);
-    }
-
-    // Set feedback type
-    void setFeedbackType(FeedbackType type) {
-        m_feedbackProcessor.setFeedbackType(type);
-    }
-
-    // Enable/disable feedback
-    void setFeedbackEnabled(bool enabled) {
-        m_feedbackProcessor.setFeedbackEnabled(enabled);
-    }
-
-    //--------------------------------------------------------------------------
-    // UTILITY FUNCTIONS
-    //--------------------------------------------------------------------------
     // Send position data to server
     void sendPositionData() {
         if (!m_networkManager.isConnected()) {
@@ -1196,44 +1830,6 @@ public:
 
         // Send packet
         m_networkManager.sendPacket(packet);
-
-        // Record packet if recording is enabled
-        if (m_isRecording && m_recordFile.is_open()) {
-            m_recordFile.write(reinterpret_cast<const char*>(&packet), sizeof(packet));
-        }
-    }
-
-    // Start recording
-    void startRecording() {
-        if (m_isRecording) {
-            return; // Already recording
-        }
-
-        m_recordFile.open(m_recordingFileName, std::ios::binary);
-        if (m_recordFile.is_open()) {
-            m_isRecording = true;
-            m_userInterface.setMessage("Recording started: " + m_recordingFileName);
-            std::cout << "Recording started: " << m_recordingFileName << std::endl;
-        }
-        else {
-            m_userInterface.setMessage("Failed to open recording file");
-            std::cerr << "Failed to open recording file" << std::endl;
-        }
-    }
-
-    // Stop recording
-    void stopRecording() {
-        if (!m_isRecording) {
-            return; // Not recording
-        }
-
-        if (m_recordFile.is_open()) {
-            m_recordFile.close();
-        }
-
-        m_isRecording = false;
-        m_userInterface.setMessage("Recording stopped");
-        std::cout << "Recording stopped" << std::endl;
     }
 
     // Get current timestamp
@@ -1244,34 +1840,30 @@ public:
         strftime(timestamp, 64, "%Y-%m-%d %H:%M:%S", &timeinfo);
     }
 
-    // Close the application
+    // Close and cleanup
     void close() {
-        // Stop recording if active
-        if (m_isRecording) {
-            stopRecording();
-        }
-
         // Stop haptic simulation
         stopHapticSimulation();
 
         // Disconnect from server
         m_networkManager.disconnect();
 
+        // Shutdown magnets visualizer
+        m_magnetsVisualizer.shutdown();
+
         std::cout << "Client shutdown complete" << std::endl;
     }
 
-private:
-    //--------------------------------------------------------------------------
-    // PRIVATE PROPERTIES
-    //--------------------------------------------------------------------------
     // Network manager
     NetworkManager m_networkManager;
 
     // Feedback processor
     FeedbackProcessor m_feedbackProcessor;
 
-    // User interface
-    UserInterface m_userInterface;
+    // User interfaces
+    ConsoleInterface m_consoleInterface;
+    AnalyticsInterface m_analyticsInterface;
+    MagnetsVisualizer m_magnetsVisualizer;
 
     // Haptic thread
     std::thread m_hapticThread;
@@ -1279,6 +1871,7 @@ private:
     // Simulation flags
     bool m_simulationRunning;
     bool m_simulationFinished;
+    bool m_analyticsActive;
 
     // Device physics simulation properties
     float m_position[3];
@@ -1291,8 +1884,6 @@ private:
     std::mutex m_positionMutex;
 
     // Recording
-    bool m_isRecording = false;
-    std::ofstream m_recordFile;
     std::string m_recordingFileName;
 
     // Packet counter
@@ -1310,28 +1901,27 @@ void NetworkManager::processFeedbackPacket(FeedbackPacket* packet) {
     }
 }
 
-// Handle button events in UserInterface
-void UserInterface::onButtonPressed(int id) {
-    std::lock_guard<std::mutex> lock(m_uiMutex);
+// Process console input
+void ConsoleInterface::processInput() {
+    // Input processing is handled by the main client class
+}
 
-    if (m_client) {
-        switch (id) {
-        case 0: // Quit button
-            exit(0);
-            break;
-        }
-    }
+// Process analytics input
+void AnalyticsInterface::processInput() {
+    // Input processing is handled by the main client class
 }
 
 //------------------------------------------------------------------------------
 // MAIN FUNCTION
 //------------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
-    std::cout << "Haptic Teleoperation Client - Windows Implementation" << std::endl;
+    SetConsoleTitle(TEXT("Fixed Windows Haptic Teleoperation Client"));
+
+    std::cout << "Fixed Windows Haptic Teleoperation Client" << std::endl;
     std::cout << "Copyright (c) 2023" << std::endl << std::endl;
 
     // Create client
-    HapticTeleoperationClient client;
+    HapticClient client;
 
     // Initialize client
     if (!client.initialize()) {
