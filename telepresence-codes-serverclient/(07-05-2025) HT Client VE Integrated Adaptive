@@ -1,13 +1,14 @@
 //------------------------------------------------------------------------------
-// Adaptive Haptic Teleoperation Client
+// Enhanced Haptic Teleoperation Client
 //
 // Features:
 // - Bidirectional socket communication (sending and receiving on same port)
 // - Free-running haptic device for position data capture only
 // - Adaptive feedback handling from server (utilizes 5 packets every 3000 received)
 // - Buffered feedback control with constant values between utilization cycles
-// - 3D visualization of server-side haptic environment
-// - Real-time analytics display
+// - 3D visualization of server-side haptic environment with actual device position
+// - Graphical analytics GUI using GLUT for data visualization
+// - Console logging of detailed packet information
 //------------------------------------------------------------------------------
 
 #define WIN32_LEAN_AND_MEAN
@@ -27,9 +28,11 @@
 #include <conio.h>
 #include <deque>
 #include <algorithm>
+#include <GL/glew.h>
+#include "glut.h"
+  // For analytics GUI
 #include "chai3d.h"
 #include <GLFW/glfw3.h>
-
 // Link with Winsock library
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -50,6 +53,7 @@ const int PORT = 4000;                         // Same port for both sending and
 const int BUFFER_SIZE = 1024;                  // Packet buffer size
 const int HAPTIC_RATE_HZ = 1000;               // Haptic device update rate in Hz
 const int MAX_HISTORY_SIZE = 1000;             // Maximum history size for graphs
+const int CONSOLE_LOG_PACKETS = 10;            // Number of recent packets to show in console
 
 //------------------------------------------------------------------------------
 // ADAPTIVE FEEDBACK CONTROL PARAMETERS
@@ -112,6 +116,12 @@ const int LIGHT_CONE_ANGLE = 30;
 const double WINDOW_WIDTH_RATIO = 0.8;
 const double WINDOW_HEIGHT_RATIO = 0.5;
 
+// Analytics window settings
+const int ANALYTICS_WINDOW_WIDTH = 800;       // Analytics window width
+const int ANALYTICS_WINDOW_HEIGHT = 600;      // Analytics window height
+const int GRAPH_MARGIN = 50;                  // Margin around graphs
+const int GRAPH_HEIGHT = 150;                 // Height of each graph
+
 // Refresh rates
 const int DEFAULT_SWAP_INTERVAL = 1;           // Vertical sync (1=enabled, 0=disabled)
 
@@ -134,6 +144,11 @@ std::mutex socketMutex;
 std::atomic<int> packetsSent(0);
 std::atomic<int> packetsReceived(0);
 int packetNumber = 0;
+
+// Recent packet logging
+std::deque<std::string> sentPacketLogs;
+std::deque<std::string> receivedPacketLogs;
+std::mutex logMutex;
 
 //------------------------------------------------------------------------------
 // PACKET STRUCTURES
@@ -167,6 +182,12 @@ struct FeedbackPacket {
 std::deque<FeedbackPacket> feedbackBuffer;
 std::mutex feedbackMutex;
 
+// History for graphs
+std::vector<float> positionHistory[3];  // X, Y, Z
+std::vector<float> forceHistory[3];     // X, Y, Z
+std::vector<float> latencyHistory;
+std::vector<float> errorHistory;
+
 // Current feedback values (these are the actually applied values)
 float currentForce[3] = { 0.0f, 0.0f, 0.0f };
 float targetPosition[3] = { 0.0f, 0.0f, 0.0f };
@@ -190,6 +211,10 @@ float minForceY = std::numeric_limits<float>::max();
 float maxForceY = std::numeric_limits<float>::lowest();
 float minForceZ = std::numeric_limits<float>::max();
 float maxForceZ = std::numeric_limits<float>::lowest();
+float minLatency = std::numeric_limits<float>::max();
+float maxLatency = std::numeric_limits<float>::lowest();
+float minError = std::numeric_limits<float>::max();
+float maxError = std::numeric_limits<float>::lowest();
 
 // Feedback control
 enum FeedbackType {
@@ -203,6 +228,9 @@ bool feedbackEnabled = true;
 double stiffnessValue = DEFAULT_STIFFNESS;
 double dampingValue = DEFAULT_DAMPING;
 
+// Device cursor representation
+cShapeSphere* deviceCursor = nullptr;
+
 //------------------------------------------------------------------------------
 // VISUALATION AND GUI VARIABLES
 //------------------------------------------------------------------------------
@@ -210,7 +238,8 @@ double dampingValue = DEFAULT_DAMPING;
 cStereoMode stereoMode = C_STEREO_DISABLED;
 bool fullscreen = false;
 bool mirroredDisplay = false;
-bool showAnalytics = false;
+bool showConsoleAnalytics = false;
+int analyticsWindowId = -1;       // GLUT window ID for analytics
 
 // CHAI3D world objects
 cWorld* world;
@@ -279,9 +308,19 @@ void configureServerIP();
 void processFeedbackPacket(const FeedbackPacket& packet);
 void updateFeedbackStatistics(const FeedbackPacket& packet);
 void applyAdaptiveFeedback();
+void logPacket(const ClientPacket& packet, bool isSent);
+void logPacket(const FeedbackPacket& packet, bool isSent);
 
 // Analytics and UI
-void displayAnalyticsInfo();
+void displayConsoleAnalytics();
+void initAnalyticsWindow();
+void reshapeAnalyticsWindow(int w, int h);
+void displayAnalyticsWindow();
+void idleAnalyticsWindow();
+void drawGraph(float x, float y, float width, float height,
+    const std::vector<float>& data, float minVal, float maxVal,
+    GLfloat r, GLfloat g, GLfloat b);
+void drawText(float x, float y, const char* text);
 
 // Cleanup
 void close(void);
@@ -459,6 +498,46 @@ void configureServerIP() {
 }
 
 //------------------------------------------------------------------------------
+// Packet Logging
+//------------------------------------------------------------------------------
+void logPacket(const ClientPacket& packet, bool isSent) {
+    std::lock_guard<std::mutex> lock(logMutex);
+
+    std::stringstream ss;
+    ss << (isSent ? "SENT" : "RCVD") << " | Pkt#: " << packet.packetNumber
+        << " | Pos: (" << std::fixed << std::setprecision(3)
+        << packet.x << ", " << packet.y << ", " << packet.z << ")"
+        << " | From: " << packet.srcIP << ":" << packet.srcPort
+        << " | To: " << packet.dstIP << ":" << packet.dstPort;
+
+    if (isSent) {
+        sentPacketLogs.push_back(ss.str());
+        if (sentPacketLogs.size() > CONSOLE_LOG_PACKETS) {
+            sentPacketLogs.pop_front();
+        }
+    }
+}
+
+void logPacket(const FeedbackPacket& packet, bool isSent) {
+    std::lock_guard<std::mutex> lock(logMutex);
+
+    std::stringstream ss;
+    ss << (isSent ? "SENT" : "RCVD") << " | Pkt#: " << packet.packetNumber
+        << " | Force: (" << std::fixed << std::setprecision(3)
+        << packet.fx << ", " << packet.fy << ", " << packet.fz << ")"
+        << " | Pos: (" << packet.px << ", " << packet.py << ", " << packet.pz << ")"
+        << " | Err: " << packet.positionError
+        << " | Lat: " << packet.latency << "ms";
+
+    if (!isSent) {
+        receivedPacketLogs.push_back(ss.str());
+        if (receivedPacketLogs.size() > CONSOLE_LOG_PACKETS) {
+            receivedPacketLogs.pop_front();
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
 // Feedback Processing Functions
 //------------------------------------------------------------------------------
 void processFeedbackPacket(const FeedbackPacket& packet) {
@@ -484,6 +563,9 @@ void processFeedbackPacket(const FeedbackPacket& packet) {
 
     // Update statistics for all received packets (not just applied ones)
     updateFeedbackStatistics(packet);
+
+    // Log the packet
+    logPacket(packet, false);
 }
 
 void updateFeedbackStatistics(const FeedbackPacket& packet) {
@@ -503,8 +585,44 @@ void updateFeedbackStatistics(const FeedbackPacket& packet) {
     minForceZ = std::min(minForceZ, packet.fz);
     maxForceZ = std::max(maxForceZ, packet.fz);
 
+    // Update min/max values for latency and error
+    minLatency = std::min(minLatency, packet.latency);
+    maxLatency = std::max(maxLatency, packet.latency);
+    minError = std::min(minError, packet.positionError);
+    maxError = std::max(maxError, packet.positionError);
+
     // Update average latency (smoothed)
     averageLatency = 0.9f * averageLatency + 0.1f * packet.latency;
+
+    // Update history for graphs (with limiting to avoid memory issues)
+    positionHistory[0].push_back(packet.px);
+    positionHistory[1].push_back(packet.py);
+    positionHistory[2].push_back(packet.pz);
+
+    forceHistory[0].push_back(packet.fx);
+    forceHistory[1].push_back(packet.fy);
+    forceHistory[2].push_back(packet.fz);
+
+    latencyHistory.push_back(packet.latency);
+    errorHistory.push_back(packet.positionError);
+
+    // Limit size of history arrays
+    for (int i = 0; i < 3; i++) {
+        while (positionHistory[i].size() > MAX_HISTORY_SIZE) {
+            positionHistory[i].erase(positionHistory[i].begin());
+        }
+        while (forceHistory[i].size() > MAX_HISTORY_SIZE) {
+            forceHistory[i].erase(forceHistory[i].begin());
+        }
+    }
+
+    while (latencyHistory.size() > MAX_HISTORY_SIZE) {
+        latencyHistory.erase(latencyHistory.begin());
+    }
+
+    while (errorHistory.size() > MAX_HISTORY_SIZE) {
+        errorHistory.erase(errorHistory.begin());
+    }
 }
 
 void applyAdaptiveFeedback() {
@@ -586,83 +704,195 @@ void applyAdaptiveFeedback() {
     }
 }
 
-void displayAnalyticsInfo() {
+void displayConsoleAnalytics() {
     system("cls");
 
-    cout << "====== ADAPTIVE HAPTIC TELEOPERATION ANALYTICS ======\n\n";
+    cout << "====== ENHANCED HAPTIC TELEOPERATION CLIENT ======\n\n";
 
-    // Display tab name
-    string tabName;
-    switch (currentTab) {
-    case TAB_POSITION: tabName = "Position"; break;
-    case TAB_FORCE: tabName = "Force"; break;
-    case TAB_NETWORK: tabName = "Network"; break;
-    case TAB_PERFORMANCE: tabName = "Performance"; break;
+    // Display network status
+    cout << "NETWORK STATUS:\n";
+    cout << "  Local IP: " << SRC_IP << ":" << PORT << "\n";
+    cout << "  Server IP: " << SERVER_IP << ":" << PORT << "\n";
+    cout << "  Packets Sent: " << packetsSent << "  |  Received: " << packetsReceived << "\n";
+    cout << "  Buffer: " << feedbackBuffer.size() << "  |  Counter: " << feedbackPacketCounter << "/" << PACKET_UTILIZATION_INTERVAL << "\n";
+    cout << "  Latency: " << averageLatency << " ms\n\n";
+
+    // Display sent packets
+    cout << "SENT PACKETS:\n";
+    for (const auto& log : sentPacketLogs) {
+        cout << "  " << log << "\n";
     }
-    cout << "Tab: " << tabName << " [Press 1-4 to change]\n\n";
+    cout << "\n";
 
-    // Display tab-specific content
-    switch (currentTab) {
-    case TAB_POSITION:
-        cout << "--- POSITION DATA ---\n";
-        cout << "Current Position: (" << targetPosition[0] << ", " << targetPosition[1] << ", " << targetPosition[2] << ")\n";
-        cout << "Min X: " << minPositionX << "\n";
-        cout << "Max X: " << maxPositionX << "\n";
-        cout << "Min Y: " << minPositionY << "\n";
-        cout << "Max Y: " << maxPositionY << "\n";
-        cout << "Min Z: " << minPositionZ << "\n";
-        cout << "Max Z: " << maxPositionZ << "\n";
-        break;
-
-    case TAB_FORCE:
-        cout << "--- FORCE DATA ---\n";
-        cout << "Current Force: (" << currentForce[0] << ", " << currentForce[1] << ", " << currentForce[2] << ")\n";
-        cout << "Min Fx: " << minForceX << "\n";
-        cout << "Max Fx: " << maxForceX << "\n";
-        cout << "Min Fy: " << minForceY << "\n";
-        cout << "Max Fy: " << maxForceY << "\n";
-        cout << "Min Fz: " << minForceZ << "\n";
-        cout << "Max Fz: " << maxForceZ << "\n";
-        cout << "Feedback Type: " << (currentFeedbackType == FEEDBACK_POSITION ? "Position" :
-            (currentFeedbackType == FEEDBACK_FORCE ? "Force" : "Stiffness/Damping")) << "\n";
-        cout << "Feedback Enabled: " << (feedbackEnabled ? "Yes" : "No") << "\n";
-        break;
-
-    case TAB_NETWORK:
-        cout << "--- NETWORK DATA ---\n";
-        cout << "Local IP: " << SRC_IP << "\n";
-        cout << "Server IP: " << SERVER_IP << "\n";
-        cout << "Port: " << PORT << " (both sending and receiving)\n";
-        cout << "Packets Sent: " << packetsSent << "\n";
-        cout << "Packets Received: " << packetsReceived << "\n";
-        cout << "Packets in Buffer: " << feedbackBuffer.size() << "\n";
-        cout << "Feedback Counter: " << feedbackPacketCounter << " / " << PACKET_UTILIZATION_INTERVAL << "\n";
-        cout << "Current Latency: " << averageLatency << " ms\n";
-
-        // Calculate packet loss
-        if (packetsSent > 0) {
-            float packetLoss = 100.0f * (1.0f - static_cast<float>(packetsReceived) / packetsSent);
-            cout << "Packet Loss: " << packetLoss << "%\n";
-        }
-        break;
-
-    case TAB_PERFORMANCE:
-        cout << "--- PERFORMANCE DATA ---\n";
-        cout << "Position Error: " << positionError << "\n";
-        cout << "Haptic Rate: " << freqCounterHaptics.getFrequency() << " Hz\n";
-        cout << "Graphics Rate: " << freqCounterGraphics.getFrequency() << " Hz\n";
-        cout << "Feedback Utilization Rate: " << (float)PACKETS_TO_UTILIZE / PACKET_UTILIZATION_INTERVAL * 100.0f << "%\n";
-        cout << "Packet Utilization: " << PACKETS_TO_UTILIZE << " every " << PACKET_UTILIZATION_INTERVAL << " packets\n";
-        cout << "Stiffness: " << stiffnessValue << " / " << MAX_STIFFNESS << "\n";
-        cout << "Damping: " << dampingValue << " / " << MAX_DAMPING << "\n";
-        break;
+    // Display received packets
+    cout << "RECEIVED PACKETS:\n";
+    for (const auto& log : receivedPacketLogs) {
+        cout << "  " << log << "\n";
     }
+    cout << "\n";
 
     // Display commands
-    cout << "\nCOMMANDS:\n";
-    cout << "  1-4: Change tab  t: Toggle feedback type  f: Toggle feedback\n";
-    cout << "  +/-: Adjust stiffness  d/c: Adjust damping  i: Configure server IP\n";
-    cout << "  a: Toggle analytics  v: Toggle 3D view  q: Quit application\n";
+    cout << "COMMANDS:\n";
+    cout << "  [g] - Toggle graphical analytics\n";
+    cout << "  [a] - Toggle console analytics\n";
+    cout << "  [t] - Toggle feedback type\n";
+    cout << "  [i] - Configure server IP\n";
+    cout << "  [q] - Exit application\n";
+}
+
+//------------------------------------------------------------------------------
+// Graphics Analytics Functions
+//------------------------------------------------------------------------------
+void initAnalyticsWindow() {
+    // Initialize GLUT if not already initialized
+    int argc = 1;
+    char* argv[1] = { (char*)"EnhancedHapticClient" };
+
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(ANALYTICS_WINDOW_WIDTH, ANALYTICS_WINDOW_HEIGHT);
+    glutInitWindowPosition(50, 50);
+
+    analyticsWindowId = glutCreateWindow("Haptic Teleoperation Analytics");
+
+    glutDisplayFunc(displayAnalyticsWindow);
+    glutReshapeFunc(reshapeAnalyticsWindow);
+    glutIdleFunc(idleAnalyticsWindow);
+
+    glClearColor(0.95f, 0.95f, 0.95f, 1.0f);
+}
+
+void reshapeAnalyticsWindow(int w, int h) {
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0, w, 0, h);
+    glMatrixMode(GL_MODELVIEW);
+}
+
+void drawGraph(float x, float y, float width, float height,
+    const std::vector<float>& data, float minVal, float maxVal,
+    GLfloat r, GLfloat g, GLfloat b) {
+    if (data.empty()) return;
+
+    // Ensure min != max to avoid division by zero
+    if (fabs(maxVal - minVal) < 0.0001f) {
+        maxVal = minVal + 0.0001f;
+    }
+
+    // Set color
+    glColor3f(r, g, b);
+
+    // Draw border
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x, y);
+    glVertex2f(x + width, y);
+    glVertex2f(x + width, y + height);
+    glVertex2f(x, y + height);
+    glEnd();
+
+    // Draw graph line
+    glBegin(GL_LINE_STRIP);
+    float xStep = width / (data.size() - 1);
+
+    for (size_t i = 0; i < data.size(); i++) {
+        float xPos = x + i * xStep;
+        float normalizedY = (data[i] - minVal) / (maxVal - minVal);
+        float yPos = y + normalizedY * height;
+        glVertex2f(xPos, yPos);
+    }
+    glEnd();
+
+    // Draw axis labels
+    char buffer[50];
+    glColor3f(0.0f, 0.0f, 0.0f);
+
+    // Y-axis labels (min and max)
+    sprintf_s(buffer, "%.2f", maxVal);
+    drawText(x - 40, y + height - 10, buffer);
+
+    sprintf_s(buffer, "%.2f", minVal);
+    drawText(x - 40, y + 5, buffer);
+
+    // Current value label
+    sprintf_s(buffer, "Current: %.2f", data.back());
+    drawText(x + width - 100, y + height - 20, buffer);
+}
+
+void drawText(float x, float y, const char* text) {
+    glRasterPos2f(x, y);
+    for (const char* c = text; *c != '\0'; c++) {
+        glutBitmapCharacter(GLUT_BITMAP_8_BY_13, *c);
+    }
+}
+
+void displayAnalyticsWindow() {
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLoadIdentity();
+
+    int w = glutGet(GLUT_WINDOW_WIDTH);
+    int h = glutGet(GLUT_WINDOW_HEIGHT);
+
+    // Lock the feedback buffer to avoid race conditions
+    std::lock_guard<std::mutex> lock(feedbackMutex);
+
+    // Title
+    glColor3f(0.0f, 0.0f, 0.0f);
+    char titleBuffer[100];
+    sprintf_s(titleBuffer, "Haptic Teleoperation Analytics - Packets: Sent %d | Received %d | Buffer %zu",
+        (int)packetsSent, (int)packetsReceived, feedbackBuffer.size());
+    drawText(GRAPH_MARGIN, h - 20, titleBuffer);
+
+    // Draw position graphs
+    float graphWidth = w - 2 * GRAPH_MARGIN;
+
+    // Position X graph
+    if (!positionHistory[0].empty()) {
+        drawGraph(GRAPH_MARGIN, h - GRAPH_HEIGHT - 50, graphWidth, GRAPH_HEIGHT,
+            positionHistory[0], minPositionX, maxPositionX, 1.0f, 0.0f, 0.0f);
+        drawText(GRAPH_MARGIN, h - 40, "Position X");
+    }
+
+    // Position Y graph
+    if (!positionHistory[1].empty()) {
+        drawGraph(GRAPH_MARGIN, h - 2 * GRAPH_HEIGHT - 80, graphWidth, GRAPH_HEIGHT,
+            positionHistory[1], minPositionY, maxPositionY, 0.0f, 1.0f, 0.0f);
+        drawText(GRAPH_MARGIN, h - GRAPH_HEIGHT - 70, "Position Y");
+    }
+
+    // Position Z graph
+    if (!positionHistory[2].empty()) {
+        drawGraph(GRAPH_MARGIN, h - 3 * GRAPH_HEIGHT - 110, graphWidth, GRAPH_HEIGHT,
+            positionHistory[2], minPositionZ, maxPositionZ, 0.0f, 0.0f, 1.0f);
+        drawText(GRAPH_MARGIN, h - 2 * GRAPH_HEIGHT - 100, "Position Z");
+    }
+
+    // Error graph
+    if (!errorHistory.empty()) {
+        drawGraph(GRAPH_MARGIN, h - 4 * GRAPH_HEIGHT - 140, graphWidth, GRAPH_HEIGHT,
+            errorHistory, minError, maxError, 0.5f, 0.0f, 0.5f);
+        drawText(GRAPH_MARGIN, h - 3 * GRAPH_HEIGHT - 130, "Position Error");
+    }
+
+    // Status info
+    char statusBuffer[100];
+    sprintf_s(statusBuffer, "Server: %s:%d | Feedback Counter: %d/%d | Update Ready: %s",
+        SERVER_IP, PORT, feedbackPacketCounter, PACKET_UTILIZATION_INTERVAL,
+        feedbackUpdateReady ? "Yes" : "No");
+    drawText(GRAPH_MARGIN, 30, statusBuffer);
+
+    // Commands
+    drawText(GRAPH_MARGIN, 10, "Commands: [g] Toggle Analytics | [t] Change Feedback Type | [i] Set Server IP | [q] Quit");
+
+    glutSwapBuffers();
+}
+
+void idleAnalyticsWindow() {
+    // Trigger a redraw of the analytics window
+    if (analyticsWindowId >= 0) {
+        glutSetWindow(analyticsWindowId);
+        glutPostRedisplay();
+    }
 }
 
 // Thread function for sending packets to server
@@ -709,7 +939,13 @@ void sendNetworkThread_func(void) {
 
                 if (result != SOCKET_ERROR) {
                     packetsSent++;
+                    logPacket(packet, true);
                 }
+            }
+
+            // Update device cursor position in 3D visualization
+            if (deviceCursor) {
+                deviceCursor->setLocalPos(position);
             }
         }
 
@@ -850,35 +1086,32 @@ void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, 
         camera->setMirrorVertical(mirroredDisplay);
     }
 
-    // option - toggle analytics
+    // option - toggle console analytics
     else if (a_key == GLFW_KEY_A)
     {
-        showAnalytics = !showAnalytics;
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        showConsoleAnalytics = !showConsoleAnalytics;
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
 
-    // option - change analytics tab
-    else if (a_key == GLFW_KEY_1 && showAnalytics)
+    // option - toggle graphical analytics
+    else if (a_key == GLFW_KEY_G)
     {
-        currentTab = TAB_POSITION;
-        displayAnalyticsInfo();
-    }
-    else if (a_key == GLFW_KEY_2 && showAnalytics)
-    {
-        currentTab = TAB_FORCE;
-        displayAnalyticsInfo();
-    }
-    else if (a_key == GLFW_KEY_3 && showAnalytics)
-    {
-        currentTab = TAB_NETWORK;
-        displayAnalyticsInfo();
-    }
-    else if (a_key == GLFW_KEY_4 && showAnalytics)
-    {
-        currentTab = TAB_PERFORMANCE;
-        displayAnalyticsInfo();
+        // If window not created yet, create it
+        if (analyticsWindowId < 0) {
+            initAnalyticsWindow();
+        }
+        else {
+            // Toggle visibility by destroying/recreating
+            glutDestroyWindow(analyticsWindowId);
+            analyticsWindowId = -1;
+
+            // If it was destroyed, recreate it
+            if (analyticsWindowId < 0) {
+                initAnalyticsWindow();
+            }
+        }
     }
 
     // option - toggle feedback type
@@ -892,8 +1125,8 @@ void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, 
         case FEEDBACK_STIFFNESS_DAMPING: typeName = "Stiffness/Damping"; break;
         }
         cout << "Feedback type changed to: " << typeName << endl;
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
 
@@ -902,8 +1135,8 @@ void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, 
     {
         feedbackEnabled = !feedbackEnabled;
         cout << "Feedback " << (feedbackEnabled ? "enabled" : "disabled") << endl;
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
 
@@ -912,16 +1145,16 @@ void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, 
     {
         stiffnessValue = std::min(stiffnessValue + 10.0, MAX_STIFFNESS);
         cout << "Stiffness: " << stiffnessValue << endl;
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
     else if (a_key == GLFW_KEY_MINUS || a_key == GLFW_KEY_KP_SUBTRACT) // Minus key
     {
         stiffnessValue = std::max(0.0, stiffnessValue - 10.0);
         cout << "Stiffness: " << stiffnessValue << endl;
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
 
@@ -930,16 +1163,16 @@ void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, 
     {
         dampingValue = std::min(dampingValue + 5.0, MAX_DAMPING);
         cout << "Damping: " << dampingValue << endl;
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
     else if (a_key == GLFW_KEY_C)
     {
         dampingValue = std::max(0.0, dampingValue - 5.0);
         cout << "Damping: " << dampingValue << endl;
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
 
@@ -947,14 +1180,14 @@ void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, 
     else if (a_key == GLFW_KEY_I)
     {
         // Temporarily pause rendering
-        bool wasAnalyticsActive = showAnalytics;
-        showAnalytics = false;
+        bool wasAnalyticsActive = showConsoleAnalytics;
+        showConsoleAnalytics = false;
 
         configureServerIP();
 
-        showAnalytics = wasAnalyticsActive;
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        showConsoleAnalytics = wasAnalyticsActive;
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
 }
@@ -985,6 +1218,11 @@ void close(void)
 
     // close network sockets
     closeNetworkSockets();
+
+    // destroy GLUT window if exists
+    if (analyticsWindowId >= 0) {
+        glutDestroyWindow(analyticsWindowId);
+    }
 
     // delete resources
     delete hapticsThread;
@@ -1173,10 +1411,11 @@ int main(int argc, char* argv[])
 
     cout << endl;
     cout << "-----------------------------------" << endl;
-    cout << "Adaptive Haptic Teleoperation Client" << endl;
+    cout << "Enhanced Haptic Teleoperation Client" << endl;
     cout << "-----------------------------------" << endl;
     cout << "Keyboard Options:" << endl << endl;
-    cout << "[a] - Toggle analytics view" << endl;
+    cout << "[a] - Toggle console analytics" << endl;
+    cout << "[g] - Toggle graphical analytics" << endl;
     cout << "[f] - Toggle fullscreen mode" << endl;
     cout << "[t] - Toggle feedback type" << endl;
     cout << "[i] - Configure server IP" << endl;
@@ -1232,7 +1471,7 @@ int main(int argc, char* argv[])
     }
 
     // create display context
-    window = glfwCreateWindow(w, h, "Adaptive Haptic Teleoperation Client", NULL, NULL);
+    window = glfwCreateWindow(w, h, "Enhanced Haptic Teleoperation Client", NULL, NULL);
     if (!window)
     {
         cout << "Failed to create window" << endl;
@@ -1391,6 +1630,11 @@ int main(int argc, char* argv[])
         return (-1);
     }
 
+    // Create device cursor
+    deviceCursor = new cShapeSphere(SPHERE_RADIUS);
+    world->addChild(deviceCursor);
+    deviceCursor->m_material->setRedCrimson();
+
     // create spheres
     for (int i = 0; i < NUM_SPHERES; i++)
     {
@@ -1412,7 +1656,7 @@ int main(int argc, char* argv[])
         sphere->setTexture(texture);
         sphere->m_texture->setSphericalMappingEnabled(true);
         sphere->setUseTexture(true);
-        sphere->m_material->setWhite();
+        sphere->m_material->setBlue();
     }
 
     //--------------------------------------------------------------------------
@@ -1498,9 +1742,9 @@ int main(int argc, char* argv[])
         // signal frequency counter
         freqCounterGraphics.signal(1);
 
-        // display analytics if enabled
-        if (showAnalytics) {
-            displayAnalyticsInfo();
+        // display console analytics if enabled
+        if (showConsoleAnalytics) {
+            displayConsoleAnalytics();
         }
     }
 
