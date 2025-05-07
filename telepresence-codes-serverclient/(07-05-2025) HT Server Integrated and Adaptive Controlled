@@ -11,8 +11,8 @@
 //
 // Port: 4000 for both receiving and sending
 //------------------------------------------------------------------------------
-#define WIN32_LEAN_AND_MEAN 
-#define _WINSOCK_DEPRECATED_NO_WARNINGS // Exclude rarely-used stuff from Windows headers
+#define WIN32_LEAN_AND_MEAN  // Exclude rarely-used stuff from Windows headers
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define NOMINMAX
 #include <windows.h>
 #include <winsock2.h>  // Include before windows.h if both are needed
@@ -57,7 +57,7 @@ using namespace std;
 #define UDP_PORT 4000          // Port for both receiving and sending packets
 #define MAX_PACKET_SIZE 400    // Maximum UDP packet size
 #define MAX_BUFFER_SIZE 5000   // Buffer capacity for packet storage
-const char* SERVER_IP = "0.0.0.0";  // Server IP (0.0.0.0 = listen on all interfaces)
+const char* SERVER_IP = "169.254.213.206";  // Server IP (0.0.0.0 = listen on all interfaces)
 const char* CLIENT_IP = "127.0.0.1"; // Default client IP (can be detected automatically)
 const int SOCKET_TIMEOUT_MS = 5000; // Socket timeout in milliseconds
 
@@ -68,7 +68,7 @@ const int SLIDING_WINDOW_SIZE = 100;   // Size of sliding window buffer for dela
 const double JITTER_THRESHOLD_MS = 10.0; // Threshold to consider jitter significant
 const int PACKET_SEND_INTERVAL_US = 1000; // Feedback packet send interval (microseconds) = 1ms
 const int PACKET_UTILIZATION_INTERVAL = 3000; // Apply feedback every 5 packets after this many
-const int FEEDBACK_ACTIVE_PKTS = 5;    // Number of consecutive packets marked as "active" for feedback
+const int FEEDBACK_ACTIVE_PKTS = 3000;    // Number of consecutive packets marked as "active" for feedback
 
 //------------------------------------------------------------------------------
 // HAPTIC DEVICE CONFIGURATION
@@ -2271,7 +2271,7 @@ void display() {
 
     // Draw legend box
     if (showLegend) {
-        drawLegendBox(0.1f, 0.1f, LEGEND_WIDTH, LEGEND_HEIGHT);
+        drawLegendBox(0.7f, 0.7f, LEGEND_WIDTH, LEGEND_HEIGHT);
     }
 
     // Draw help screen if enabled
