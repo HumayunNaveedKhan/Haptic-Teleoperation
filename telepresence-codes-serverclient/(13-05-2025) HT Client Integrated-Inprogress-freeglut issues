@@ -1,0 +1,1715 @@
+//------------------------------------------------------------------------------
+// Enhanced Haptic Teleoperation Client with Bidirectional Communication
+// Windows-specific version
+//
+// Features:
+// - Bidirectional socket communication (sending and receiving on same port 4000)
+// - Haptic device position data capture and transmission
+// - Adaptive feedback handling from server (utilizes 5 packets every 3000 received)
+// - Buffered feedback control with constant values between utilization cycles
+// - 3D visualization of server-side haptic environment with actual device position
+// - Separate GLUT window for graphical analytics display
+// - Console logging of detailed packet information (IPs, ports, and payloads)
+//------------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <iostream>
+#include <iomanip>
+#include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <conio.h>
+#include <deque>
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <cstdlib>
+#include <ctime>
+#include "chai3d.h"
+#include <GL/glew.h>
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\15inch\freeglut\include\GL\freeglut.h>
+#include <GLFW/glfw3.h>
+
+// Link with libraries
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "chai3d.lib")
+#pragma comment(lib, "glut32.lib")
+#pragma comment(lib, "freeglut.lib")
+#pragma comment(lib, "glew32.lib")
+#pragma comment(lib, "glfw3.lib")
+#pragma comment(lib, "opengl32.lib")
+#pragma comment(lib, "glu32.lib")
+
+using namespace chai3d;
+using namespace std;
+
+// Define RESOURCE_PATH_STANDARD if not defined
+#ifndef RESOURCE_PATH_STANDARD
+#define RESOURCE_PATH_STANDARD "../resources/"
+#endif
+
+//==============================================================================
+// ALL CONTROL PARAMETERS
+//==============================================================================
+//------------------------------------------------------------------------------
+// NETWORK SETTINGS
+//------------------------------------------------------------------------------
+char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0";      // Will be fetched dynamically
+char SERVER_IP[INET_ADDRSTRLEN] = "169.254.213.206"; // Default server IP (configurable)
+const int PORT = 4000;                         // Same port for both sending and receiving
+const int BUFFER_SIZE = 1024;                  // Packet buffer size
+const int HAPTIC_RATE_HZ = 1000;               // Haptic device update rate in Hz
+const int MAX_HISTORY_SIZE = 1000;             // Maximum history size for graphs
+const int CONSOLE_LOG_PACKETS = 10;            // Number of recent packets to show in console
+//------------------------------------------------------------------------------
+// ADAPTIVE FEEDBACK CONTROL PARAMETERS
+//------------------------------------------------------------------------------
+const int PACKET_UTILIZATION_INTERVAL = 3000;  // Apply feedback after this many received packets
+const int PACKETS_TO_UTILIZE = 5;              // Number of packets to utilize in each cycle
+double DEFAULT_STIFFNESS = 100.0;              // Default stiffness value
+double DEFAULT_DAMPING = 20.0;                 // Default damping value
+double MAX_STIFFNESS = 500.0;                  // Maximum stiffness value
+double MAX_DAMPING = 100.0;                    // Maximum damping value
+//------------------------------------------------------------------------------
+// VIRTUAL ENVIRONMENT PARAMETERS
+//------------------------------------------------------------------------------
+// Number of magnetic spheres in the scene
+const int NUM_SPHERES = 3;
+// Radius of each sphere
+const double SPHERE_RADIUS = 0.007;
+// Physics parameters
+const double SPHERE_STIFFNESS = 1000.0;        // Stiffness of spheres
+const double SPHERE_MASS = 0.04;               // Mass of spheres
+const double K_DAMPING = 0.996;                // Damping coefficient
+const double K_MAGNET = 500.0;                 // Magnetic force coefficient
+const double HAPTIC_STIFFNESS = 500.0;         // Haptic stiffness
+// Virtual wall positions
+const double WALL_GROUND = 0.0 + SPHERE_RADIUS;
+const double WALL_LEFT = -0.1;
+const double WALL_RIGHT = 0.2;
+const double WALL_FRONT = 0.08;
+const double WALL_BACK = -0.08;
+// Camera parameters
+const double CAMERA_POSITION_X = 0.20;
+const double CAMERA_POSITION_Y = 0.00;
+const double CAMERA_POSITION_Z = 0.10;
+const double CAMERA_LOOKAT_X = 0.00;
+const double CAMERA_LOOKAT_Y = 0.00;
+const double CAMERA_LOOKAT_Z = 0.05;
+const double CAMERA_UP_X = 0.00;
+const double CAMERA_UP_Y = 0.00;
+const double CAMERA_UP_Z = 1.00;
+// Light parameters
+const double LIGHT_POSITION_X = 0.0;
+const double LIGHT_POSITION_Y = 0.3;
+const double LIGHT_POSITION_Z = 0.4;
+const double LIGHT_DIRECTION_X = 0.0;
+const double LIGHT_DIRECTION_Y = -0.25;
+const double LIGHT_DIRECTION_Z = -0.4;
+const double SHADOW_INTENSITY = 0.3;
+const int LIGHT_CONE_ANGLE = 30;
+//------------------------------------------------------------------------------
+// GUI SETTINGS
+//------------------------------------------------------------------------------
+// Default GUI size
+const double WINDOW_WIDTH_RATIO = 0.8;
+const double WINDOW_HEIGHT_RATIO = 0.5;
+// Analytics window settings
+const int ANALYTICS_WINDOW_WIDTH = 800;       // Analytics window width
+const int ANALYTICS_WINDOW_HEIGHT = 600;      // Analytics window height
+const int GRAPH_MARGIN = 50;                  // Margin around graphs
+const int GRAPH_HEIGHT = 120;                 // Height of each graph
+// Refresh rates
+const int DEFAULT_SWAP_INTERVAL = 1;           // Vertical sync (1=enabled, 0=disabled)
+//==============================================================================
+// GLOBAL VARIABLES AND DATA STRUCTURES
+//==============================================================================
+//------------------------------------------------------------------------------
+// NETWORK VARIABLES
+//------------------------------------------------------------------------------
+// Network communication threads
+std::thread* sendNetworkThread = nullptr;
+std::thread* receiveNetworkThread = nullptr;
+std::atomic<bool> networkRunning(true);
+SOCKET sendSocket = INVALID_SOCKET;
+SOCKET receiveSocket = INVALID_SOCKET;
+std::mutex socketMutex;
+// Statistics for network communication
+std::atomic<int> packetsSent(0);
+std::atomic<int> packetsReceived(0);
+int packetNumber = 0;
+// Recent packet logging
+std::deque<std::string> sentPacketLogs;
+std::deque<std::string> receivedPacketLogs;
+std::mutex logMutex;
+//------------------------------------------------------------------------------
+// PACKET STRUCTURES
+//------------------------------------------------------------------------------
+// Client packet structure (sent to server)
+struct ClientPacket {
+    int packetNumber;
+    float x, y, z;                // Position data
+    float delay;                  // Delay information in ms
+    char timestamp[64];           // Timestamp for synchronization
+    char srcIP[16];               // Source IP address
+    char dstIP[16];               // Destination IP address
+    int srcPort;                  // Source port
+    int dstPort;                  // Destination port
+};
+// Feedback packet structure (received from server)
+struct FeedbackPacket {
+    int packetNumber;             // Matching packet number from client
+    float fx, fy, fz;             // Force feedback
+    float px, py, pz;             // Actual position on server
+    float positionError;          // Error between commanded and actual position
+    float latency;                // Estimated latency in ms
+    char timestamp[64];           // Timestamp for synchronization
+};
+//------------------------------------------------------------------------------
+// FEEDBACK BUFFER AND CONTROL VARIABLES
+//------------------------------------------------------------------------------
+// Feedback buffer for adaptive feedback control
+std::deque<FeedbackPacket> feedbackBuffer;
+std::mutex feedbackMutex;
+// History for graphs
+std::vector<float> positionHistory[3];  // X, Y, Z
+std::vector<float> forceHistory[3];     // X, Y, Z
+std::vector<float> latencyHistory;
+std::vector<float> errorHistory;
+// Current feedback values (these are the actually applied values)
+float currentForce[3] = { 0.0f, 0.0f, 0.0f };
+float targetPosition[3] = { 0.0f, 0.0f, 0.0f };
+float positionError = 0.0f;
+float averageLatency = 0.0f;
+// Current device position (for visualization)
+cVector3d devicePosition;
+std::mutex devicePositionMutex;
+// Packet counting for adaptive feedback
+int feedbackPacketCounter = 0;    // Counter for received feedback packets
+bool feedbackUpdateReady = false; // Flag to indicate when it's time to update feedback
+// Min/Max tracking for analytics
+float minPositionX = std::numeric_limits<float>::max();
+float maxPositionX = std::numeric_limits<float>::lowest();
+float minPositionY = std::numeric_limits<float>::max();
+float maxPositionY = std::numeric_limits<float>::lowest();
+float minPositionZ = std::numeric_limits<float>::max();
+float maxPositionZ = std::numeric_limits<float>::lowest();
+float minForceX = std::numeric_limits<float>::max();
+float maxForceX = std::numeric_limits<float>::lowest();
+float minForceY = std::numeric_limits<float>::max();
+float maxForceY = std::numeric_limits<float>::lowest();
+float minForceZ = std::numeric_limits<float>::max();
+float maxForceZ = std::numeric_limits<float>::lowest();
+float minLatency = std::numeric_limits<float>::max();
+float maxLatency = std::numeric_limits<float>::lowest();
+float minError = std::numeric_limits<float>::max();
+float maxError = std::numeric_limits<float>::lowest();
+// Feedback control
+enum FeedbackType {
+    FEEDBACK_POSITION = 0,
+    FEEDBACK_FORCE = 1,
+    FEEDBACK_STIFFNESS_DAMPING = 2
+};
+FeedbackType currentFeedbackType = FEEDBACK_POSITION;
+bool feedbackEnabled = true;
+double stiffnessValue = DEFAULT_STIFFNESS;
+double dampingValue = DEFAULT_DAMPING;
+// Device cursor representation
+cShapeSphere* deviceCursor = nullptr;
+//------------------------------------------------------------------------------
+// VISUALIZATION AND GUI VARIABLES
+//------------------------------------------------------------------------------
+// CHAI3D visualization state
+cStereoMode stereoMode = C_STEREO_DISABLED;
+bool fullscreen = false;
+bool mirroredDisplay = false;
+bool showConsoleAnalytics = false;
+int analyticsWindowId = -1;       // GLUT window ID for analytics
+int mainWindowId = -1;            // GLUT window ID for main window
+// CHAI3D world objects
+cWorld* world;
+cCamera* camera;
+cSpotLight* light;
+cHapticDeviceHandler* handler;
+cGenericHapticDevicePtr hapticDevice;
+double hapticDeviceMaxStiffness;
+cShapeSphere* spheres[NUM_SPHERES];
+cVector3d sphereVel[NUM_SPHERES];
+cBackground* background;
+cFontPtr font;
+cLabel* labelRates;
+cLabel* labelMessage;
+// Simulation control
+bool simulationRunning = false;
+bool simulationFinished = true;
+cFrequencyCounter freqCounterGraphics;
+cFrequencyCounter freqCounterHaptics;
+cThread* hapticsThread;
+// Window variables
+GLFWwindow* window = NULL;
+int width = 0;
+int height = 0;
+int swapInterval = DEFAULT_SWAP_INTERVAL;
+// Analytics specific
+enum AnalyticsTab {
+    TAB_POSITION = 0,
+    TAB_FORCE = 1,
+    TAB_NETWORK = 2,
+    TAB_PERFORMANCE = 3
+};
+AnalyticsTab currentTab = TAB_POSITION;
+// Resource path
+string resourceRoot;
+// Convert to resource path
+#define RESOURCE_PATH(p)    (char*)((resourceRoot+string(p)).c_str())
+//==============================================================================
+// FORWARD DECLARATIONS
+//==============================================================================
+// Window callbacks
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
+void errorCallback(int error, const char* a_description);
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
+// GLUT callbacks for analytics window
+void initAnalyticsWindow();
+void reshapeAnalyticsWindow(int w, int h);
+void displayAnalyticsWindow();
+void keyboardAnalyticsWindow(unsigned char key, int x, int y);
+void idleAnalyticsWindow();
+void closeAnalyticsWindow();
+// Main loops
+void updateGraphics(void);
+void updateHaptics(void);
+// Network communication
+void sendNetworkThread_func(void);
+void receiveNetworkThread_func(void);
+void getLocalIP(char* ipBuffer);
+void getTimestamp(char* timestamp);
+bool initializeNetworkSockets();
+void closeNetworkSockets();
+void configureServerIP();
+// Feedback processing
+void processFeedbackPacket(const FeedbackPacket& packet);
+void updateActiveFeedback();
+void updateHapticForce(const cVector3d& force);
+void recordPacketStatistics(const FeedbackPacket& packet);
+// Utility functions
+float clampValue(float value, float min, float max);
+void clearBuffers();
+
+//==============================================================================
+// MAIN FUNCTION
+//==============================================================================
+int main(int argc, char* argv[])
+{
+    //--------------------------------------------------------------------------
+    // INITIALIZE CHAI3D
+    //--------------------------------------------------------------------------
+    // Initialize CHAI3D
+    cout << endl;
+    cout << "-----------------------------------" << endl;
+    cout << "ENHANCED HAPTIC TELEOPERATION CLIENT" << endl;
+    cout << "-----------------------------------" << endl;
+    cout << "Commands:" << endl << endl;
+    cout << "[1] - Change feedback mode (position, force, stiffness/damping)" << endl;
+    cout << "[2] - Toggle feedback (enabled/disabled)" << endl;
+    cout << "[c] - Configure server IP address" << endl;
+    cout << "[f] - Toggle fullscreen" << endl;
+    cout << "[m] - Toggle mirror display" << endl;
+    cout << "[q] - Exit application" << endl;
+    cout << endl << endl;
+
+    // Get the current working directory
+    resourceRoot = string(RESOURCE_PATH_STANDARD);
+
+    //--------------------------------------------------------------------------
+    // OPEN GL - WINDOW DISPLAY
+    //--------------------------------------------------------------------------
+    // Initialize GLFW library
+    if (!glfwInit())
+    {
+        cout << "Failed to initialize GLFW library" << endl;
+        return 1;
+    }
+
+    // Set error callback
+    glfwSetErrorCallback(errorCallback);
+
+    // Set OpenGL version
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+
+    // Set active stereo mode
+    if (stereoMode == C_STEREO_ACTIVE)
+    {
+        glfwWindowHint(GLFW_STEREO, GL_TRUE);
+    }
+    else
+    {
+        glfwWindowHint(GLFW_STEREO, GL_FALSE);
+    }
+
+    // Get primary monitor size
+    const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
+    int screenW = mode->width;
+    int screenH = mode->height;
+
+    // Set the window size
+    width = (int)(WINDOW_WIDTH_RATIO * screenW);
+    height = (int)(WINDOW_HEIGHT_RATIO * screenH);
+
+    // Create display context
+    window = glfwCreateWindow(width, height, "Haptic Teleoperation Client", NULL, NULL);
+    if (!window)
+    {
+        cout << "Failed to create window" << endl;
+        glfwTerminate();
+        return 1;
+    }
+
+    // Get the width and height of the frame buffer
+    glfwGetFramebufferSize(window, &width, &height);
+
+    // Set the window position
+    int windowPosX = (screenW - width) / 2;
+    int windowPosY = (screenH - height) / 2;
+    glfwSetWindowPos(window, windowPosX, windowPosY);
+
+    // Make the OpenGL context current
+    glfwMakeContextCurrent(window);
+
+    // Initialize GLEW
+    glewInit();
+
+    // Set keyboard callback
+    glfwSetKeyCallback(window, keyCallback);
+
+    // Set resize callback
+    glfwSetWindowSizeCallback(window, windowSizeCallback);
+
+    // Initialize GLUT for the analytics window
+    glutInit(&argc, argv);
+    initAnalyticsWindow();
+
+    // Set swap interval (vertical synchronization)
+    glfwSwapInterval(swapInterval);
+
+    //--------------------------------------------------------------------------
+    // WORLD - CAMERA - LIGHTING
+    //--------------------------------------------------------------------------
+
+    // Create a new world
+    world = new cWorld();
+
+    // Set background color
+    world->m_backgroundColor.setWhite();
+
+    // Create a camera and insert it into the virtual world
+    camera = new cCamera(world);
+    world->addChild(camera);
+
+    // Position and orient the camera
+    camera->set(cVector3d(CAMERA_POSITION_X, CAMERA_POSITION_Y, CAMERA_POSITION_Z),    // Position
+        cVector3d(CAMERA_LOOKAT_X, CAMERA_LOOKAT_Y, CAMERA_LOOKAT_Z),    // Look at
+        cVector3d(CAMERA_UP_X, CAMERA_UP_Y, CAMERA_UP_Z));   // Up direction
+
+    // Set the near and far clipping planes of the camera
+    camera->setClippingPlanes(0.01, 10.0);
+
+    // Set stereo mode
+    camera->setStereoMode(stereoMode);
+
+    // Set stereo eye separation and focal length
+    camera->setStereoEyeSeparation(0.005);
+    camera->setStereoFocalLength(0.5);
+
+    // Set vertical mirrored display mode
+    camera->setMirrorVertical(mirroredDisplay);
+
+    // Enable multi-pass rendering to handle transparent objects
+    camera->setUseMultipassTransparency(true);
+
+    // Create a light source and attach it to the camera
+    light = new cSpotLight(world);
+    camera->addChild(light);
+
+    // Define the light direction in the camera coordinate system
+    light->setLocalPos(cVector3d(LIGHT_POSITION_X, LIGHT_POSITION_Y, LIGHT_POSITION_Z));
+    light->setDir(cVector3d(LIGHT_DIRECTION_X, LIGHT_DIRECTION_Y, LIGHT_DIRECTION_Z));
+
+    // Enable light source
+    light->setEnabled(true);
+
+    // Set light cone half angle
+    light->setCutOffAngleDeg(LIGHT_CONE_ANGLE);
+
+    // Create a background
+    background = new cBackground();
+    camera->m_backLayer->addChild(background);
+
+    // Create a font
+    font = NEW_CFONTCALIBRI20();
+
+    // Create a label to display the haptic and graphic rate of the simulation
+    labelRates = new cLabel(font);
+    camera->m_frontLayer->addChild(labelRates);
+
+    // Create a label to display information about the client
+    labelMessage = new cLabel(font);
+    camera->m_frontLayer->addChild(labelMessage);
+    labelMessage->m_fontColor.setBlack();
+
+    //--------------------------------------------------------------------------
+    // HAPTIC DEVICE
+    //--------------------------------------------------------------------------
+    // Create a handler
+    handler = new cHapticDeviceHandler();
+
+    // Get the first haptic device
+    handler->getDevice(hapticDevice, 0);
+
+    // Retrieve information about the haptic device
+    if (hapticDevice)
+    {
+        // Get the specifications of the haptic device
+        hapticDeviceMaxStiffness = hapticDevice->getSpecifications().m_maxLinearStiffness;
+
+        // Display a message about the haptic device
+        cout << "Haptic device available: " << hapticDevice->getSpecifications().m_modelName << endl;
+    }
+    else
+    {
+        // No haptic device found, create a simulated position for demonstration
+        cout << "No haptic device found. Using simulated position data." << endl;
+        devicePosition.set(0.0, 0.0, 0.0);
+    }
+
+    //--------------------------------------------------------------------------
+    // MAGNETIC SCENE OBJECTS
+    //--------------------------------------------------------------------------
+    // Create magnetic spheres
+    for (int i = 0; i < NUM_SPHERES; i++)
+    {
+        // Create sphere
+        spheres[i] = new cShapeSphere(SPHERE_RADIUS);
+        world->addChild(spheres[i]);
+
+        // Initialize velocity
+        sphereVel[i].zero();
+
+        // Set random initial position
+        double x = 0.04 * (((double)rand() / RAND_MAX) * 2.0 - 1.0);
+        double y = 0.04 * (((double)rand() / RAND_MAX) * 2.0 - 1.0);
+        double z = 0.04 * ((double)rand() / RAND_MAX);
+        spheres[i]->setLocalPos(x, y, z);
+
+        // Set color based on sphere index
+        if (i == 0) spheres[i]->m_material->setRedCrimson();
+        else if (i == 1) spheres[i]->m_material->setBlueCornflower();
+        else spheres[i]->m_material->setGreenForest();
+
+        // Set physical properties
+        spheres[i]->m_material->setStiffness(SPHERE_STIFFNESS);
+    }
+
+    //--------------------------------------------------------------------------
+    // HAPTIC CURSOR
+    //--------------------------------------------------------------------------
+    // Create a sphere for haptic device cursor
+    deviceCursor = new cShapeSphere(0.01);
+    world->addChild(deviceCursor);
+    deviceCursor->m_material->setRedIndian();
+
+    //--------------------------------------------------------------------------
+    // INITIALIZE NETWORKING
+    //--------------------------------------------------------------------------
+    // Get the local IP address of this machine
+    getLocalIP(SRC_IP);
+    cout << "Local IP address: " << SRC_IP << endl;
+
+    // Allow the user to configure the server IP
+    configureServerIP();
+
+    // Initialize the sockets for network communication
+    if (!initializeNetworkSockets()) {
+        cout << "Failed to initialize network sockets. Exiting." << endl;
+        return 1;
+    }
+
+    // Start the network threads for sending/receiving
+    sendNetworkThread = new std::thread(sendNetworkThread_func);
+    receiveNetworkThread = new std::thread(receiveNetworkThread_func);
+
+    //--------------------------------------------------------------------------
+    // START HAPTICS LOOP
+    //--------------------------------------------------------------------------
+    // Create a thread which starts the haptic rendering loop
+    hapticsThread = new cThread();
+    hapticsThread->start(updateHaptics, CTHREAD_PRIORITY_HAPTICS);
+
+    // Start the main graphics rendering loop
+    simulationRunning = true;
+    simulationFinished = false;
+
+    // Rendering loop
+    while (!simulationFinished)
+    {
+        // Update the graphical scene
+        updateGraphics();
+
+        // Swap buffers
+        glfwSwapBuffers(window);
+
+        // Process events
+        glfwPollEvents();
+
+        // Check if the window should be closed
+        if (glfwWindowShouldClose(window))
+        {
+            simulationFinished = true;
+        }
+
+        // Check if a key was pressed in the console window
+        if (_kbhit())
+        {
+            int key = _getch();
+            if (key == '1')
+            {
+                // Change feedback type
+                currentFeedbackType = (FeedbackType)(((int)currentFeedbackType + 1) % 3);
+                if (currentFeedbackType == FEEDBACK_POSITION)
+                    cout << "Feedback mode: POSITION control" << endl;
+                else if (currentFeedbackType == FEEDBACK_FORCE)
+                    cout << "Feedback mode: FORCE control" << endl;
+                else
+                    cout << "Feedback mode: STIFFNESS/DAMPING control" << endl;
+            }
+            else if (key == '2')
+            {
+                // Toggle feedback
+                feedbackEnabled = !feedbackEnabled;
+                cout << "Feedback " << (feedbackEnabled ? "enabled" : "disabled") << endl;
+            }
+            else if (key == 'c' || key == 'C')
+            {
+                // Configure server IP
+                configureServerIP();
+            }
+            else if (key == 'q' || key == 'Q')
+            {
+                // Exit application
+                simulationFinished = true;
+            }
+        }
+
+        // Sleep for a short interval to reduce CPU usage
+        this_thread::sleep_for(chrono::milliseconds(1));
+    }
+
+    //--------------------------------------------------------------------------
+    // CLEANUP
+    //--------------------------------------------------------------------------
+    // Close the haptic loop
+    simulationRunning = false;
+
+    // Wait for the haptic loop to terminate
+    // Note: we don't use getExitFlag() since it's not available in this version of CHAI3D
+    // Instead we'll wait a short time to allow the thread to terminate
+    this_thread::sleep_for(chrono::milliseconds(500));
+
+    // Stop the network threads
+    networkRunning = false;
+    if (sendNetworkThread && sendNetworkThread->joinable()) {
+        sendNetworkThread->join();
+        delete sendNetworkThread;
+        sendNetworkThread = nullptr;
+    }
+    if (receiveNetworkThread && receiveNetworkThread->joinable()) {
+        receiveNetworkThread->join();
+        delete receiveNetworkThread;
+        receiveNetworkThread = nullptr;
+    }
+
+    // Close the sockets
+    closeNetworkSockets();
+
+    // Delete resources
+    delete hapticsThread;
+    delete world;
+    delete handler;
+
+    // Close the GLFW window
+    glfwDestroyWindow(window);
+
+    // Terminate GLFW library
+    glfwTerminate();
+
+    // Exit
+    return 0;
+}
+
+//==============================================================================
+// GRAPHICS LOOP
+//==============================================================================
+void updateGraphics(void)
+{
+    // Update the graphical rendering frequency
+    freqCounterGraphics.signal(1);
+
+    // Render world
+    camera->renderView(width, height);
+
+    // Average haptic force from feedback
+    cVector3d force(currentForce[0], currentForce[1], currentForce[2]);
+    double forceMagnitude = force.length();
+
+    // Update displayed information
+    labelRates->setText(cStr(freqCounterGraphics.getFrequency(), 0) + " Hz / " +
+        cStr(freqCounterHaptics.getFrequency(), 0) + " Hz");
+    labelRates->setLocalPos((int)(0.5 * (width - labelRates->getWidth())), 15);
+
+    // Display connection and mode information
+    string message = "Connected to server: " + string(SERVER_IP) + ":" + to_string(PORT) + "\n";
+    message += "Feedback: " + string(feedbackEnabled ? "Enabled" : "Disabled") + " | ";
+    message += "Mode: ";
+    if (currentFeedbackType == FEEDBACK_POSITION)
+        message += "POSITION";
+    else if (currentFeedbackType == FEEDBACK_FORCE)
+        message += "FORCE";
+    else
+        message += "STIFFNESS/DAMPING";
+    message += "\nLatency: " + cStr(averageLatency, 1) + " ms | ";
+    message += "Error: " + cStr(positionError * 1000.0, 1) + " mm | ";
+    message += "Force: " + cStr(forceMagnitude, 1) + " N";
+
+    // Display the message with larger font
+    labelMessage->setText(message);
+    labelMessage->setLocalPos((int)(0.5 * (width - labelMessage->getWidth())), height - 70);
+
+    // Update position of haptic device cursor
+    std::lock_guard<std::mutex> lock(devicePositionMutex);
+    deviceCursor->setLocalPos(devicePosition);
+}
+
+//==============================================================================
+// HAPTICS LOOP
+//==============================================================================
+void updateHaptics(void)
+{
+    // Simulation clock initialization
+    cPrecisionClock clock;
+    clock.reset();
+
+    // Haptic simulation loop
+    while (simulationRunning)
+    {
+        // Update the haptic rendering frequency
+        freqCounterHaptics.signal(1);
+
+        // Start the timer for the current haptic frame
+        clock.start();
+
+        // Read position from haptic device
+        cVector3d position;
+        if (hapticDevice)
+        {
+            // Read from the actual haptic device
+            hapticDevice->getPosition(position);
+        }
+        else
+        {
+            // For simulation, use the last known position
+            position = devicePosition;
+
+            // Add some simulated movement (for demonstration when no device is present)
+            double time = clock.getCurrentTimeSeconds();
+            position.x(0.03 * sin(0.5 * time));
+            position.y(0.03 * cos(0.7 * time));
+            position.z(0.03 + 0.01 * sin(0.9 * time));
+        }
+
+        // Update the device position for visualization
+        {
+            std::lock_guard<std::mutex> lock(devicePositionMutex);
+            devicePosition = position;
+        }
+
+        // Apply feedback forces to the haptic device if enabled
+        if (feedbackEnabled && hapticDevice)
+        {
+            // Create a force vector
+            cVector3d force(currentForce[0], currentForce[1], currentForce[2]);
+
+            // Apply the force based on the feedback type
+            if (currentFeedbackType == FEEDBACK_POSITION)
+            {
+                // Position control - compute force using stiffness and damping
+                cVector3d targetPos(targetPosition[0], targetPosition[1], targetPosition[2]);
+                cVector3d deltaPos = targetPos - position;
+
+                // Read velocity
+                cVector3d velocity;
+                hapticDevice->getLinearVelocity(velocity);
+
+                // Compute force with stiffness and damping
+                force = (stiffnessValue * deltaPos) - (dampingValue * velocity);
+
+                // Clamp the force
+                double forceMagnitude = force.length();
+                if (forceMagnitude > MAX_STIFFNESS)
+                {
+                    force *= (MAX_STIFFNESS / forceMagnitude);
+                }
+            }
+
+            // Apply the force to the haptic device
+            hapticDevice->setForce(force);
+        }
+        else if (hapticDevice)
+        {
+            // If feedback is disabled, set zero force
+            hapticDevice->setForce(cVector3d(0.0, 0.0, 0.0));
+        }
+
+        // Signal graphic update if analytics window is showing
+        if (showConsoleAnalytics && analyticsWindowId != -1)
+        {
+            glutPostWindowRedisplay(analyticsWindowId);
+        }
+
+        // Wait until the next haptic frame
+        clock.stop();
+        double timeSpent = clock.getCurrentTimeSeconds();
+        double timeToWait = 1.0 / HAPTIC_RATE_HZ - timeSpent;
+        if (timeToWait > 0.0)
+        {
+            // Sleep for milliseconds
+            std::this_thread::sleep_for(std::chrono::microseconds((int)(timeToWait * 1000000.0)));
+        }
+    }
+}
+
+//==============================================================================
+// NETWORK COMMUNICATION
+//==============================================================================
+void sendNetworkThread_func(void)
+{
+    // Initialize random number generator
+    srand((unsigned int)time(NULL));
+
+    // Initialize sockaddr_in structure
+    struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PORT);
+
+    // Convert the server IP string to numeric format
+    inet_pton(AF_INET, SERVER_IP, &(serverAddr.sin_addr));
+
+    // Create a buffer for the packet
+    char packetBuffer[BUFFER_SIZE];
+
+    // Timing control for consistent packet rate
+    auto previousTime = std::chrono::high_resolution_clock::now();
+    const int sendIntervalMs = 1000 / HAPTIC_RATE_HZ;
+
+    // Loop until signaled to stop
+    while (networkRunning)
+    {
+        // Create a packet with the current device position
+        ClientPacket packet;
+        packet.packetNumber = ++packetNumber;
+
+        // Get current position
+        {
+            std::lock_guard<std::mutex> lock(devicePositionMutex);
+            packet.x = (float)devicePosition.x();
+            packet.y = (float)devicePosition.y();
+            packet.z = (float)devicePosition.z();
+        }
+
+        // Add other packet information
+        packet.delay = 0.0f;
+        strcpy(packet.srcIP, SRC_IP);
+        strcpy(packet.dstIP, SERVER_IP);
+        packet.srcPort = PORT;
+        packet.dstPort = PORT;
+
+        // Add timestamp
+        getTimestamp(packet.timestamp);
+
+        // Copy packet to buffer
+        memcpy(packetBuffer, &packet, sizeof(ClientPacket));
+
+        // Send packet to server
+        {
+            std::lock_guard<std::mutex> lock(socketMutex);
+            if (sendSocket != INVALID_SOCKET)
+            {
+                // Send data directly (non-binding method)
+                int result = sendto(sendSocket, packetBuffer, sizeof(ClientPacket), 0,
+                    (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+
+                if (result != SOCKET_ERROR)
+                {
+                    // Increment sent packet counter
+                    packetsSent++;
+
+                    // Log packet information
+                    if (packetsSent % 100 == 0)
+                    {
+                        std::stringstream logStream;
+                        logStream << "SENT #" << packet.packetNumber << " ["
+                            << packet.x << ", " << packet.y << ", " << packet.z
+                            << "] -> " << packet.dstIP << ":" << packet.dstPort;
+
+                        // Add to sent log queue
+                        {
+                            std::lock_guard<std::mutex> logLock(logMutex);
+                            sentPacketLogs.push_front(logStream.str());
+                            if (sentPacketLogs.size() > CONSOLE_LOG_PACKETS)
+                                sentPacketLogs.pop_back();
+                        }
+                    }
+                }
+                else {
+                    // Log error
+                    cout << "Send error: " << WSAGetLastError() << endl;
+                }
+            }
+        }
+
+        // Calculate time to wait for next packet send (for consistent rate)
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            currentTime - previousTime).count();
+        if (elapsedMs < sendIntervalMs)
+        {
+            // Sleep for the remaining time
+            std::this_thread::sleep_for(std::chrono::milliseconds(sendIntervalMs - elapsedMs));
+        }
+
+        // Update previous time
+        previousTime = std::chrono::high_resolution_clock::now();
+    }
+}
+
+void receiveNetworkThread_func(void)
+{
+    // Create a buffer for receiving packets
+    char packetBuffer[BUFFER_SIZE];
+
+    // Client address information for recvfrom
+    struct sockaddr_in clientAddr;
+    int clientAddrLen = sizeof(clientAddr);
+
+    // Loop until signaled to stop
+    while (networkRunning)
+    {
+        // Receive packet (this will block until data arrives)
+        int bytesReceived = 0;
+        {
+            std::lock_guard<std::mutex> lock(socketMutex);
+            if (receiveSocket != INVALID_SOCKET) {
+                bytesReceived = recvfrom(receiveSocket, packetBuffer, BUFFER_SIZE, 0,
+                    (struct sockaddr*)&clientAddr, &clientAddrLen);
+            }
+        }
+
+        // Process the packet if valid
+        if (bytesReceived == sizeof(FeedbackPacket))
+        {
+            // Convert buffer to feedback packet
+            FeedbackPacket* packet = (FeedbackPacket*)packetBuffer;
+
+            // Increment received packet counter
+            packetsReceived++;
+
+            // Log packet information
+            if (packetsReceived % 100 == 0)
+            {
+                std::stringstream logStream;
+                char clientIP[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(clientAddr.sin_addr), clientIP, INET_ADDRSTRLEN);
+
+                logStream << "RECEIVED #" << packet->packetNumber << " ["
+                    << packet->fx << ", " << packet->fy << ", " << packet->fz
+                    << "] <- " << clientIP << ":" << ntohs(clientAddr.sin_port)
+                    << " (error: " << packet->positionError << "mm, latency: "
+                    << packet->latency << "ms)";
+
+                // Add to received log queue
+                {
+                    std::lock_guard<std::mutex> logLock(logMutex);
+                    receivedPacketLogs.push_front(logStream.str());
+                    if (receivedPacketLogs.size() > CONSOLE_LOG_PACKETS)
+                        receivedPacketLogs.pop_back();
+                }
+            }
+
+            // Process the feedback packet (update forces, position targets, etc.)
+            processFeedbackPacket(*packet);
+
+            // Increment the feedback counter for adaptive feedback
+            feedbackPacketCounter++;
+
+            // Check if it's time to update the active feedback (every PACKET_UTILIZATION_INTERVAL)
+            if (feedbackPacketCounter >= PACKET_UTILIZATION_INTERVAL)
+            {
+                feedbackUpdateReady = true;
+                updateActiveFeedback();
+                feedbackPacketCounter = 0;
+            }
+        }
+        else if (bytesReceived <= 0)
+        {
+            // Error or connection closed, add a short delay to avoid spinning
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+}
+
+void getLocalIP(char* ipBuffer)
+{
+    // Default to loopback address
+    strcpy(ipBuffer, "127.0.0.1");
+
+    // Windows-specific code for getting local IP
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        return;
+    }
+
+    char hostName[256];
+    if (gethostname(hostName, sizeof(hostName)) == 0) {
+        struct hostent* host = gethostbyname(hostName);
+        if (host != nullptr) {
+            struct in_addr addr;
+            memcpy(&addr, host->h_addr_list[0], sizeof(struct in_addr));
+            strcpy(ipBuffer, inet_ntoa(addr));
+        }
+    }
+}
+
+void getTimestamp(char* timestamp)
+{
+    // Get current time
+    auto now = std::chrono::system_clock::now();
+    auto now_c = std::chrono::system_clock::to_time_t(now);
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+
+    // Convert to tm struct
+    struct tm timeInfo;
+    localtime_s(&timeInfo, &now_c);
+
+    // Format the timestamp string
+    sprintf(timestamp, "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+        timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+        timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec, (int)now_ms.count());
+}
+
+bool initializeNetworkSockets()
+{
+    // Initialize Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        cout << "WSAStartup failed with error: " << WSAGetLastError() << endl;
+        return false;
+    }
+
+    // Create the send socket
+    sendSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sendSocket == INVALID_SOCKET) {
+        cout << "Error creating send socket" << endl;
+        return false;
+    }
+
+    // Create the receive socket
+    receiveSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (receiveSocket == INVALID_SOCKET) {
+        cout << "Error creating receive socket" << endl;
+        return false;
+    }
+
+    // Set up the receive socket to bind to the specified port
+    struct sockaddr_in receiveAddr;
+    memset(&receiveAddr, 0, sizeof(receiveAddr));
+    receiveAddr.sin_family = AF_INET;
+    receiveAddr.sin_port = htons(PORT);
+    receiveAddr.sin_addr.s_addr = INADDR_ANY;
+
+    // Bind the receive socket
+    if (bind(receiveSocket, (struct sockaddr*)&receiveAddr, sizeof(receiveAddr)) == SOCKET_ERROR) {
+        cout << "Error binding receive socket: " << WSAGetLastError() << endl;
+        return false;
+    }
+
+    cout << "Network sockets initialized successfully" << endl;
+    return true;
+}
+
+void closeNetworkSockets()
+{
+    // Close the sockets
+    if (sendSocket != INVALID_SOCKET) {
+        closesocket(sendSocket);
+        sendSocket = INVALID_SOCKET;
+    }
+
+    if (receiveSocket != INVALID_SOCKET) {
+        closesocket(receiveSocket);
+        receiveSocket = INVALID_SOCKET;
+    }
+
+    // Cleanup Winsock
+    WSACleanup();
+
+    cout << "Network sockets closed" << endl;
+}
+
+void configureServerIP()
+{
+    cout << "Current server IP: " << SERVER_IP << endl;
+    cout << "Enter new server IP (or press ENTER to keep current): ";
+
+    char inputBuffer[64];
+    if (fgets(inputBuffer, sizeof(inputBuffer), stdin) != NULL) {
+        // Remove the newline character
+        size_t len = strlen(inputBuffer);
+        if (len > 0 && inputBuffer[len - 1] == '\n') {
+            inputBuffer[len - 1] = '\0';
+        }
+
+        // Update the server IP if not empty
+        if (strlen(inputBuffer) > 0) {
+            strcpy(SERVER_IP, inputBuffer);
+            cout << "Server IP updated to: " << SERVER_IP << endl;
+        }
+        else {
+            cout << "Keeping current server IP: " << SERVER_IP << endl;
+        }
+    }
+}
+
+//==============================================================================
+// FEEDBACK PROCESSING
+//==============================================================================
+void processFeedbackPacket(const FeedbackPacket& packet)
+{
+    // Add the packet to the feedback buffer
+    {
+        std::lock_guard<std::mutex> lock(feedbackMutex);
+        feedbackBuffer.push_back(packet);
+
+        // Limit the buffer size
+        while (feedbackBuffer.size() > MAX_HISTORY_SIZE) {
+            feedbackBuffer.pop_front();
+        }
+    }
+
+    // Record statistics for the packet
+    recordPacketStatistics(packet);
+}
+
+void updateActiveFeedback()
+{
+    // This is called when it's time to utilize packets for feedback (after PACKET_UTILIZATION_INTERVAL)
+    std::lock_guard<std::mutex> lock(feedbackMutex);
+
+    // Check if there are enough packets in the buffer
+    if (feedbackBuffer.size() < PACKETS_TO_UTILIZE) {
+        return;
+    }
+
+    // Take the most recent packets to utilize
+    std::vector<FeedbackPacket> activePackets;
+    for (int i = 0; i < PACKETS_TO_UTILIZE && i < feedbackBuffer.size(); i++) {
+        activePackets.push_back(feedbackBuffer[feedbackBuffer.size() - 1 - i]);
+    }
+
+    // Calculate averages for force and position
+    float avgForce[3] = { 0.0f, 0.0f, 0.0f };
+    float avgPosition[3] = { 0.0f, 0.0f, 0.0f };
+    float avgError = 0.0f;
+    float avgLatency = 0.0f;
+
+    for (const auto& pkt : activePackets) {
+        avgForce[0] += pkt.fx;
+        avgForce[1] += pkt.fy;
+        avgForce[2] += pkt.fz;
+
+        avgPosition[0] += pkt.px;
+        avgPosition[1] += pkt.py;
+        avgPosition[2] += pkt.pz;
+
+        avgError += pkt.positionError;
+        avgLatency += pkt.latency;
+    }
+
+    // Compute the averages
+    for (int i = 0; i < 3; i++) {
+        avgForce[i] /= PACKETS_TO_UTILIZE;
+        avgPosition[i] /= PACKETS_TO_UTILIZE;
+    }
+    avgError /= PACKETS_TO_UTILIZE;
+    avgLatency /= PACKETS_TO_UTILIZE;
+
+    // Update the current feedback values
+    for (int i = 0; i < 3; i++) {
+        currentForce[i] = avgForce[i];
+        targetPosition[i] = avgPosition[i];
+    }
+    positionError = avgError;
+    averageLatency = avgLatency;
+
+    // Apply force to the haptic device
+    updateHapticForce(cVector3d(currentForce[0], currentForce[1], currentForce[2]));
+
+    // Clear the feedback buffer after processing
+    feedbackBuffer.clear();
+}
+
+void updateHapticForce(const cVector3d& force)
+{
+    // This function applies the force to the haptic device
+    // The actual force application happens in the haptics loop
+
+    // Force is already stored in currentForce array, which the haptics loop uses
+}
+
+void recordPacketStatistics(const FeedbackPacket& packet)
+{
+    // Update the history vectors for graphs
+    {
+        std::lock_guard<std::mutex> lock(feedbackMutex);
+
+        // Position history
+        positionHistory[0].push_back(packet.px);
+        positionHistory[1].push_back(packet.py);
+        positionHistory[2].push_back(packet.pz);
+
+        // Force history
+        forceHistory[0].push_back(packet.fx);
+        forceHistory[1].push_back(packet.fy);
+        forceHistory[2].push_back(packet.fz);
+
+        // Latency and error history
+        latencyHistory.push_back(packet.latency);
+        errorHistory.push_back(packet.positionError);
+
+        // Limit the history size
+        while (positionHistory[0].size() > MAX_HISTORY_SIZE) {
+            for (int i = 0; i < 3; i++) {
+                positionHistory[i].erase(positionHistory[i].begin());
+                forceHistory[i].erase(forceHistory[i].begin());
+            }
+            latencyHistory.erase(latencyHistory.begin());
+            errorHistory.erase(errorHistory.begin());
+        }
+
+        // Update min/max values for position
+        minPositionX = std::min(minPositionX, packet.px);
+        maxPositionX = std::max(maxPositionX, packet.px);
+        minPositionY = std::min(minPositionY, packet.py);
+        maxPositionY = std::max(maxPositionY, packet.py);
+        minPositionZ = std::min(minPositionZ, packet.pz);
+        maxPositionZ = std::max(maxPositionZ, packet.pz);
+
+        // Update min/max values for force
+        minForceX = std::min(minForceX, packet.fx);
+        maxForceX = std::max(maxForceX, packet.fx);
+        minForceY = std::min(minForceY, packet.fy);
+        maxForceY = std::max(maxForceY, packet.fy);
+        minForceZ = std::min(minForceZ, packet.fz);
+        maxForceZ = std::max(maxForceZ, packet.fz);
+
+        // Update min/max values for latency and error
+        minLatency = std::min(minLatency, packet.latency);
+        maxLatency = std::max(maxLatency, packet.latency);
+        minError = std::min(minError, packet.positionError);
+        maxError = std::max(maxError, packet.positionError);
+    }
+}
+
+//==============================================================================
+// UTILITY FUNCTIONS
+//==============================================================================
+float clampValue(float value, float min, float max)
+{
+    return std::max(min, std::min(max, value));
+}
+
+void clearBuffers()
+{
+    std::lock_guard<std::mutex> lock(feedbackMutex);
+    feedbackBuffer.clear();
+
+    for (int i = 0; i < 3; i++) {
+        positionHistory[i].clear();
+        forceHistory[i].clear();
+    }
+
+    latencyHistory.clear();
+    errorHistory.clear();
+}
+
+//==============================================================================
+// WINDOW CALLBACKS
+//==============================================================================
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height)
+{
+    // Update the window size
+    width = a_width;
+    height = a_height;
+}
+
+void errorCallback(int error, const char* a_description)
+{
+    cout << "Error: " << a_description << endl;
+}
+
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods)
+{
+    // Handle key press
+    if (a_action == GLFW_PRESS)
+    {
+        // Option - Exit
+        if ((a_key == GLFW_KEY_ESCAPE) || (a_key == GLFW_KEY_Q))
+        {
+            glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+        }
+
+        // Option - Toggle fullscreen
+        else if (a_key == GLFW_KEY_F)
+        {
+            fullscreen = !fullscreen;
+            if (fullscreen)
+            {
+                glfwSetWindowMonitor(window, glfwGetPrimaryMonitor(), 0, 0,
+                    glfwGetVideoMode(glfwGetPrimaryMonitor())->width,
+                    glfwGetVideoMode(glfwGetPrimaryMonitor())->height,
+                    glfwGetVideoMode(glfwGetPrimaryMonitor())->refreshRate);
+            }
+            else
+            {
+                glfwSetWindowMonitor(window, NULL, 0, 0, width, height, 0);
+            }
+        }
+
+        // Option - Toggle mirror display
+        else if (a_key == GLFW_KEY_M)
+        {
+            mirroredDisplay = !mirroredDisplay;
+            camera->setMirrorVertical(mirroredDisplay);
+        }
+
+        // Option - Toggle analytics window
+        else if (a_key == GLFW_KEY_A)
+        {
+            showConsoleAnalytics = !showConsoleAnalytics;
+            if (showConsoleAnalytics)
+            {
+                if (analyticsWindowId == -1)
+                {
+                    initAnalyticsWindow();
+                }
+                glutSetWindow(analyticsWindowId);
+                glutShowWindow();
+            }
+            else if (analyticsWindowId != -1)
+            {
+                glutSetWindow(analyticsWindowId);
+                glutHideWindow();
+            }
+        }
+
+        // Option - Change feedback mode
+        else if (a_key == GLFW_KEY_1)
+        {
+            // Change feedback type
+            currentFeedbackType = (FeedbackType)(((int)currentFeedbackType + 1) % 3);
+            if (currentFeedbackType == FEEDBACK_POSITION)
+                cout << "Feedback mode: POSITION control" << endl;
+            else if (currentFeedbackType == FEEDBACK_FORCE)
+                cout << "Feedback mode: FORCE control" << endl;
+            else
+                cout << "Feedback mode: STIFFNESS/DAMPING control" << endl;
+        }
+
+        // Option - Toggle feedback
+        else if (a_key == GLFW_KEY_2)
+        {
+            // Toggle feedback
+            feedbackEnabled = !feedbackEnabled;
+            cout << "Feedback " << (feedbackEnabled ? "enabled" : "disabled") << endl;
+        }
+
+        // Option - Configure server IP
+        else if (a_key == GLFW_KEY_C)
+        {
+            // Configure server IP in console
+            configureServerIP();
+        }
+    }
+}
+
+//==============================================================================
+// ANALYTICS WINDOW GLUT CALLBACKS
+//==============================================================================
+void initAnalyticsWindow()
+{
+    // Create window
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(ANALYTICS_WINDOW_WIDTH, ANALYTICS_WINDOW_HEIGHT);
+    glutInitWindowPosition(50, 50);
+    analyticsWindowId = glutCreateWindow("Haptic Teleoperation Analytics");
+
+    // Set callbacks
+    glutDisplayFunc(displayAnalyticsWindow);
+    glutReshapeFunc(reshapeAnalyticsWindow);
+    glutKeyboardFunc(keyboardAnalyticsWindow);
+    glutIdleFunc(idleAnalyticsWindow);
+
+    // Initialize OpenGL state
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glLineWidth(2.0);
+
+    // Hide window initially
+    glutHideWindow();
+}
+
+void reshapeAnalyticsWindow(int w, int h)
+{
+    // Set viewport
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0.0, 1.0, 0.0, 1.0, -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+}
+
+// Utility function to draw text in analytics window
+void drawText(float x, float y, const char* text, const void* font = GLUT_BITMAP_HELVETICA_12)
+{
+    glRasterPos2f(x, y);
+    for (const char* c = text; *c != '\0'; c++) {
+        glutBitmapCharacter(font, *c);
+    }
+}
+
+// Utility function to draw a graph in the analytics window
+void drawGraph(float x, float y, float width, float height,
+    const std::vector<float>& data, float minValue, float maxValue,
+    float r, float g, float b, const char* label)
+{
+    // Draw border
+    glColor3f(0.0f, 0.0f, 0.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x, y);
+    glVertex2f(x + width, y);
+    glVertex2f(x + width, y + height);
+    glVertex2f(x, y + height);
+    glEnd();
+
+    // Draw label
+    drawText(x, y + height + 0.02f, label);
+
+    // Draw scale values
+    char buffer[64];
+    sprintf(buffer, "%.2f", maxValue);
+    drawText(x - 0.05f, y + height, buffer);
+    sprintf(buffer, "%.2f", minValue);
+    drawText(x - 0.05f, y, buffer);
+
+    // Draw data line
+    if (data.size() >= 2) {
+        glColor3f(r, g, b);
+        glBegin(GL_LINE_STRIP);
+
+        float valueRange = maxValue - minValue;
+        if (valueRange == 0.0f) valueRange = 1.0f;  // Avoid division by zero
+
+        for (size_t i = 0; i < data.size(); i++) {
+            float normalizedX = x + width * ((float)i / (data.size() - 1));
+            float normalizedY = y + height * ((data[i] - minValue) / valueRange);
+            glVertex2f(normalizedX, normalizedY);
+        }
+
+        glEnd();
+    }
+}
+
+void displayAnalyticsWindow()
+{
+    // Clear the window
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLoadIdentity();
+
+    // Draw title
+    glColor3f(0.0f, 0.0f, 0.0f);
+    drawText(0.02f, 0.96f, "Haptic Teleoperation Analytics", GLUT_BITMAP_HELVETICA_18);
+
+    // Draw connection info
+    char buffer[256];
+    sprintf(buffer, "Connection: %s:%d | Packets Sent: %d | Packets Received: %d",
+        SERVER_IP, PORT, packetsSent.load(), packetsReceived.load());
+    drawText(0.02f, 0.92f, buffer);
+
+    // Draw tabs
+    const char* tabNames[4] = { "Position", "Force", "Network", "Performance" };
+    float tabWidth = 0.23f;
+    float tabHeight = 0.04f;
+    float tabStartX = 0.02f;
+    float tabY = 0.86f;
+
+    for (int i = 0; i < 4; i++) {
+        float x = tabStartX + i * (tabWidth + 0.02f);
+
+        // Draw tab background (highlight if selected)
+        if (i == currentTab) {
+            glColor3f(0.8f, 0.8f, 1.0f);
+        }
+        else {
+            glColor3f(0.9f, 0.9f, 0.9f);
+        }
+
+        glBegin(GL_QUADS);
+        glVertex2f(x, tabY);
+        glVertex2f(x + tabWidth, tabY);
+        glVertex2f(x + tabWidth, tabY + tabHeight);
+        glVertex2f(x, tabY + tabHeight);
+        glEnd();
+
+        // Draw tab border
+        glColor3f(0.0f, 0.0f, 0.0f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(x, tabY);
+        glVertex2f(x + tabWidth, tabY);
+        glVertex2f(x + tabWidth, tabY + tabHeight);
+        glVertex2f(x, tabY + tabHeight);
+        glEnd();
+
+        // Draw tab name
+        glColor3f(0.0f, 0.0f, 0.0f);
+        float textX = x + (tabWidth - 0.008f * strlen(tabNames[i])) / 2.0f;
+        drawText(textX, tabY + 0.015f, tabNames[i]);
+    }
+
+    // Lock for data access
+    std::lock_guard<std::mutex> lock(feedbackMutex);
+
+    // Draw content based on selected tab
+    float graphStartY = 0.78f;
+    float graphHeight = 0.15f;
+    float graphWidth = 0.9f;
+    float graphMargin = 0.02f;
+
+    if (currentTab == TAB_POSITION) {
+        // Display position graphs (X, Y, Z)
+        drawGraph(0.05f, graphStartY, graphWidth, graphHeight,
+            positionHistory[0], minPositionX, maxPositionX,
+            1.0f, 0.0f, 0.0f, "Position X (meters)");
+
+        drawGraph(0.05f, graphStartY - graphHeight - graphMargin, graphWidth, graphHeight,
+            positionHistory[1], minPositionY, maxPositionY,
+            0.0f, 1.0f, 0.0f, "Position Y (meters)");
+
+        drawGraph(0.05f, graphStartY - 2 * (graphHeight + graphMargin), graphWidth, graphHeight,
+            positionHistory[2], minPositionZ, maxPositionZ,
+            0.0f, 0.0f, 1.0f, "Position Z (meters)");
+
+        // Display current position
+        sprintf(buffer, "Current Position: [%.4f, %.4f, %.4f] meters",
+            devicePosition.x(), devicePosition.y(), devicePosition.z());
+        drawText(0.05f, 0.1f, buffer);
+
+        // Display target position
+        sprintf(buffer, "Target Position: [%.4f, %.4f, %.4f] meters",
+            targetPosition[0], targetPosition[1], targetPosition[2]);
+        drawText(0.05f, 0.06f, buffer);
+    }
+    else if (currentTab == TAB_FORCE) {
+        // Display force graphs (X, Y, Z)
+        drawGraph(0.05f, graphStartY, graphWidth, graphHeight,
+            forceHistory[0], minForceX, maxForceX,
+            1.0f, 0.0f, 0.0f, "Force X (Newtons)");
+
+        drawGraph(0.05f, graphStartY - graphHeight - graphMargin, graphWidth, graphHeight,
+            forceHistory[1], minForceY, maxForceY,
+            0.0f, 1.0f, 0.0f, "Force Y (Newtons)");
+
+        drawGraph(0.05f, graphStartY - 2 * (graphHeight + graphMargin), graphWidth, graphHeight,
+            forceHistory[2], minForceZ, maxForceZ,
+            0.0f, 0.0f, 1.0f, "Force Z (Newtons)");
+
+        // Display current force
+        sprintf(buffer, "Current Force: [%.4f, %.4f, %.4f] Newtons",
+            currentForce[0], currentForce[1], currentForce[2]);
+        drawText(0.05f, 0.1f, buffer);
+
+        // Display force magnitude
+        float forceMagnitude = sqrt(
+            currentForce[0] * currentForce[0] +
+            currentForce[1] * currentForce[1] +
+            currentForce[2] * currentForce[2]);
+        sprintf(buffer, "Force Magnitude: %.4f Newtons", forceMagnitude);
+        drawText(0.05f, 0.06f, buffer);
+    }
+    else if (currentTab == TAB_NETWORK) {
+        // Display latency graph
+        drawGraph(0.05f, graphStartY, graphWidth, graphHeight,
+            latencyHistory, minLatency, maxLatency,
+            0.0f, 0.5f, 1.0f, "Network Latency (ms)");
+
+        // Display error graph
+        drawGraph(0.05f, graphStartY - graphHeight - graphMargin, graphWidth, graphHeight,
+            errorHistory, minError, maxError,
+            1.0f, 0.5f, 0.0f, "Position Error (mm)");
+
+        // Display packet send/receive rate
+        static auto lastRateTime = std::chrono::high_resolution_clock::now();
+        static int lastSent = 0;
+        static int lastReceived = 0;
+        static float sendRate = 0.0f;
+        static float receiveRate = 0.0f;
+
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float deltaTime = std::chrono::duration<float>(currentTime - lastRateTime).count();
+
+        if (deltaTime >= 1.0f) {
+            int currentSent = packetsSent.load();
+            int currentReceived = packetsReceived.load();
+
+            sendRate = (currentSent - lastSent) / deltaTime;
+            receiveRate = (currentReceived - lastReceived) / deltaTime;
+
+            lastSent = currentSent;
+            lastReceived = currentReceived;
+            lastRateTime = currentTime;
+        }
+
+        sprintf(buffer, "Send Rate: %.1f packets/sec | Receive Rate: %.1f packets/sec",
+            sendRate, receiveRate);
+        drawText(0.05f, 0.1f, buffer);
+
+        // Display network statistics
+        sprintf(buffer, "Average Latency: %.2f ms | Average Position Error: %.2f mm",
+            averageLatency, positionError * 1000.0f);
+        drawText(0.05f, 0.06f, buffer);
+    }
+    else if (currentTab == TAB_PERFORMANCE) {
+        // Display haptic and graphic rendering rates
+        sprintf(buffer, "Graphics Rate: %.1f Hz | Haptics Rate: %.1f Hz",
+            freqCounterGraphics.getFrequency(), freqCounterHaptics.getFrequency());
+        drawText(0.05f, graphStartY, buffer);
+
+        // Display feedback configuration
+        sprintf(buffer, "Feedback Mode: %s | Enabled: %s",
+            currentFeedbackType == FEEDBACK_POSITION ? "Position" :
+            (currentFeedbackType == FEEDBACK_FORCE ? "Force" : "Stiffness/Damping"),
+            feedbackEnabled ? "Yes" : "No");
+        drawText(0.05f, graphStartY - 0.05f, buffer);
+
+        // Display control parameters
+        sprintf(buffer, "Stiffness: %.1f | Damping: %.1f",
+            stiffnessValue, dampingValue);
+        drawText(0.05f, graphStartY - 0.1f, buffer);
+
+        // Display packet utilization parameters
+        sprintf(buffer, "Packet Utilization: %d packets every %d received",
+            PACKETS_TO_UTILIZE, PACKET_UTILIZATION_INTERVAL);
+        drawText(0.05f, graphStartY - 0.15f, buffer);
+
+        // Display buffer information
+        sprintf(buffer, "Feedback Buffer Size: %d / %d",
+            (int)feedbackBuffer.size(), MAX_HISTORY_SIZE);
+        drawText(0.05f, graphStartY - 0.2f, buffer);
+    }
+
+    // Display recent packet logs
+    float logY = 0.3f;
+    float logLineHeight = 0.017f;
+
+    drawText(0.02f, logY, "Recent Sent Packets:", GLUT_BITMAP_HELVETICA_12);
+    logY -= 0.03f;
+
+    {
+        std::lock_guard<std::mutex> logLock(logMutex);
+
+        for (const auto& log : sentPacketLogs) {
+            glColor3f(0.0f, 0.0f, 0.7f);
+            drawText(0.02f, logY, log.c_str(), GLUT_BITMAP_9_BY_15);
+            logY -= logLineHeight;
+        }
+
+        logY -= 0.01f;
+        glColor3f(0.0f, 0.0f, 0.0f);
+        drawText(0.02f, logY, "Recent Received Packets:", GLUT_BITMAP_HELVETICA_12);
+        logY -= 0.03f;
+
+        for (const auto& log : receivedPacketLogs) {
+            glColor3f(0.7f, 0.0f, 0.0f);
+            drawText(0.02f, logY, log.c_str(), GLUT_BITMAP_9_BY_15);
+            logY -= logLineHeight;
+        }
+    }
+
+    // Swap buffers
+    glutSwapBuffers();
+}
+
+void keyboardAnalyticsWindow(unsigned char key, int x, int y)
+{
+    // Handle keyboard input for analytics window
+    if (key == 27 || key == 'q' || key == 'Q') {  // ESC or Q
+        // Hide analytics window
+        glutHideWindow();
+        showConsoleAnalytics = false;
+    }
+    else if (key >= '1' && key <= '4') {
+        // Switch tabs
+        currentTab = (AnalyticsTab)(key - '1');
+        glutPostRedisplay();
+    }
+    else if (key == 'c' || key == 'C') {
+        // Clear statistics
+        std::lock_guard<std::mutex> lock(feedbackMutex);
+        clearBuffers();
+
+        // Reset min/max values
+        minPositionX = minPositionY = minPositionZ = std::numeric_limits<float>::max();
+        maxPositionX = maxPositionY = maxPositionZ = std::numeric_limits<float>::lowest();
+        minForceX = minForceY = minForceZ = std::numeric_limits<float>::max();
+        maxForceX = maxForceY = maxForceZ = std::numeric_limits<float>::lowest();
+        minLatency = minError = std::numeric_limits<float>::max();
+        maxLatency = maxError = std::numeric_limits<float>::lowest();
+
+        glutPostRedisplay();
+    }
+}
+
+void idleAnalyticsWindow()
+{
+    // Update analytics window if necessary
+    if (showConsoleAnalytics) {
+        glutPostRedisplay();
+    }
+}
+
+void closeAnalyticsWindow()
+{
+    // Close the analytics window
+    if (analyticsWindowId != -1) {
+        glutDestroyWindow(analyticsWindowId);
+        analyticsWindowId = -1;
+    }
+}
