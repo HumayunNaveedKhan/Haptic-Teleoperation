@@ -1,0 +1,297 @@
+//------------------------------------------------------------------------------
+// Simple Haptic Network Test
+// - Sends random position (x,y,z) to server
+// - Receives data back from server
+// - Displays all data on console
+//------------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <cstring>
+#include <ctime>
+#include <random>
+#include <thread>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <string>
+
+#pragma comment(lib, "ws2_32.lib")
+
+//------------------------------------------------------------------------------
+// NETWORK SETTINGS
+//------------------------------------------------------------------------------
+const char SERVER_IP[] = "169.254.213.206";  // Server IP
+const char CLIENT_IP[] = "169.254.50.63";    // Client IP
+const int PORT = 4000;                       // Port for both sending and receiving
+const int UPDATE_RATE_MS = 100;             // Send data every 1000ms (1 second)
+
+//------------------------------------------------------------------------------
+// PACKET STRUCTURES
+//------------------------------------------------------------------------------
+// Outgoing packet structure
+struct OutgoingPacket {
+    int packetNumber;
+    float x, y, z;
+    float delay;
+    char timestamp[64];
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int srcPort;
+    int dstPort;
+};
+
+// Incoming packet structure (adjust based on what your server actually sends)
+struct IncomingPacket {
+    int packetNumber;        // Must match outgoing packet number
+    double force[3];         // Force vector (x,y,z)
+    double position[3];      // Current device position
+    double error[3];         // Position error
+    double stiffness;        // Current stiffness value used (K)
+    double damping;          // Current damping value used (B)
+    bool isActive;           // Flag indicating if this is an "active" packet for feedback
+    char message[64];        // Message/status
+    char timestamp[64];      // Timestamp from server
+};
+
+//------------------------------------------------------------------------------
+// GLOBAL VARIABLES
+//------------------------------------------------------------------------------
+SOCKET sock = INVALID_SOCKET;
+int packetCount = 0;
+int successfulSends = 0;
+int successfulReceives = 0;
+int failedSends = 0;
+int failedReceives = 0;
+bool running = true;
+
+//------------------------------------------------------------------------------
+// FUNCTION PROTOTYPES
+//------------------------------------------------------------------------------
+void initializeWinsock();
+void setupSocket();
+void sendRandomPosition();
+void receiveData();
+void cleanupSocket();
+void getCurrentTimestamp(char* buffer, size_t size);
+void handleError(const std::string& message);
+
+//------------------------------------------------------------------------------
+// MAIN FUNCTION
+//------------------------------------------------------------------------------
+int main() {
+    // Seed random number generator
+    std::srand(static_cast<unsigned int>(std::time(nullptr)));
+
+    // Initialize Winsock
+    initializeWinsock();
+
+    // Set up socket
+    setupSocket();
+
+    std::cout << "===== Haptic Network Test =====" << std::endl;
+    std::cout << "Client IP: " << CLIENT_IP << std::endl;
+    std::cout << "Server IP: " << SERVER_IP << std::endl;
+    std::cout << "Port: " << PORT << std::endl;
+    std::cout << "Sending random position data to server..." << std::endl;
+    std::cout << "Press Ctrl+C to exit" << std::endl;
+    std::cout << "===============================" << std::endl << std::endl;
+
+    // Main loop
+    try {
+        while (running) {
+            // Send random position to server
+            sendRandomPosition();
+
+            // Receive data from server
+            receiveData();
+
+            // Display statistics
+            std::cout << "---------------------------" << std::endl;
+            std::cout << "Total packets: " << packetCount << std::endl;
+            std::cout << "Successful sends: " << successfulSends << " ("
+                << (packetCount > 0 ? (successfulSends * 100.0 / packetCount) : 0) << "%)" << std::endl;
+            std::cout << "Successful receives: " << successfulReceives << " ("
+                << (packetCount > 0 ? (successfulReceives * 100.0 / packetCount) : 0) << "%)" << std::endl;
+            std::cout << "---------------------------" << std::endl << std::endl;
+
+            // Wait for next update
+            std::this_thread::sleep_for(std::chrono::milliseconds(UPDATE_RATE_MS));
+        }
+    }
+    catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << std::endl;
+    }
+
+    // Clean up
+    cleanupSocket();
+
+    return 0;
+}
+
+//------------------------------------------------------------------------------
+// FUNCTION IMPLEMENTATIONS
+//------------------------------------------------------------------------------
+void initializeWinsock() {
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        handleError("WSAStartup failed with error: " + std::to_string(result));
+    }
+    std::cout << "Winsock initialized successfully" << std::endl;
+}
+
+void setupSocket() {
+    // Create socket
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        handleError("Socket creation failed with error: " + std::to_string(WSAGetLastError()));
+    }
+
+    // Bind socket to client IP and port
+    sockaddr_in clientAddr;
+    std::memset(&clientAddr, 0, sizeof(clientAddr));
+    clientAddr.sin_family = AF_INET;
+    clientAddr.sin_port = htons(PORT);
+    inet_pton(AF_INET, CLIENT_IP, &clientAddr.sin_addr);
+
+    int bindResult = bind(sock, (sockaddr*)&clientAddr, sizeof(clientAddr));
+    if (bindResult == SOCKET_ERROR) {
+        closesocket(sock);
+        handleError("Bind failed with error: " + std::to_string(WSAGetLastError()));
+    }
+
+    // Set socket timeout to avoid blocking forever
+    DWORD timeout = 1000; // 1 second
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+    std::cout << "Socket set up successfully and bound to " << CLIENT_IP << ":" << PORT << std::endl;
+}
+
+void sendRandomPosition() {
+    // Generate random position
+    float x = static_cast<float>(std::rand()) / RAND_MAX * 0.2f - 0.1f;  // Range: -0.1 to 0.1
+    float y = static_cast<float>(std::rand()) / RAND_MAX * 0.2f - 0.1f;  // Range: -0.1 to 0.1
+    float z = static_cast<float>(std::rand()) / RAND_MAX * 0.2f - 0.1f;  // Range: -0.1 to 0.1
+
+    // Prepare packet
+    OutgoingPacket packet;
+    std::memset(&packet, 0, sizeof(packet));
+
+    packet.packetNumber = ++packetCount;
+    packet.x = x;
+    packet.y = y;
+    packet.z = z;
+    packet.delay = static_cast<float>(UPDATE_RATE_MS);
+    getCurrentTimestamp(packet.timestamp, sizeof(packet.timestamp));
+    std::strcpy(packet.srcIP, CLIENT_IP);
+    std::strcpy(packet.dstIP, SERVER_IP);
+    packet.srcPort = PORT;
+    packet.dstPort = PORT;
+
+    // Set up server address
+    sockaddr_in serverAddr;
+    std::memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PORT);
+    inet_pton(AF_INET, SERVER_IP, &serverAddr.sin_addr);
+
+    // Send packet
+    int sendResult = sendto(sock, (char*)&packet, sizeof(packet), 0,
+        (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+    // Display sent data
+    std::cout << "SENT #" << packet.packetNumber << " | Position: ("
+        << std::fixed << std::setprecision(6) << x << ", "
+        << std::fixed << std::setprecision(6) << y << ", "
+        << std::fixed << std::setprecision(6) << z << ") | "
+        << packet.timestamp << std::endl;
+
+    if (sendResult == SOCKET_ERROR) {
+        std::cerr << "Send failed with error: " << WSAGetLastError() << std::endl;
+        failedSends++;
+    }
+    else {
+        successfulSends++;
+    }
+}
+
+void receiveData() {
+    // Buffer for incoming data
+    IncomingPacket packet;
+    sockaddr_in senderAddr;
+    int senderAddrSize = sizeof(senderAddr);
+
+    // Try to receive data
+    int recvResult = recvfrom(sock, (char*)&packet, sizeof(packet), 0,
+        (sockaddr*)&senderAddr, &senderAddrSize);
+
+    if (recvResult > 0) {
+        // Successfully received data
+        successfulReceives++;
+
+        // Get sender IP
+        char senderIP[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &senderAddr.sin_addr, senderIP, INET_ADDRSTRLEN);
+
+        // Display received data
+        std::cout << "RECEIVED #" << packet.packetNumber << " from " << senderIP
+            << ":" << ntohs(senderAddr.sin_port) << std::endl;
+
+        std::cout << "  Force: ("
+            << std::fixed << std::setprecision(6) << packet.force[0] << ", "
+            << std::fixed << std::setprecision(6) << packet.force[1] << ", "
+            << std::fixed << std::setprecision(6) << packet.force[2] << ")" << std::endl;
+
+        std::cout << "  Position: ("
+            << std::fixed << std::setprecision(6) << packet.position[0] << ", "
+            << std::fixed << std::setprecision(6) << packet.position[1] << ", "
+            << std::fixed << std::setprecision(6) << packet.position[2] << ")" << std::endl;
+
+        std::cout << "  Stiffness: " << packet.stiffness << ", Damping: " << packet.damping
+            << ", Active: " << (packet.isActive ? "Yes" : "No") << std::endl;
+
+        if (strlen(packet.message) > 0) {
+            std::cout << "  Message: " << packet.message << std::endl;
+        }
+
+        std::cout << "  Timestamp: " << packet.timestamp << std::endl;
+    }
+    else {
+        int error = WSAGetLastError();
+        if (error != WSAETIMEDOUT) {
+            // Only display real errors, not timeouts
+            std::cerr << "Receive failed with error: " << error << std::endl;
+        }
+        failedReceives++;
+    }
+}
+
+void cleanupSocket() {
+    // Close socket
+    if (sock != INVALID_SOCKET) {
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+
+    // Clean up Winsock
+    WSACleanup();
+
+    std::cout << "Socket closed and Winsock cleaned up" << std::endl;
+}
+
+void getCurrentTimestamp(char* buffer, size_t size) {
+    // Get current time
+    time_t now = time(0);
+    struct tm tstruct;
+    localtime_s(&tstruct, &now);
+
+    // Format time
+    strftime(buffer, size, "%Y-%m-%d %X", &tstruct);
+}
+
+void handleError(const std::string& message) {
+    throw std::runtime_error(message);
+}
