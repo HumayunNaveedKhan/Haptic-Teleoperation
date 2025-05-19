@@ -1,0 +1,2566 @@
+//------------------------------------------------------------------------------
+// Enhanced Haptic Teleoperation System with Adaptive Buffering - Windows Version
+// 
+// OVERVIEW:
+// - Receives position packets from client and applies to Force Dimension haptic device
+// - Implements adaptive buffering with a sliding window of last 100 packets
+// - Calculates network delay and jitter using timestamp-based analysis
+// - Continuously generates and sends feedback packets to client 
+// - Marks specific packets (every 5 after 3000) as "active" for feedback application
+// - Maintains high-frequency packet flow between client and server
+// 
+//
+// Port: 4000 for both receiving and sending
+//------------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN  // Exclude rarely-used stuff from Windows headers
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define NOMINMAX
+#include <windows.h>
+#include <winsock2.h>  // Include before windows.h if both are needed
+#include <ws2tcpip.h>  // For additional socket functions
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <ctime>
+#include <deque>
+#include <fstream>
+#include <GL/glut.h>
+#include <iostream>
+#include <iomanip>
+#include <mutex>
+#include <random>    // For random number generation
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#include <map>
+using namespace std;
+
+// Force Dimension haptic device libraries
+// Update these paths to match your system
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\sdk-3.17.1\include\dhdc.h>  // Force Dimension haptic device communication
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\sdk-3.17.1\include\drdc.h>  // Force Dimension robot kinematics
+
+#pragma comment(lib, "ws2_32.lib")
+// Force Dimension library linkage
+#pragma comment(lib, "dhdms64.lib")
+#pragma comment(lib, "drdms64.lib")
+
+//==============================================================================
+// ALL CONTROL PARAMETERS - Centralized at the top of the code
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// NETWORK CONFIGURATION
+//------------------------------------------------------------------------------
+// Network setup
+#define UDP_PORT 4000          // Port for both receiving and sending packets
+#define MAX_PACKET_SIZE 400    // Maximum UDP packet size
+#define MAX_BUFFER_SIZE 5000   // Buffer capacity for packet storage
+const char* SERVER_IP = "169.254.213.206";  // Server IP (0.0.0.0 = listen on all interfaces)
+const char* CLIENT_IP = "0.0.0.0";//"169.254.50.63"; // Default client IP (can be detected automatically)
+const int SOCKET_TIMEOUT_MS = 5000; // Socket timeout in milliseconds
+
+
+
+//------------------------------------------------------------------------------
+// ADAPTIVE BUFFERING CONFIGURATION
+//------------------------------------------------------------------------------
+const int SLIDING_WINDOW_SIZE = 100;   // Size of sliding window buffer for delay analysis
+const double JITTER_THRESHOLD_MS = 10.0; // Threshold to consider jitter significant
+const int PACKET_SEND_INTERVAL_US = 1000; // Feedback packet send interval (microseconds) = 1ms
+const int PACKET_UTILIZATION_INTERVAL = 3000; // Apply feedback every 5 packets after this many
+const int FEEDBACK_ACTIVE_PKTS = 3000;    // Number of consecutive packets marked as "active" for feedback
+
+//------------------------------------------------------------------------------
+// HAPTIC DEVICE CONFIGURATION
+//------------------------------------------------------------------------------
+double STIFFNESS_K = 100.0;    // Default stiffness for force feedback (N/m)
+double DAMPING_B = 20.0;       // Default damping coefficient (Ns/m)
+double MAX_FORCE = 5.0;        // Maximum force in Newtons
+double FORCE_SCALE = 1.0;      // Force scaling factor
+double POSITION_LIMIT_X = 0.1; // Position limit in X direction (meters)
+double POSITION_LIMIT_Y = 0.1; // Position limit in Y direction (meters)
+double POSITION_LIMIT_Z = 0.1; // Position limit in Z direction (meters)
+bool ENABLE_VIRTUAL_WALLS = true; // Enable virtual walls at position limits
+
+// Adaptive stiffness parameters
+double MIN_STIFFNESS_K = 50.0; // Minimum stiffness during high jitter
+double MAX_STIFFNESS_K = 150.0; // Maximum stiffness during stable connection
+double STIFFNESS_ADAPTATION_RATE = 0.1; // Rate of adaptation (0-1)
+
+//------------------------------------------------------------------------------
+// PACKET PROCESSING CONFIGURATION
+//------------------------------------------------------------------------------
+int FEEDBACK_ENABLED = 1;            // Enable/disable feedback (1=enabled, 0=disabled)
+const int PACKET_HISTORY_SIZE = 100; // Number of packets to consider for average timing
+float GLOBAL_RELEASE_RATE_FACTOR = 1.0f; // User-controlled release rate multiplier
+bool SHOW_PACKET_NUMBERS = true;     // Display packet numbers on bars
+bool SHOW_TIME_GAPS = true;          // Display time gaps between packets
+bool LOG_TO_CONSOLE = true;          // Output packet info to console
+bool LOG_TO_CSV = true;              // Save packet data to CSV file
+int MAX_GRAPH_POINTS = 50;           // Maximum points to show on delay graphs
+bool UNIFORM_DELAY_ENABLED = false;  // Enable uniform delay for packet processing
+int UNIFORM_DELAY_MS = 0;            // Uniform delay amount in milliseconds
+bool RANDOM_DELAY_ENABLED = false;   // Enable random delay for packet processing
+int RANDOM_DELAY_MIN_MS = 0;         // Minimum random delay in milliseconds
+int RANDOM_DELAY_MAX_MS = 50;        // Maximum random delay in milliseconds
+
+//------------------------------------------------------------------------------
+// DISPLAY AND UI CONFIGURATION
+//------------------------------------------------------------------------------
+const int MAX_DISPLAY_PACKETS = 15;     // Maximum packets shown in visualization windows
+const int TIMESTAMP_DISPLAY_INTERVAL = 4; // Display every nth timestamp to avoid crowding
+const float TEXT_SPACING = 0.035f;      // Vertical spacing between text lines
+const float BAR_WIDTH = 0.016f;         // Width of packet visualization bars
+const float BAR_MAX_HEIGHT = 0.3f;      // Maximum height for packet bars
+const float TEXT_Y_OFFSET = 0.030f;     // Offset for text to prevent overlap
+const float GRAPH_HEIGHT = 0.25f;       // Height of delay graphs
+const float LEGEND_WIDTH = 0.30f;       // Width of legend box
+const float LEGEND_HEIGHT = 0.20f;      // Height of legend box
+const float GUI_MARGIN = 0.05f;         // Margin around UI elements
+const float GUI_PADDING = 0.02f;        // Padding within UI elements
+
+// Initial window size
+int windowWidth = 1280;
+int windowHeight = 800;
+bool fullscreen = false;
+float scaleFactor = 1.0f;               // For adjusting visualization scale
+
+//------------------------------------------------------------------------------
+// THREAD CONFIGURATION
+//------------------------------------------------------------------------------
+const int THREAD_PRIORITY_PACKET_RECEPTION = THREAD_PRIORITY_HIGHEST;
+const int THREAD_PRIORITY_PROCESSING = THREAD_PRIORITY_ABOVE_NORMAL;
+const int THREAD_PRIORITY_RENDERING = THREAD_PRIORITY_NORMAL;
+const int THREAD_PRIORITY_HAPTICS = THREAD_PRIORITY_TIME_CRITICAL;  // Highest priority
+const int HAPTIC_THREAD_INTERVAL_US = 500; // Update interval for haptic thread in microseconds
+const int FEEDBACK_THREAD_INTERVAL_US = 1000; // Update interval for feedback thread in microseconds
+
+//------------------------------------------------------------------------------
+// CSV FILE CONFIGURATION
+//------------------------------------------------------------------------------
+string CSV_BASE_FILENAME = "haptic_teleoperation_data";
+string CSV_FILENAME;
+bool TIMESTAMP_CSV_FILENAME = true;     // Use timestamped filenames for CSV files
+
+//------------------------------------------------------------------------------
+// UI DISPLAY OPTIONS
+//------------------------------------------------------------------------------
+bool showHelp = false;         // Show help screen
+bool showSettings = false;     // Show settings panel
+bool showLegend = true;        // Show legend
+bool showStats = true;         // Show statistics
+bool showGraphs = true;        // Show delay graphs
+bool showVectorVis = true;     // Show vector visualization
+bool showJitterAnalysis = true; // Show network jitter analysis
+int uiMode = 0;                // 0 = normal, 1 = settings, 2 = help
+const void* FONT_SMALL = GLUT_BITMAP_8_BY_13;
+const void* FONT_MEDIUM = GLUT_BITMAP_9_BY_15;
+const void* FONT_LARGE = GLUT_BITMAP_HELVETICA_12;
+const void* FONT_TITLE = GLUT_BITMAP_HELVETICA_18;
+
+//------------------------------------------------------------------------------
+// DATA STRUCTURES
+//------------------------------------------------------------------------------
+
+// Haptic parameters
+struct HapticConfig {
+    double Kp = STIFFNESS_K;           // Position proportional gain - can be adjusted at runtime
+    double Kd = DAMPING_B;             // Damping gain
+    double maxForce = MAX_FORCE;       // Maximum force in Newtons
+    double forceScale = FORCE_SCALE;   // User-adjustable force scaling
+    bool hapticEnabled = true;         // Enable/disable haptic feedback
+    bool deviceConnected = false;      // Flag to indicate if device is connected
+    int deviceID = -1;                 // Device ID for Force Dimension device
+    bool wallsEnabled = ENABLE_VIRTUAL_WALLS; // Enable virtual walls
+    double posLimit[3] = { POSITION_LIMIT_X, POSITION_LIMIT_Y, POSITION_LIMIT_Z }; // Position limits
+};
+HapticConfig hapticConfig;
+std::mutex hapticMutex;
+
+// Current device state
+struct DeviceState {
+    double position[3] = { 0.0, 0.0, 0.0 };    // Current device position
+    double velocity[3] = { 0.0, 0.0, 0.0 };    // Current device velocity
+    double force[3] = { 0.0, 0.0, 0.0 };       // Current force being applied
+    double targetPos[3] = { 0.0, 0.0, 0.0 };   // Target position from received packets
+};
+DeviceState deviceState;
+std::mutex deviceMutex;
+
+// Packet and Distribution Tracking
+struct PacketStats {
+    double avgReceiveRate = 0.0;
+    int totalPacketsReceived = 0;
+    int totalPacketsProcessed = 0;
+    int totalFeedbackSent = 0;
+    std::chrono::steady_clock::time_point firstPacketTime;
+    std::chrono::steady_clock::time_point lastPacketTime;
+    double avgInterPacketTime = 0.0; // Average time between packets in ms
+    std::deque<double> packetTimings; // Store timing of last PACKET_HISTORY_SIZE packets
+
+    // For delay graphs
+    std::deque<std::pair<int, float>> rawDelays;    // Original packet delays
+    std::deque<std::pair<int, float>> processedDelays; // Delays after processing
+
+    // Network jitter analysis
+    double avgNetworkDelay = 0.0;     // Average network delay in ms
+    double networkJitter = 0.0;       // Network jitter (delay variance) in ms
+    double adaptedStiffness = STIFFNESS_K; // Stiffness adapted based on network conditions
+};
+PacketStats globalPacketStats;
+std::mutex statsMutex;
+
+// Common Packet Structure
+struct Packet {
+    int packetNumber;  // Sequential packet number
+    float x, y, z;     // 3D Vector components
+    float delay;       // Processing delay in milliseconds
+    char timestamp[64];  // Timestamp of packet creation
+    char srcIP[INET_ADDRSTRLEN]; // Source IP address
+    char dstIP[INET_ADDRSTRLEN]; // Destination IP address
+    int srcPort;       // Source port
+    int dstPort;       // Destination port
+    std::chrono::steady_clock::time_point receiveTime;  // Time of packet reception
+
+    // Additional tracking
+    float processingDelay;  // Time taken for processing by our system
+    bool isProcessed = false; // Flag to indicate if packet has been processed
+};
+
+// Enhanced feedback packet structure with force data
+struct FeedbackPacket {
+    int packetNumber;      // Sequential packet number
+    double force[3];       // Force vector (x,y,z)
+    double position[3];    // Current device position
+    double error[3];       // Position error
+    double stiffness;      // Current stiffness value used (K)
+    double damping;        // Current damping value used (B)
+    bool isActive;         // Flag indicating if this is an "active" packet for feedback
+    char message[64];      // Message/status
+    std::chrono::steady_clock::time_point sendTime; // Time when feedback was sent
+};
+
+// Socket data
+SOCKET recvSocket = INVALID_SOCKET;
+std::mutex socketMutex;
+
+// Client information storage for feedback
+struct ClientInfo {
+    sockaddr_in addr;
+    bool valid = false;
+    char ipStr[INET_ADDRSTRLEN];  // Store IP as string for display
+    int port;                    // Store port for display
+    std::chrono::steady_clock::time_point lastActivity; // Time of last activity
+};
+ClientInfo lastClient;
+std::mutex clientMutex;
+
+// CSV File Storage
+std::ofstream csvFile;
+std::mutex csvMutex;
+
+// Store feedback history
+std::deque<FeedbackPacket> feedbackHistory;
+std::mutex feedbackMutex;
+const int MAX_FEEDBACK_HISTORY = 50;
+
+// Random number generator for delays
+std::random_device rd;
+std::mt19937 gen(rd());
+std::uniform_int_distribution<> randomDelayDist(RANDOM_DELAY_MIN_MS, RANDOM_DELAY_MAX_MS);
+
+// Global counter for marking active packets
+int globalPacketCounter = 0;
+std::mutex packetCounterMutex;
+
+// Forward declarations
+void sendFeedback(const sockaddr_in& clientAddr, int packetNumber, const double force[3],
+    const double position[3], const double error[3], double stiffness, double damping, bool isActive);
+void cleanup();
+void initCSVFile();
+void closeCSVFile();
+void logPacketToCSV(const Packet& packet, const FeedbackPacket* feedback = nullptr);
+std::string generateTimestampedFilename(const std::string& baseFilename, const std::string& extension);
+void calculateVirtualWallForces(double position[3], double velocity[3], double limits[3], double outForce[3]);
+std::string getIPString(const sockaddr_in& addr);
+void adaptHapticParameters();
+double calculateAdaptiveStiffness(double jitter, double avgDelay);
+
+//------------------------------------------------------------------------------
+// ADAPTIVE BUFFER AND DELAY ANALYSIS
+//------------------------------------------------------------------------------
+
+// Enhanced Sliding Window Packet Distributor with Delay Analysis
+class AdaptivePacketBuffer {
+private:
+    std::deque<Packet> packetBuffer;       // Main secure buffer for all received packets
+    std::deque<Packet> processedPackets;   // Packets that have been processed/released
+    std::deque<Packet> slidingWindow;      // Sliding window for delay/jitter analysis
+    std::mutex bufferMutex;
+    std::mutex processedMutex;
+    std::mutex windowMutex;
+    std::chrono::steady_clock::time_point lastReleaseTime;
+    std::map<int, double> packetTimeGaps;  // Stores time gaps between consecutive packets
+
+public:
+    AdaptivePacketBuffer() : lastReleaseTime(std::chrono::steady_clock::now()) {}
+
+    // Add packet to buffer and sliding window
+    void addPacket(const Packet& packet) {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+
+        // Calculate and store time gap if not the first packet
+        if (!packetBuffer.empty()) {
+            auto prevPacket = packetBuffer.back();
+            double timeGapMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                packet.receiveTime - prevPacket.receiveTime).count();
+            packetTimeGaps[packet.packetNumber] = timeGapMs;
+        }
+
+        // Add to secure buffer
+        packetBuffer.push_back(packet);
+
+        // Ensure buffer doesn't exceed maximum size
+        if (packetBuffer.size() > MAX_BUFFER_SIZE) {
+            packetBuffer.pop_front();
+        }
+
+        // Add to sliding window for delay analysis
+        {
+            std::lock_guard<std::mutex> windowLock(windowMutex);
+            slidingWindow.push_back(packet);
+
+            // Keep sliding window to specified size
+            while (slidingWindow.size() > SLIDING_WINDOW_SIZE) {
+                slidingWindow.pop_front();
+            }
+
+            // Calculate delay statistics whenever window changes
+            calculateDelayStatistics();
+        }
+    }
+
+    // Calculate network delay statistics from sliding window
+    void calculateDelayStatistics() {
+        if (slidingWindow.size() < 2) return;
+
+        double sumDelay = 0.0;
+        std::vector<double> delays;
+
+        // Calculate delays between packets
+        for (size_t i = 1; i < slidingWindow.size(); i++) {
+            // Calculate delay between consecutive packets
+            double delay = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                slidingWindow[i].receiveTime - slidingWindow[i - 1].receiveTime).count();
+
+            sumDelay += delay;
+            delays.push_back(delay);
+        }
+
+        // Calculate average delay
+        double avgDelay = sumDelay / delays.size();
+
+        // Calculate jitter (standard deviation of delays)
+        double sumSquaredDiff = 0.0;
+        for (double delay : delays) {
+            double diff = delay - avgDelay;
+            sumSquaredDiff += diff * diff;
+        }
+        double jitter = sqrt(sumSquaredDiff / delays.size());
+
+        // Update global stats
+        {
+            std::lock_guard<std::mutex> statsLock(statsMutex);
+            globalPacketStats.avgNetworkDelay = avgDelay;
+            globalPacketStats.networkJitter = jitter;
+
+            // Update adaptive stiffness based on network conditions
+            globalPacketStats.adaptedStiffness = calculateAdaptiveStiffness(jitter, avgDelay);
+        }
+    }
+
+    // Process packets based on average receival time and ordered by packet number
+    void processPackets() {
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> bufferLock(bufferMutex);
+        std::lock_guard<std::mutex> processedLock(processedMutex);
+
+        // Check if it's time to release a packet based on average timing
+        if (!packetBuffer.empty()) {
+            // Get the average inter-packet time from global stats
+            double avgTimeMs;
+            {
+                std::lock_guard<std::mutex> statsLock(statsMutex);
+                avgTimeMs = globalPacketStats.avgInterPacketTime;
+            }
+            if (avgTimeMs <= 0) avgTimeMs = 10.0; // Default if no stats available
+
+            // Apply user-controlled release rate factor
+            avgTimeMs *= GLOBAL_RELEASE_RATE_FACTOR;
+
+            // Calculate time elapsed since last release
+            auto timeSinceLastRelease = std::chrono::duration<double, std::milli>(
+                now - lastReleaseTime).count();
+
+            // Find the packet with the lowest packet number (maintain order)
+            auto oldestPacket = std::min_element(packetBuffer.begin(), packetBuffer.end(),
+                [](const Packet& a, const Packet& b) {
+                    return a.packetNumber < b.packetNumber;
+                });
+
+            // Check if enough time has passed to release the next packet
+            if (timeSinceLastRelease >= avgTimeMs) {
+                // Apply artificial processing delay if enabled
+                if (UNIFORM_DELAY_ENABLED || RANDOM_DELAY_ENABLED) {
+                    int delayAmount = 0;
+
+                    if (UNIFORM_DELAY_ENABLED) {
+                        delayAmount = UNIFORM_DELAY_MS;
+                    }
+
+                    if (RANDOM_DELAY_ENABLED) {
+                        delayAmount = randomDelayDist(gen);
+                    }
+
+                    if (delayAmount > 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(delayAmount));
+                    }
+                }
+
+                // Calculate processing delay
+                Packet processedPacket = *oldestPacket;
+                processedPacket.processingDelay = std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - processedPacket.receiveTime).count();
+
+                // Mark as processed
+                processedPacket.isProcessed = true;
+
+                // Before adding to processed, update the target position for haptic device
+                {
+                    std::lock_guard<std::mutex> lock(deviceMutex);
+                    deviceState.targetPos[0] = processedPacket.x;
+                    deviceState.targetPos[1] = processedPacket.y;
+                    deviceState.targetPos[2] = processedPacket.z;
+                }
+
+                // Track delays for graphing
+                {
+                    std::lock_guard<std::mutex> statsLock(statsMutex);
+                    globalPacketStats.rawDelays.push_back(
+                        std::make_pair(processedPacket.packetNumber, processedPacket.delay));
+                    globalPacketStats.processedDelays.push_back(
+                        std::make_pair(processedPacket.packetNumber, processedPacket.processingDelay));
+
+                    // Keep only the most recent points
+                    while (globalPacketStats.rawDelays.size() > MAX_GRAPH_POINTS) {
+                        globalPacketStats.rawDelays.pop_front();
+                    }
+                    while (globalPacketStats.processedDelays.size() > MAX_GRAPH_POINTS) {
+                        globalPacketStats.processedDelays.pop_front();
+                    }
+
+                    // Increment processed packet counter
+                    globalPacketStats.totalPacketsProcessed++;
+                }
+
+                // Add to processed packets queue
+                processedPackets.push_back(processedPacket);
+
+                // Maintain sliding window by removing oldest when exceeding MAX_DISPLAY_PACKETS
+                while (processedPackets.size() > MAX_DISPLAY_PACKETS) {
+                    processedPackets.pop_front();
+                }
+
+                // Remove from buffer
+                packetBuffer.erase(oldestPacket);
+
+                // Update last release time
+                lastReleaseTime = now;
+
+                // Log processed packet to console and CSV
+                if (LOG_TO_CONSOLE) {
+                    std::cout << "Processed packet #" << processedPacket.packetNumber
+                        << " from " << processedPacket.srcIP << ":" << processedPacket.srcPort
+                        << " [" << processedPacket.x << ", " << processedPacket.y << ", " << processedPacket.z << "]"
+                        << " Initial delay: " << processedPacket.delay << " ms"
+                        << " Processing delay: " << processedPacket.processingDelay << " ms" << std::endl;
+                }
+
+                if (LOG_TO_CSV) {
+                    logPacketToCSV(processedPacket);
+                }
+            }
+        }
+    }
+
+    // Get all packets in buffer (only return the most recent for visualization)
+    std::deque<Packet> getBufferedPackets() {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+
+        // Create a copy with just the latest MAX_DISPLAY_PACKETS
+        std::deque<Packet> displayPackets;
+        int tempIdx = static_cast<int>(packetBuffer.size()) - MAX_DISPLAY_PACKETS;
+        int startIdx = (tempIdx > 0) ? tempIdx : 0;
+
+        for (int i = startIdx; i < static_cast<int>(packetBuffer.size()); i++) {
+            displayPackets.push_back(packetBuffer[i]);
+        }
+
+        return displayPackets;
+    }
+
+    // Get the sliding window contents (for analysis visualization)
+    std::deque<Packet> getSlidingWindow() {
+        std::lock_guard<std::mutex> lock(windowMutex);
+        return slidingWindow;
+    }
+
+    // Get processed/released packets
+    std::deque<Packet> getProcessedPackets() {
+        std::lock_guard<std::mutex> lock(processedMutex);
+        return processedPackets;
+    }
+
+    // Get time gap for a specific packet
+    double getPacketTimeGap(int packetNumber) {
+        auto it = packetTimeGaps.find(packetNumber);
+        if (it != packetTimeGaps.end()) {
+            return it->second;
+        }
+        return 0.0; // No gap for first packet or if not found
+    }
+
+    size_t getBufferSize() {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+        return packetBuffer.size();
+    }
+
+    size_t getProcessedSize() {
+        std::lock_guard<std::mutex> lock(processedMutex);
+        return processedPackets.size();
+    }
+
+    size_t getSlidingWindowSize() {
+        std::lock_guard<std::mutex> lock(windowMutex);
+        return slidingWindow.size();
+    }
+};
+
+// Global adaptive packet buffer
+AdaptivePacketBuffer adaptiveBuffer;
+
+// Calculate adaptive stiffness based on network conditions
+double calculateAdaptiveStiffness(double jitter, double avgDelay) {
+    // Base stiffness
+    double stiffness = STIFFNESS_K;
+
+    // Adjust stiffness based on jitter (higher jitter -> lower stiffness)
+    if (jitter > JITTER_THRESHOLD_MS) {
+        // Calculate a factor between 0-1 based on jitter
+        double jitterFactor = std::max(0.0, std::min(1.0,
+            JITTER_THRESHOLD_MS / (jitter + JITTER_THRESHOLD_MS)));
+
+        // Calculate target stiffness based on jitter
+        double targetStiffness = MIN_STIFFNESS_K +
+            jitterFactor * (MAX_STIFFNESS_K - MIN_STIFFNESS_K);
+
+        // Smoothly adapt stiffness toward target
+        stiffness = stiffness * (1.0 - STIFFNESS_ADAPTATION_RATE) +
+            targetStiffness * STIFFNESS_ADAPTATION_RATE;
+    }
+    else {
+        // Gradually restore stiffness when jitter is low
+        stiffness = stiffness * (1.0 - STIFFNESS_ADAPTATION_RATE) +
+            MAX_STIFFNESS_K * STIFFNESS_ADAPTATION_RATE;
+    }
+
+    return stiffness;
+}
+
+// Adapt haptic parameters based on network conditions
+void adaptHapticParameters() {
+    double adaptedStiffness;
+
+    // Get current network stats
+    {
+        std::lock_guard<std::mutex> statsLock(statsMutex);
+        adaptedStiffness = globalPacketStats.adaptedStiffness;
+    }
+
+    // Update haptic configuration
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.Kp = adaptedStiffness;
+    }
+}
+
+//------------------------------------------------------------------------------
+// UTILITY FUNCTIONS
+//------------------------------------------------------------------------------
+
+// Get current timestamp as string
+std::string getCurrentTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+
+    std::stringstream ss;
+    struct tm timeinfo;
+    localtime_s(&timeinfo, &time_t_now);
+
+    ss << std::put_time(&timeinfo, "%Y-%m-%d %H:%M:%S");
+    return ss.str();
+}
+
+// Generate timestamp-based filename
+std::string generateTimestampedFilename(const std::string& baseFilename, const std::string& extension) {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+
+    std::stringstream ss;
+    struct tm timeinfo;
+    localtime_s(&timeinfo, &time_t_now);
+
+    ss << baseFilename << "_"
+        << std::put_time(&timeinfo, "%Y%m%d_%H%M%S")
+        << "." << extension;
+
+    return ss.str();
+}
+
+// Get IP address as string from sockaddr_in
+std::string getIPString(const sockaddr_in& addr) {
+    char ipStr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(addr.sin_addr), ipStr, INET_ADDRSTRLEN);
+    return std::string(ipStr);
+}
+
+// Calculate forces for virtual walls
+void calculateVirtualWallForces(double position[3], double velocity[3], double limits[3], double outForce[3]) {
+    const double wallStiffness = 500.0; // Wall stiffness (N/m)
+    const double wallDamping = 50.0;    // Wall damping (Ns/m)
+
+    // Initialize output force to zero
+    outForce[0] = 0.0;
+    outForce[1] = 0.0;
+    outForce[2] = 0.0;
+
+    // For each dimension
+    for (int i = 0; i < 3; i++) {
+        // Check minimum limits (negative)
+        if (position[i] < -limits[i]) {
+            double penetration = -limits[i] - position[i];
+            double vel = velocity[i];
+
+            // Only apply damping if moving further into the wall
+            if (vel < 0) {
+                outForce[i] += wallStiffness * penetration - wallDamping * vel;
+            }
+            else {
+                outForce[i] += wallStiffness * penetration;
+            }
+        }
+        // Check maximum limits (positive)
+        else if (position[i] > limits[i]) {
+            double penetration = position[i] - limits[i];
+            double vel = velocity[i];
+
+            // Only apply damping if moving further into the wall
+            if (vel > 0) {
+                outForce[i] -= wallStiffness * penetration + wallDamping * vel;
+            }
+            else {
+                outForce[i] -= wallStiffness * penetration;
+            }
+        }
+    }
+}
+
+// Initialize CSV file with headers
+void initCSVFile() {
+    std::lock_guard<std::mutex> lock(csvMutex);
+
+    // Create timestamped file name if enabled
+    if (TIMESTAMP_CSV_FILENAME) {
+        CSV_FILENAME = generateTimestampedFilename(CSV_BASE_FILENAME, "csv");
+    }
+    else {
+        CSV_FILENAME = CSV_BASE_FILENAME + ".csv";
+    }
+
+    csvFile.open(CSV_FILENAME);
+    if (csvFile.is_open()) {
+        // Timestamp header
+        csvFile << "Timestamp,";
+
+        // Packet data
+        csvFile << "PacketNumber,SourceIP,SourcePort,DestIP,DestPort,"
+            << "PositionX,PositionY,PositionZ,"
+            << "OriginalDelay,ProcessingDelay,";
+
+        // Feedback data
+        csvFile << "FeedbackTime,FeedbackForceX,FeedbackForceY,FeedbackForceZ,"
+            << "DevicePositionX,DevicePositionY,DevicePositionZ,"
+            << "ErrorX,ErrorY,ErrorZ,"
+            << "Stiffness,Damping,IsActive,FeedbackMessage,"
+            << "NetworkDelay,NetworkJitter"
+            << std::endl;
+
+        std::cout << "CSV logging initialized: " << CSV_FILENAME << std::endl;
+    }
+    else {
+        std::cerr << "Error: Could not open CSV file for writing" << std::endl;
+    }
+}
+
+// Close CSV file properly
+void closeCSVFile() {
+    std::lock_guard<std::mutex> lock(csvMutex);
+
+    if (csvFile.is_open()) {
+        csvFile.close();
+        std::cout << "CSV file closed: " << CSV_FILENAME << std::endl;
+    }
+}
+
+// Log packet data to CSV file
+void logPacketToCSV(const Packet& packet, const FeedbackPacket* feedback) {
+    std::lock_guard<std::mutex> lock(csvMutex);
+
+    if (csvFile.is_open()) {
+        // Current timestamp
+        csvFile << getCurrentTimestamp() << ",";
+
+        // Packet data
+        csvFile << packet.packetNumber << ","
+            << packet.srcIP << "," << packet.srcPort << ","
+            << packet.dstIP << "," << packet.dstPort << ","
+            << std::fixed << std::setprecision(6)
+            << packet.x << "," << packet.y << "," << packet.z << ","
+            << packet.delay << "," << packet.processingDelay << ",";
+
+        // Retrieve current network stats
+        double networkDelay, networkJitter;
+        {
+            std::lock_guard<std::mutex> statsLock(statsMutex);
+            networkDelay = globalPacketStats.avgNetworkDelay;
+            networkJitter = globalPacketStats.networkJitter;
+        }
+
+        // Feedback data (if available)
+        if (feedback) {
+            // Convert feedback send time to string
+            auto feedbackTime = std::chrono::system_clock::to_time_t(
+                std::chrono::system_clock::now()); // Use send time if available
+            std::stringstream feedbackTimeStr;
+            struct tm feedbackTimeInfo;
+            localtime_s(&feedbackTimeInfo, &feedbackTime);
+            feedbackTimeStr << std::put_time(&feedbackTimeInfo, "%Y-%m-%d %H:%M:%S");
+
+            csvFile << feedbackTimeStr.str() << ","
+                << std::fixed << std::setprecision(6)
+                << feedback->force[0] << "," << feedback->force[1] << "," << feedback->force[2] << ","
+                << feedback->position[0] << "," << feedback->position[1] << "," << feedback->position[2] << ","
+                << feedback->error[0] << "," << feedback->error[1] << "," << feedback->error[2] << ","
+                << feedback->stiffness << "," << feedback->damping << ","
+                << (feedback->isActive ? "1" : "0") << ","
+                << feedback->message << ","
+                << networkDelay << "," << networkJitter;
+        }
+        else {
+            // No feedback data yet, fill with commas
+            csvFile << ",,,,,,,,,,,,,,";
+            csvFile << networkDelay << "," << networkJitter;
+        }
+
+        csvFile << std::endl;
+    }
+}
+
+// Function to calculate packet magnitude
+float calculateMagnitude(const Packet& packet) {
+    return sqrt(packet.x * packet.x + packet.y * packet.y + packet.z * packet.z);
+}
+
+// Convert timestamp string to more compact format for display
+std::string formatTimestampForDisplay(const char* timestamp) {
+    // Extract just the time portion (assuming format "YYYY-MM-DD HH:MM:SS")
+    std::string ts(timestamp);
+    size_t spacePos = ts.find(' ');
+    if (spacePos != std::string::npos && spacePos + 1 < ts.length()) {
+        return ts.substr(spacePos + 1); // Return just the time part
+    }
+    return ts;
+}
+
+//------------------------------------------------------------------------------
+// FEEDBACK AND NETWORK FUNCTIONS
+//------------------------------------------------------------------------------
+
+// Enhanced function to send feedback to client with force data
+void sendFeedback(const sockaddr_in& clientAddr, int packetNumber, const double force[3],
+    const double position[3], const double error[3], double stiffness, double damping, bool isActive) {
+    if (!FEEDBACK_ENABLED) return;
+
+    std::lock_guard<std::mutex> lock(socketMutex);
+
+    // Create enhanced feedback message
+    FeedbackPacket feedback;
+    feedback.packetNumber = packetNumber;
+
+    // Copy force, position and error data
+    memcpy(feedback.force, force, sizeof(double) * 3);
+    memcpy(feedback.position, position, sizeof(double) * 3);
+    memcpy(feedback.error, error, sizeof(double) * 3);
+
+    // Store stiffness and damping values
+    feedback.stiffness = stiffness;
+    feedback.damping = damping;
+
+    // Set whether this is an active feedback packet
+    feedback.isActive = isActive;
+
+    // Record the send time
+    feedback.sendTime = std::chrono::steady_clock::now();
+
+    snprintf(feedback.message, sizeof(feedback.message),
+        "Force feedback for packet %d (%s)",
+        packetNumber,
+        isActive ? "ACTIVE" : "passive");
+
+    // Send feedback to client using the same socket (UDP_PORT - 4000)
+    // Use the client's address directly (same port they connected from)
+    int result = sendto(recvSocket, (const char*)&feedback, sizeof(feedback), 0,
+        (const sockaddr*)&clientAddr, sizeof(clientAddr));
+
+    if (result == SOCKET_ERROR) {
+        std::cerr << "Failed to send feedback. Error: " << WSAGetLastError() << std::endl;
+    }
+    else {
+        // Add to feedback history
+        {
+            std::lock_guard<std::mutex> feedbackLock(feedbackMutex);
+            feedbackHistory.push_back(feedback);
+
+            // Maintain limited history
+            while (feedbackHistory.size() > MAX_FEEDBACK_HISTORY) {
+                feedbackHistory.pop_front();
+            }
+
+            // Update stats
+            std::lock_guard<std::mutex> statsLock(statsMutex);
+            globalPacketStats.totalFeedbackSent++;
+        }
+
+        // Find the corresponding packet for this feedback
+        auto processedPackets = adaptiveBuffer.getProcessedPackets();
+        for (const auto& packet : processedPackets) {
+            if (packet.packetNumber == packetNumber) {
+                // Log feedback data to CSV
+                if (LOG_TO_CSV) {
+                    logPacketToCSV(packet, &feedback);
+                }
+                break;
+            }
+        }
+
+        // Log to console
+        if (LOG_TO_CONSOLE && isActive) {
+            std::cout << "Sent ACTIVE feedback for packet #" << packetNumber
+                << " to " << inet_ntoa(clientAddr.sin_addr) << ":" << ntohs(clientAddr.sin_port)
+                << " Force: [" << feedback.force[0] << ", " << feedback.force[1] << ", " << feedback.force[2] << "]"
+                << std::endl;
+        }
+    }
+}
+
+// Thread function to continuously send feedback packets
+void continuousFeedbackThread() {
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    std::cout << "Continuous feedback thread started" << std::endl;
+
+    // Initialize packet counter for active packet tracking
+    int feedbackPacketCounter = 0;
+
+    while (true) {
+        // Check if we have a valid client
+        ClientInfo client;
+        bool hasClient = false;
+        {
+            std::lock_guard<std::mutex> lock(clientMutex);
+            if (lastClient.valid) {
+                client = lastClient;
+                hasClient = true;
+            }
+        }
+
+        if (hasClient) {
+            // Get current device state for feedback
+            double currentPos[3], currentForce[3], targetPos[3];
+            double posError[3];
+            double Kp, Kd;
+
+            {
+                std::lock_guard<std::mutex> deviceLock(deviceMutex);
+                memcpy(currentPos, deviceState.position, sizeof(double) * 3);
+                memcpy(currentForce, deviceState.force, sizeof(double) * 3);
+                memcpy(targetPos, deviceState.targetPos, sizeof(double) * 3);
+
+                // Calculate position error
+                for (int i = 0; i < 3; i++) {
+                    posError[i] = targetPos[i] - currentPos[i];
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> hapticLock(hapticMutex);
+                Kp = hapticConfig.Kp;
+                Kd = hapticConfig.Kd;
+            }
+
+            // Determine if this is an active packet based on utilization interval
+            feedbackPacketCounter++;
+            bool isActive = false;
+
+            if (feedbackPacketCounter > PACKET_UTILIZATION_INTERVAL) {
+                if (feedbackPacketCounter <= PACKET_UTILIZATION_INTERVAL + FEEDBACK_ACTIVE_PKTS) {
+                    isActive = true;
+                }
+                else if (feedbackPacketCounter > PACKET_UTILIZATION_INTERVAL + FEEDBACK_ACTIVE_PKTS) {
+                    // Reset counter after active packets
+                    feedbackPacketCounter = 0;
+                }
+            }
+
+            // Get packet number for feedback
+            int packetNumber;
+            {
+                std::lock_guard<std::mutex> lock(packetCounterMutex);
+                packetNumber = globalPacketCounter++;
+            }
+
+            // Send feedback packet
+            sendFeedback(client.addr, packetNumber, currentForce, currentPos, posError, Kp, Kd, isActive);
+        }
+
+        // Sleep to maintain feedback rate
+        std::this_thread::sleep_for(std::chrono::microseconds(PACKET_SEND_INTERVAL_US));
+    }
+}
+
+// Initialize network
+bool initNetwork() {
+    // Initialize Winsock
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        std::cerr << "WSAStartup failed: " << result << std::endl;
+        return false;
+    }
+
+    // Create receive socket (which also sends feedback)
+    {
+        std::lock_guard<std::mutex> lock(socketMutex);
+        recvSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (recvSocket == INVALID_SOCKET) {
+            std::cerr << "Failed to create socket. Error: " << WSAGetLastError() << std::endl;
+            WSACleanup();
+            return false;
+        }
+
+        // Set socket timeout
+        DWORD timeout = SOCKET_TIMEOUT_MS;
+        if (setsockopt(recvSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) == SOCKET_ERROR) {
+            std::cerr << "Failed to set socket timeout. Error: " << WSAGetLastError() << std::endl;
+            // Continue anyway as this is not critical
+        }
+
+        // Set up socket address
+        sockaddr_in serverAddr;
+        memset(&serverAddr, 0, sizeof(serverAddr));
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(UDP_PORT);
+
+        // Convert server IP from string
+        if (inet_pton(AF_INET, SERVER_IP, &(serverAddr.sin_addr)) != 1) {
+            // If invalid, use INADDR_ANY
+            serverAddr.sin_addr.s_addr = INADDR_ANY;
+            std::cout << "Using INADDR_ANY for socket binding" << std::endl;
+        }
+
+        // Bind socket
+        if (bind(recvSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            std::cerr << "Failed to bind socket. Error: " << WSAGetLastError() << std::endl;
+            closesocket(recvSocket);
+            WSACleanup();
+            return false;
+        }
+    }
+
+    // Get local IP addresses for display
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        struct addrinfo hints, * res, * p;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+
+        if (getaddrinfo(hostname, NULL, &hints, &res) == 0) {
+            std::cout << "Available server IP addresses:" << std::endl;
+            for (p = res; p != NULL; p = p->ai_next) {
+                struct sockaddr_in* addr = (struct sockaddr_in*)p->ai_addr;
+                char ipStr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(addr->sin_addr), ipStr, INET_ADDRSTRLEN);
+                std::cout << "  - " << ipStr << std::endl;
+            }
+            freeaddrinfo(res);
+        }
+    }
+
+    std::cout << "Network initialized, listening on UDP port " << UDP_PORT << std::endl;
+    std::cout << "Using same port (" << UDP_PORT << ") for sending feedback responses" << std::endl;
+    return true;
+}
+
+// Thread function to receive packets
+void receivePackets() {
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_PACKET_RECEPTION);
+
+    std::cout << "Packet receiver thread started" << std::endl;
+
+    char buffer[MAX_PACKET_SIZE];
+
+    while (true) {
+        sockaddr_in clientAddr;
+        int clientAddrLen = sizeof(clientAddr);
+
+        // Wait for packet
+        int bytesReceived = recvfrom(recvSocket, buffer, MAX_PACKET_SIZE, 0,
+            (sockaddr*)&clientAddr, &clientAddrLen);
+
+        if (bytesReceived > 0) {
+            // Store the client information for feedback
+            {
+                std::lock_guard<std::mutex> lock(clientMutex);
+                lastClient.addr = clientAddr;
+                lastClient.valid = true;
+                lastClient.port = ntohs(clientAddr.sin_port);
+                lastClient.lastActivity = std::chrono::steady_clock::now();
+                inet_ntop(AF_INET, &(clientAddr.sin_addr), lastClient.ipStr, INET_ADDRSTRLEN);
+            }
+
+            // Create packet structure
+            Packet packet;
+            int copySize = bytesReceived;
+            if (copySize > (int)sizeof(Packet)) {
+                copySize = (int)sizeof(Packet);
+            }
+            memcpy(&packet, buffer, copySize);
+
+            // Set receive time
+            packet.receiveTime = std::chrono::steady_clock::now();
+
+            // Add to adaptive buffer
+            adaptiveBuffer.addPacket(packet);
+
+            // Update packet statistics
+            {
+                std::lock_guard<std::mutex> lock(statsMutex);
+
+                // If this is the first packet, initialize time
+                if (globalPacketStats.totalPacketsReceived == 0) {
+                    globalPacketStats.firstPacketTime = packet.receiveTime;
+                }
+
+                // Store packet timing
+                if (globalPacketStats.totalPacketsReceived > 0) {
+                    auto timeSinceLastPacket = std::chrono::duration<double, std::milli>(
+                        packet.receiveTime - globalPacketStats.lastPacketTime).count();
+
+                    globalPacketStats.packetTimings.push_back(timeSinceLastPacket);
+
+                    // Keep only the most recent PACKET_HISTORY_SIZE timings
+                    while (globalPacketStats.packetTimings.size() > PACKET_HISTORY_SIZE) {
+                        globalPacketStats.packetTimings.pop_front();
+                    }
+
+                    // Calculate average inter-packet time
+                    double sum = 0.0;
+                    for (const auto& timing : globalPacketStats.packetTimings) {
+                        sum += timing;
+                    }
+
+                    globalPacketStats.avgInterPacketTime = sum / globalPacketStats.packetTimings.size();
+                }
+
+                // Update packet count and rate
+                globalPacketStats.totalPacketsReceived++;
+                globalPacketStats.lastPacketTime = packet.receiveTime;
+
+                // Calculate packets per second
+                auto elapsedSeconds = std::chrono::duration<double>(
+                    globalPacketStats.lastPacketTime - globalPacketStats.firstPacketTime).count();
+
+                if (elapsedSeconds > 0) {
+                    globalPacketStats.avgReceiveRate = globalPacketStats.totalPacketsReceived / elapsedSeconds;
+                }
+            }
+
+            // Log packet details to console
+            if (LOG_TO_CONSOLE) {
+                std::cout << "Received packet #" << packet.packetNumber
+                    << " from " << lastClient.ipStr << ":" << lastClient.port
+                    << " [" << packet.x << ", " << packet.y << ", " << packet.z << "]"
+                    << " Delay: " << packet.delay << " ms" << std::endl;
+            }
+        }
+    }
+}
+
+// Thread function to process packets
+void processPacketsThread() {
+    // Set thread priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_PROCESSING);
+
+    std::cout << "Packet processor thread started" << std::endl;
+
+    while (true) {
+        // Process packets based on timing
+        adaptiveBuffer.processPackets();
+
+        // Adapt haptic parameters based on network conditions
+        adaptHapticParameters();
+
+        // Sleep briefly to prevent high CPU usage
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+//------------------------------------------------------------------------------
+// HAPTIC DEVICE FUNCTIONS
+//------------------------------------------------------------------------------
+
+// Initialize haptic device
+bool initHapticDevice() {
+    // Initialize Force Dimension device
+    int deviceID = dhdOpen();
+
+    if (deviceID < 0) {
+        std::cerr << "Error: Failed to open haptic device. Error code: " << deviceID << std::endl;
+        std::cerr << "Error message: " << dhdErrorGetLastStr() << std::endl;
+
+        // Continue without haptic feedback
+        std::cout << "Continuing without haptic feedback..." << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(hapticMutex);
+            hapticConfig.deviceConnected = false;
+            hapticConfig.deviceID = -1;
+        }
+        return false;
+    }
+
+    // Device connected successfully
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.deviceConnected = true;
+        hapticConfig.deviceID = deviceID;
+    }
+
+    // Configure device
+    dhdEnableForce(DHD_ON);
+
+    std::cout << "Haptic device initialized: " << dhdGetSystemName() << std::endl;
+    return true;
+}
+
+// Function to update haptic device state
+void updateHapticState() {
+    // Set thread priority for haptics
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HAPTICS);
+
+    while (true) {
+        bool hapticEnabled, wallsEnabled;
+        double Kp, Kd, maxForce, forceScale;
+        double posLimit[3];
+
+        // Get haptic parameters
+        {
+            std::lock_guard<std::mutex> lock(hapticMutex);
+            hapticEnabled = hapticConfig.hapticEnabled && hapticConfig.deviceConnected;
+            Kp = hapticConfig.Kp;
+            Kd = hapticConfig.Kd;
+            maxForce = hapticConfig.maxForce;
+            forceScale = hapticConfig.forceScale;
+            wallsEnabled = hapticConfig.wallsEnabled;
+            memcpy(posLimit, hapticConfig.posLimit, sizeof(double) * 3);
+        }
+
+        if (hapticEnabled) {
+            // Get current and target position
+            double currentPos[3], targetPos[3], velocity[3];
+
+            // Get actual position from device
+            dhdGetPosition(&currentPos[0], &currentPos[1], &currentPos[2]);
+            dhdGetLinearVelocity(&velocity[0], &velocity[1], &velocity[2]);
+
+            // Get target position
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                memcpy(targetPos, deviceState.targetPos, sizeof(double) * 3);
+
+                // Update device position
+                memcpy(deviceState.position, currentPos, sizeof(double) * 3);
+                memcpy(deviceState.velocity, velocity, sizeof(double) * 3);
+            }
+
+            // Calculate control force (PD control - stiffness K and damping B)
+            double controlForce[3];
+            double posError[3];
+
+            for (int i = 0; i < 3; i++) {
+                posError[i] = targetPos[i] - currentPos[i];
+                controlForce[i] = (Kp * posError[i] - Kd * velocity[i]) * forceScale;
+            }
+
+            // Calculate virtual wall forces if enabled
+            double wallForce[3] = { 0.0, 0.0, 0.0 };
+            if (wallsEnabled) {
+                calculateVirtualWallForces(currentPos, velocity, posLimit, wallForce);
+            }
+
+            // Combine forces
+            double force[3];
+            for (int i = 0; i < 3; i++) {
+                force[i] = controlForce[i] + wallForce[i];
+            }
+
+            // Apply force limiting
+            double forceMagnitude = sqrt(force[0] * force[0] + force[1] * force[1] + force[2] * force[2]);
+            if (forceMagnitude > maxForce) {
+                double scale = maxForce / forceMagnitude;
+                force[0] *= scale;
+                force[1] *= scale;
+                force[2] *= scale;
+            }
+
+            // Apply force to device
+            dhdSetForce(force[0], force[1], force[2]);
+
+            // Store force for visualization
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                memcpy(deviceState.force, force, sizeof(double) * 3);
+            }
+        }
+        else {
+            // No haptic feedback, set zero force
+            dhdSetForce(0.0, 0.0, 0.0);
+
+            // Clear stored force
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                deviceState.force[0] = 0.0;
+                deviceState.force[1] = 0.0;
+                deviceState.force[2] = 0.0;
+            }
+        }
+
+        // Sleep to maintain haptic update rate
+        std::this_thread::sleep_for(std::chrono::microseconds(HAPTIC_THREAD_INTERVAL_US));
+    }
+}
+
+// Function to clean up resources on exit
+void cleanup() {
+    // Close haptic device
+    if (dhdGetDeviceCount() > 0) {
+        dhdStop();
+    }
+
+    // Close socket
+    {
+        std::lock_guard<std::mutex> lock(socketMutex);
+        if (recvSocket != INVALID_SOCKET) {
+            closesocket(recvSocket);
+            recvSocket = INVALID_SOCKET;
+        }
+    }
+
+    // Close CSV file
+    closeCSVFile();
+
+    // Cleanup Winsock
+    WSACleanup();
+
+    std::cout << "Application cleaned up successfully" << std::endl;
+}
+
+//------------------------------------------------------------------------------
+// RENDERING FUNCTIONS
+//------------------------------------------------------------------------------
+
+// Rendering helper functions
+void renderSmallText(float x, float y, const void* font, const char* string,
+    float r = 0.7f, float g = 0.7f, float b = 0.7f) {
+    glColor3f(r, g, b);
+    glRasterPos2f(x, y);
+    for (const char* c = string; *c != '\0'; c++) {
+        glutBitmapCharacter((void*)font, *c);
+    }
+}
+
+// Measure text width (for proper alignment and prevention of overlap)
+float getTextWidth(const void* font, const char* string) {
+    float width = 0;
+    for (const char* c = string; *c != '\0'; c++) {
+        width += glutBitmapWidth((void*)font, *c);
+    }
+    return width / windowWidth; // Normalize to our OpenGL coordinates
+}
+
+// Draw a rectangle with optional border
+void drawRectangle(float x, float y, float width, float height,
+    float r, float g, float b, float alpha = 0.7f,
+    bool drawBorder = true, float borderWidth = 1.0f) {
+    // Draw filled rectangle
+    glColor4f(r, g, b, alpha);
+    glBegin(GL_QUADS);
+    glVertex2f(x, y);
+    glVertex2f(x + width, y);
+    glVertex2f(x + width, y + height);
+    glVertex2f(x, y + height);
+    glEnd();
+
+    // Draw border if requested
+    if (drawBorder) {
+        glColor4f(r * 0.8f, g * 0.8f, b * 0.8f, 1.0f);
+        glLineWidth(borderWidth);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(x, y);
+        glVertex2f(x + width, y);
+        glVertex2f(x + width, y + height);
+        glVertex2f(x, y + height);
+        glEnd();
+    }
+}
+
+// Draw legend box with explanation of UI elements
+void drawLegendBox(float x, float y, float width, float height) {
+    // Draw background
+    drawRectangle(x, y, width, height, 0.1f, 0.1f, 0.2f, 0.8f, true, 2.0f);
+
+    // Title
+    renderSmallText(x + 0.02f, y + height - 0.03f, FONT_LARGE,
+        "Legend", 1.0f, 1.0f, 1.0f);
+
+    const float lineHeight = 0.03f;
+    float textY = y + height - 0.06f;
+    float xPos = x + 0.02f;
+
+    // Bar colors
+    renderSmallText(xPos, textY, FONT_MEDIUM,
+        "BAR COLORS:", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    // Draw color samples
+    float colorSampleSize = 0.018f;
+    float colorTextIndent = 0.03f;
+
+    // Incoming packets (red)
+    glColor3f(0.8f, 0.2f, 0.2f);
+    glBegin(GL_QUADS);
+    glVertex2f(xPos, textY);
+    glVertex2f(xPos + colorSampleSize, textY);
+    glVertex2f(xPos + colorSampleSize, textY + colorSampleSize);
+    glVertex2f(xPos, textY + colorSampleSize);
+    glEnd();
+
+    renderSmallText(xPos + colorTextIndent, textY, FONT_SMALL,
+        "Incoming packets", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    // Processed packets (green)
+    glColor3f(0.2f, 0.8f, 0.2f);
+    glBegin(GL_QUADS);
+    glVertex2f(xPos, textY);
+    glVertex2f(xPos + colorSampleSize, textY);
+    glVertex2f(xPos + colorSampleSize, textY + colorSampleSize);
+    glVertex2f(xPos, textY + colorSampleSize);
+    glEnd();
+
+    renderSmallText(xPos + colorTextIndent, textY, FONT_SMALL,
+        "Processed packets", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    // Active feedback packets (blue)
+    glColor3f(0.2f, 0.2f, 0.9f);
+    glBegin(GL_QUADS);
+    glVertex2f(xPos, textY);
+    glVertex2f(xPos + colorSampleSize, textY);
+    glVertex2f(xPos + colorSampleSize, textY + colorSampleSize);
+    glVertex2f(xPos, textY + colorSampleSize);
+    glEnd();
+
+    renderSmallText(xPos + colorTextIndent, textY, FONT_SMALL,
+        "Active feedback packets", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    // CONTROLS
+    textY -= lineHeight / 2;
+    renderSmallText(xPos, textY, FONT_MEDIUM,
+        "KEYBOARD CONTROLS:", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    // Key explanations
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "F1: Toggle help", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "F: Toggle fullscreen", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "+/-: Adjust force scaling", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "K/L: Adjust stiffness", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "D/F: Adjust damping", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "S: Toggle statistics", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "G: Toggle graphs", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "W: Toggle virtual walls", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "J: Toggle jitter analysis", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "H: Toggle haptic feedback", 0.8f, 0.8f, 0.8f);
+    textY -= lineHeight;
+
+    renderSmallText(xPos, textY, FONT_SMALL,
+        "Esc: Exit", 0.8f, 0.8f, 0.8f);
+}
+
+// Draw detailed help screen (overlay)
+void drawHelpScreen() {
+    // Semi-transparent dark background covering entire screen
+    drawRectangle(-1.0f, -1.0f, 2.0f, 2.0f, 0.0f, 0.0f, 0.1f, 0.85f, false);
+
+    // Title
+    renderSmallText(-0.4f, 0.8f, FONT_TITLE,
+        "Enhanced Haptic Teleoperation System with Adaptive Buffering - Help", 1.0f, 1.0f, 1.0f);
+
+    // Basic description
+    float textY = 0.7f;
+    float lineHeight = 0.05f;
+
+    renderSmallText(-0.75f, textY, FONT_LARGE,
+        "This system receives position data from network clients and processes it", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    renderSmallText(-0.75f, textY, FONT_LARGE,
+        "to control a Force Dimension haptic device, with feedback sent back to clients.", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    renderSmallText(-0.75f, textY, FONT_LARGE,
+        "The system uses adaptive buffering to analyze network conditions and optimize feedback.", 0.9f, 0.9f, 0.9f);
+    textY -= 1.5f * lineHeight;
+
+    // Keyboard controls section
+    renderSmallText(-0.75f, textY, FONT_LARGE,
+        "KEYBOARD CONTROLS:", 1.0f, 1.0f, 0.7f);
+    textY -= lineHeight;
+
+    const float columnWidth = 0.8f;
+    float leftCol = -0.75f;
+    float rightCol = leftCol + columnWidth;
+
+    // Two-column layout for controls
+    renderSmallText(leftCol, textY, FONT_MEDIUM, "F1:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(leftCol + 0.1f, textY, FONT_MEDIUM, "Toggle help screen", 0.9f, 0.9f, 0.9f);
+
+    renderSmallText(rightCol, textY, FONT_MEDIUM, "F:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(rightCol + 0.1f, textY, FONT_MEDIUM, "Toggle fullscreen", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    renderSmallText(leftCol, textY, FONT_MEDIUM, "+/-:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(leftCol + 0.1f, textY, FONT_MEDIUM, "Adjust force scaling", 0.9f, 0.9f, 0.9f);
+
+    renderSmallText(rightCol, textY, FONT_MEDIUM, "K/L:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(rightCol + 0.1f, textY, FONT_MEDIUM, "Adjust stiffness (K)", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    renderSmallText(leftCol, textY, FONT_MEDIUM, "D/F:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(leftCol + 0.1f, textY, FONT_MEDIUM, "Adjust damping (B)", 0.9f, 0.9f, 0.9f);
+
+    renderSmallText(rightCol, textY, FONT_MEDIUM, "S:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(rightCol + 0.1f, textY, FONT_MEDIUM, "Toggle statistics display", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    renderSmallText(leftCol, textY, FONT_MEDIUM, "G:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(leftCol + 0.1f, textY, FONT_MEDIUM, "Toggle graphs", 0.9f, 0.9f, 0.9f);
+
+    renderSmallText(rightCol, textY, FONT_MEDIUM, "H:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(rightCol + 0.1f, textY, FONT_MEDIUM, "Toggle haptic feedback", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    renderSmallText(leftCol, textY, FONT_MEDIUM, "W:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(leftCol + 0.1f, textY, FONT_MEDIUM, "Toggle virtual walls", 0.9f, 0.9f, 0.9f);
+
+    renderSmallText(rightCol, textY, FONT_MEDIUM, "J:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(rightCol + 0.1f, textY, FONT_MEDIUM, "Toggle jitter analysis display", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    renderSmallText(leftCol, textY, FONT_MEDIUM, "U:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(leftCol + 0.1f, textY, FONT_MEDIUM, "Toggle uniform delay", 0.9f, 0.9f, 0.9f);
+
+    renderSmallText(rightCol, textY, FONT_MEDIUM, "R:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(rightCol + 0.1f, textY, FONT_MEDIUM, "Toggle random delay", 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    renderSmallText(leftCol, textY, FONT_MEDIUM, "1-9:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(leftCol + 0.1f, textY, FONT_MEDIUM, "Adjust release rate factor", 0.9f, 0.9f, 0.9f);
+
+    renderSmallText(rightCol, textY, FONT_MEDIUM, "Esc:", 0.7f, 0.7f, 1.0f);
+    renderSmallText(rightCol + 0.1f, textY, FONT_MEDIUM, "Exit application", 0.9f, 0.9f, 0.9f);
+    textY -= 2.0f * lineHeight;
+
+    // Network configuration section
+    renderSmallText(-0.75f, textY, FONT_LARGE,
+        "ADAPTIVE BUFFERING CONFIGURATION:", 1.0f, 1.0f, 0.7f);
+    textY -= lineHeight;
+
+    char netConfig[128];
+    snprintf(netConfig, sizeof(netConfig), "Sliding Window Size: %d packets", SLIDING_WINDOW_SIZE);
+    renderSmallText(leftCol, textY, FONT_MEDIUM, netConfig, 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    snprintf(netConfig, sizeof(netConfig), "Packet Utilization: Every %d after %d packets",
+        FEEDBACK_ACTIVE_PKTS, PACKET_UTILIZATION_INTERVAL);
+    renderSmallText(leftCol, textY, FONT_MEDIUM, netConfig, 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    snprintf(netConfig, sizeof(netConfig), "Network Port: %d (used for both receiving and sending feedback)", UDP_PORT);
+    renderSmallText(leftCol, textY, FONT_MEDIUM, netConfig, 0.9f, 0.9f, 0.9f);
+    textY -= lineHeight;
+
+    // Footer
+    renderSmallText(-0.4f, -0.8f, FONT_MEDIUM,
+        "Press F1 again or Esc to close this help screen", 0.7f, 0.7f, 1.0f);
+}
+
+// Draw packet visualizations
+void drawPacketVisualization(const std::deque<Packet>& packets, float xOffset,
+    const char* title, bool isProcessed,
+    float barWidth = BAR_WIDTH, float maxHeight = BAR_MAX_HEIGHT) {
+    // Draw title 
+    renderSmallText(xOffset, 0.9f, FONT_LARGE, title, 0.9f, 0.9f, 1.0f);
+
+    // Draw axis lines
+    glColor3f(0.4f, 0.4f, 0.4f);
+    glBegin(GL_LINES);
+    // Horizontal axis
+    glVertex2f(xOffset - 0.05f, 0.35f);
+    glVertex2f(xOffset + 0.65f, 0.35f);
+    // Vertical axis
+    glVertex2f(xOffset - 0.05f, 0.35f);
+    glVertex2f(xOffset - 0.05f, 0.65f);
+    glEnd();
+
+    // Draw packets as bars
+    int index = 0;
+    for (const auto& packet : packets) {
+        float x = xOffset + (index * barWidth * 1.5f);
+
+        // Calculate bar height based on vector magnitude
+        float magnitude = calculateMagnitude(packet);
+        float normalizedHeight = magnitude * 0.8f; // Scale to make it visible
+        if (normalizedHeight > maxHeight) normalizedHeight = maxHeight;
+
+        // Draw bar - differentiate between incoming and processed
+        if (isProcessed) {
+            glColor3f(0.2f, 0.8f, 0.2f); // Green for processed
+        }
+        else {
+            glColor3f(0.8f, 0.2f, 0.2f); // Red for incoming
+        }
+
+        glBegin(GL_QUADS);
+        glVertex2f(x, 0.35f);
+        glVertex2f(x + barWidth, 0.35f);
+        glVertex2f(x + barWidth, 0.35f + normalizedHeight);
+        glVertex2f(x, 0.35f + normalizedHeight);
+        glEnd();
+
+        // Draw packet number if enabled
+        if (SHOW_PACKET_NUMBERS) {
+            char packetNumStr[16];
+            snprintf(packetNumStr, sizeof(packetNumStr), "%d", packet.packetNumber);
+
+            // Calculate text position to avoid overlap
+            float textY = 0.35f - 0.03f;
+
+            // Stagger text positions to prevent overlap
+            if (index % 2 == 0) {
+                textY -= TEXT_Y_OFFSET;
+            }
+
+            renderSmallText(x - 0.005f, textY, FONT_SMALL, packetNumStr);
+        }
+
+        // Show timestamp for some packets to avoid crowding
+        if (index % TIMESTAMP_DISPLAY_INTERVAL == 0) {
+            std::string formattedTime = formatTimestampForDisplay(packet.timestamp);
+            renderSmallText(x - 0.02f, 0.35f + normalizedHeight + 0.01f, FONT_SMALL, formattedTime.c_str());
+        }
+
+        // Show time gap between packets if enabled
+        if (SHOW_TIME_GAPS && index > 0) {
+            double timeGap = adaptiveBuffer.getPacketTimeGap(packet.packetNumber);
+            if (timeGap > 0) {
+                char timeGapStr[32];
+                snprintf(timeGapStr, sizeof(timeGapStr), "%.1f ms", timeGap);
+                renderSmallText(x - 0.02f, 0.32f, FONT_SMALL, timeGapStr);
+            }
+        }
+
+        index++;
+    }
+
+    // Add packet info section at the bottom
+    if (!packets.empty()) {
+        const Packet& latestPacket = packets.back();
+        float infoY = 0.28f;
+
+        std::ostringstream packetInfo;
+        packetInfo << "Latest Packet: #" << latestPacket.packetNumber
+            << " | From: " << latestPacket.srcIP << ":" << latestPacket.srcPort
+            << " | To: " << latestPacket.dstIP << ":" << latestPacket.dstPort;
+
+        renderSmallText(xOffset + 0.05f, infoY, FONT_MEDIUM, packetInfo.str().c_str());
+        infoY -= TEXT_SPACING;
+
+        std::ostringstream vectorInfo;
+        vectorInfo << "Position Vector: [" << std::fixed << std::setprecision(3)
+            << latestPacket.x << ", " << latestPacket.y << ", " << latestPacket.z << "]"
+            << " | Magnitude: " << std::fixed << std::setprecision(3)
+            << calculateMagnitude(latestPacket);
+
+        renderSmallText(xOffset + 0.05f, infoY, FONT_MEDIUM, vectorInfo.str().c_str());
+        infoY -= TEXT_SPACING;
+
+        std::ostringstream delayInfo;
+        if (isProcessed) {
+            delayInfo << "Original Delay: " << std::fixed << std::setprecision(2)
+                << latestPacket.delay << " ms"
+                << " | Processing Delay: " << std::fixed << std::setprecision(2)
+                << latestPacket.processingDelay << " ms";
+        }
+        else {
+            delayInfo << "Original Delay: " << std::fixed << std::setprecision(2)
+                << latestPacket.delay << " ms";
+        }
+        renderSmallText(xOffset + 0.05f, infoY, FONT_MEDIUM, delayInfo.str().c_str());
+    }
+}
+
+// Draw sliding window visualization
+void drawNetworkJitterAnalysis(float x, float y, float width, float height) {
+    // Get network stats
+    double avgDelay, jitter, adaptedStiffness;
+    {
+        std::lock_guard<std::mutex> statsLock(statsMutex);
+        avgDelay = globalPacketStats.avgNetworkDelay;
+        jitter = globalPacketStats.networkJitter;
+        adaptedStiffness = globalPacketStats.adaptedStiffness;
+    }
+
+    // Get window size
+    size_t windowSize = adaptiveBuffer.getSlidingWindowSize();
+
+    // Draw background
+    drawRectangle(x, y, width, height, 0.1f, 0.1f, 0.25f, 0.7f);
+
+    // Draw title
+    renderSmallText(x + 0.02f, y + height - 0.03f, FONT_LARGE, "Network Jitter Analysis", 0.9f, 0.9f, 1.0f);
+
+    // Draw values
+    float textY = y + height - 0.07f;
+    char statStr[128];
+
+    snprintf(statStr, sizeof(statStr), "Window Size: %zu packets", windowSize);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Avg Network Delay: %.2f ms", avgDelay);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Network Jitter: %.2f ms", jitter);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr,
+        jitter > JITTER_THRESHOLD_MS ? 0.9f : 0.2f,
+        jitter > JITTER_THRESHOLD_MS ? 0.2f : 0.9f,
+        0.2f);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Adapted Stiffness: %.2f N/m (Min: %.1f, Max: %.1f)",
+        adaptedStiffness, MIN_STIFFNESS_K, MAX_STIFFNESS_K);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Active Feedback: Every %d packets after %d",
+        FEEDBACK_ACTIVE_PKTS, PACKET_UTILIZATION_INTERVAL);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    // Visual representation of jitter
+    float jitterBarWidth = width - 0.1f;
+    float jitterBarHeight = 0.03f;
+    float jitterBarX = x + 0.05f;
+    float jitterBarY = textY - 0.05f;
+
+    // Draw background bar
+    drawRectangle(jitterBarX, jitterBarY, jitterBarWidth, jitterBarHeight, 0.2f, 0.2f, 0.2f);
+
+    // Calculate filled portion based on jitter (normalized to some max value like 50ms)
+    float maxJitter = 50.0f;
+    float fillWidth = (jitter / maxJitter) * jitterBarWidth;
+    if (fillWidth > jitterBarWidth) fillWidth = jitterBarWidth;
+
+    // Color gradient based on jitter value
+    float r = jitter > JITTER_THRESHOLD_MS ? 0.9f : 0.2f;
+    float g = jitter > JITTER_THRESHOLD_MS ? 0.3f : 0.9f;
+    float b = 0.2f;
+
+    // Draw filled portion
+    drawRectangle(jitterBarX, jitterBarY, fillWidth, jitterBarHeight, r, g, b, 0.9f, false);
+
+    // Draw labels
+    renderSmallText(jitterBarX, jitterBarY - 0.03f, FONT_SMALL, "0 ms");
+    renderSmallText(jitterBarX + jitterBarWidth - 0.05f, jitterBarY - 0.03f, FONT_SMALL, "50+ ms");
+
+    // Draw threshold marker
+    float thresholdX = jitterBarX + (JITTER_THRESHOLD_MS / maxJitter) * jitterBarWidth;
+    glColor3f(1.0f, 1.0f, 1.0f);
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    glVertex2f(thresholdX, jitterBarY - 0.01f);
+    glVertex2f(thresholdX, jitterBarY + jitterBarHeight + 0.01f);
+    glEnd();
+
+    // Threshold label
+    char thresholdStr[32];
+    snprintf(thresholdStr, sizeof(thresholdStr), "Threshold (%.1f ms)", JITTER_THRESHOLD_MS);
+    renderSmallText(thresholdX - 0.07f, jitterBarY + jitterBarHeight + 0.02f, FONT_SMALL, thresholdStr);
+
+    // Stiffness bar
+    float stiffBarY = jitterBarY - 0.08f;
+
+    // Draw background bar
+    drawRectangle(jitterBarX, stiffBarY, jitterBarWidth, jitterBarHeight, 0.2f, 0.2f, 0.2f);
+
+    // Calculate filled portion based on adapted stiffness
+    float stiffnessRange = MAX_STIFFNESS_K - MIN_STIFFNESS_K;
+    float stiffFillWidth = ((adaptedStiffness - MIN_STIFFNESS_K) / stiffnessRange) * jitterBarWidth;
+    if (stiffFillWidth > jitterBarWidth) stiffFillWidth = jitterBarWidth;
+    if (stiffFillWidth < 0) stiffFillWidth = 0;
+
+    // Draw filled portion
+    drawRectangle(jitterBarX, stiffBarY, stiffFillWidth, jitterBarHeight, 0.2f, 0.5f, 0.9f, 0.9f, false);
+
+    // Draw labels
+    char minStiffStr[32], maxStiffStr[32];
+    snprintf(minStiffStr, sizeof(minStiffStr), "%.0f N/m", MIN_STIFFNESS_K);
+    snprintf(maxStiffStr, sizeof(maxStiffStr), "%.0f N/m", MAX_STIFFNESS_K);
+
+    renderSmallText(jitterBarX, stiffBarY - 0.03f, FONT_SMALL, minStiffStr);
+    renderSmallText(jitterBarX + jitterBarWidth - 0.1f, stiffBarY - 0.03f, FONT_SMALL, maxStiffStr);
+
+    // Stiffness title
+    renderSmallText(jitterBarX, stiffBarY + jitterBarHeight + 0.02f, FONT_SMALL, "Adaptive Stiffness");
+}
+
+// Draw a 3D vector representation in 2D space
+void draw3DVector(float x, float y, float scale, const float vec[3], const char* label = nullptr) {
+    // Draw base axes
+    glColor3f(0.5f, 0.5f, 0.5f);
+    glBegin(GL_LINES);
+    // X axis
+    glVertex2f(x - 0.05f, y);
+    glVertex2f(x + 0.05f, y);
+    // Y axis
+    glVertex2f(x, y - 0.05f);
+    glVertex2f(x, y + 0.05f);
+    glEnd();
+
+    // Draw vector
+    glColor3f(0.9f, 0.3f, 0.3f); // Red vector
+    glBegin(GL_LINES);
+    glVertex2f(x, y);
+    glVertex2f(x + vec[0] * scale, y + vec[1] * scale);
+    glEnd();
+
+    // Draw vector endpoint
+    glPointSize(5.0f);
+    glBegin(GL_POINTS);
+    glVertex2f(x + vec[0] * scale, y + vec[1] * scale);
+    glEnd();
+
+    // Draw label if provided
+    if (label) {
+        renderSmallText(x - 0.04f, y + 0.08f, FONT_MEDIUM, label);
+    }
+
+    // Draw magnitude and components
+    char magnitudeStr[64];
+    float magnitude = sqrt(vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2]);
+    snprintf(magnitudeStr, sizeof(magnitudeStr), "Mag: %.2f", magnitude);
+    renderSmallText(x - 0.04f, y - 0.08f, FONT_SMALL, magnitudeStr);
+
+    char compStr[64];
+    snprintf(compStr, sizeof(compStr), "[%.2f, %.2f, %.2f]", vec[0], vec[1], vec[2]);
+    renderSmallText(x - 0.04f, y - 0.10f, FONT_SMALL, compStr);
+}
+
+// Draw haptic device status
+void drawHapticStatus(float x, float y) {
+    // Get device status
+    bool deviceConnected;
+    bool hapticEnabled;
+    bool wallsEnabled;
+    double Kp, Kd, maxForce, forceScale;
+    double posLimit[3];
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        deviceConnected = hapticConfig.deviceConnected;
+        hapticEnabled = hapticConfig.hapticEnabled;
+        wallsEnabled = hapticConfig.wallsEnabled;
+        Kp = hapticConfig.Kp;
+        Kd = hapticConfig.Kd;
+        maxForce = hapticConfig.maxForce;
+        forceScale = hapticConfig.forceScale;
+        memcpy(posLimit, hapticConfig.posLimit, sizeof(double) * 3);
+    }
+
+    // Background for status section
+    drawRectangle(x - 0.05f, y - 0.35f, 0.75f, 0.33f, 0.0f, 0.1f, 0.2f, 0.5f);
+
+    // Title
+    renderSmallText(x, y, FONT_LARGE, "Haptic Device Status", 0.9f, 0.9f, 1.0f);
+    y -= TEXT_SPACING;
+
+    // Device connection status
+    if (deviceConnected) {
+        renderSmallText(x, y, FONT_MEDIUM, "Device: Connected", 0.2f, 0.9f, 0.2f);
+    }
+    else {
+        renderSmallText(x, y, FONT_MEDIUM, "Device: Not Connected", 0.9f, 0.2f, 0.2f);
+    }
+    y -= TEXT_SPACING;
+
+    // Feedback status
+    if (hapticEnabled && deviceConnected) {
+        renderSmallText(x, y, FONT_MEDIUM, "Feedback: Enabled", 0.2f, 0.9f, 0.2f);
+    }
+    else {
+        renderSmallText(x, y, FONT_MEDIUM, "Feedback: Disabled", 0.9f, 0.6f, 0.2f);
+    }
+    y -= TEXT_SPACING;
+
+    // Virtual walls status
+    if (wallsEnabled) {
+        renderSmallText(x, y, FONT_MEDIUM, "Virtual Walls: Enabled", 0.2f, 0.9f, 0.2f);
+    }
+    else {
+        renderSmallText(x, y, FONT_MEDIUM, "Virtual Walls: Disabled", 0.9f, 0.6f, 0.2f);
+    }
+    y -= TEXT_SPACING;
+
+    // Draw parameters
+    char paramStr[128];
+    snprintf(paramStr, sizeof(paramStr), "Stiffness (K): %.2f N/m | Damping (B): %.2f Ns/m", Kp, Kd);
+    renderSmallText(x, y, FONT_MEDIUM, paramStr);
+    y -= TEXT_SPACING;
+
+    snprintf(paramStr, sizeof(paramStr), "Max Force: %.2f N | Force Scale: %.2f", maxForce, forceScale);
+    renderSmallText(x, y, FONT_MEDIUM, paramStr);
+    y -= TEXT_SPACING;
+
+    snprintf(paramStr, sizeof(paramStr), "Position Limits: [±%.2f, ±%.2f, ±%.2f] m",
+        posLimit[0], posLimit[1], posLimit[2]);
+    renderSmallText(x, y, FONT_MEDIUM, paramStr);
+    y -= TEXT_SPACING;
+
+    // Get current device state
+    double currentPos[3], currentForce[3], targetPos[3];
+    {
+        std::lock_guard<std::mutex> lock(deviceMutex);
+        memcpy(currentPos, deviceState.position, sizeof(double) * 3);
+        memcpy(currentForce, deviceState.force, sizeof(double) * 3);
+        memcpy(targetPos, deviceState.targetPos, sizeof(double) * 3);
+    }
+
+    // Convert to float for drawing
+    float fPos[3], fForce[3], fTarget[3];
+    for (int i = 0; i < 3; i++) {
+        fPos[i] = (float)currentPos[i];
+        fForce[i] = (float)currentForce[i];
+        fTarget[i] = (float)targetPos[i];
+    }
+
+    // Draw vectors if vector visualization is enabled
+    if (showVectorVis) {
+        float vecScale = 5.0f;  // Scale for visualization
+        float vecY = y - 0.1f;
+
+        // Current position vector
+        draw3DVector(x + 0.15f, vecY, vecScale, fPos, "Device Position");
+
+        // Target position vector
+        draw3DVector(x + 0.45f, vecY, vecScale, fTarget, "Target Position");
+
+        // Force vector
+        draw3DVector(x + 0.15f, vecY - 0.2f, vecScale / 2.0f, fForce, "Applied Force");
+    }
+}
+
+// Draw graphs of packet delays
+void drawDelayGraphs(float x, float y, float width, float height) {
+    // Get delay data
+    std::deque<std::pair<int, float>> rawDelays;
+    std::deque<std::pair<int, float>> processedDelays;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        rawDelays = globalPacketStats.rawDelays;
+        processedDelays = globalPacketStats.processedDelays;
+    }
+
+    // Draw background
+    drawRectangle(x, y, width, height, 0.0f, 0.0f, 0.2f, 0.5f);
+
+    // Draw title
+    renderSmallText(x + 0.02f, y + height - 0.03f, FONT_MEDIUM, "Delay Analysis", 0.9f, 0.9f, 1.0f);
+
+    // Draw axes
+    glColor3f(0.5f, 0.5f, 0.5f);
+    glBegin(GL_LINES);
+    // X axis
+    glVertex2f(x + 0.02f, y + 0.05f);
+    glVertex2f(x + width - 0.02f, y + 0.05f);
+    // Y axis
+    glVertex2f(x + 0.02f, y + 0.05f);
+    glVertex2f(x + 0.02f, y + height - 0.05f);
+    glEnd();
+
+    // Find maximum delay value for scaling
+    float maxDelay = 100.0f;  // Default if no data
+    for (const auto& pair : rawDelays) {
+        if (pair.second > maxDelay) maxDelay = pair.second;
+    }
+    for (const auto& pair : processedDelays) {
+        if (pair.second > maxDelay) maxDelay = pair.second;
+    }
+    maxDelay = ceil(maxDelay / 100.0f) * 100.0f;  // Round up to nearest 100ms
+
+    // Draw scale
+    char scaleStr[32];
+    snprintf(scaleStr, sizeof(scaleStr), "%.0f ms", maxDelay);
+    renderSmallText(x + 0.03f, y + height - 0.07f, FONT_SMALL, scaleStr);
+    snprintf(scaleStr, sizeof(scaleStr), "0 ms");
+    renderSmallText(x + 0.03f, y + 0.04f, FONT_SMALL, scaleStr);
+
+    // Draw original delay graph
+    if (!rawDelays.empty()) {
+        glColor3f(0.8f, 0.5f, 0.2f);  // Orange
+        glBegin(GL_LINE_STRIP);
+        float xStep = (width - 0.04f) / MAX_GRAPH_POINTS;
+        float yScale = (height - 0.1f) / maxDelay;
+
+        int idx = 0;
+        for (const auto& pair : rawDelays) {
+            float xPos = x + 0.02f + (idx * xStep);
+            float yPos = y + 0.05f + (pair.second * yScale);
+            glVertex2f(xPos, yPos);
+            idx++;
+        }
+        glEnd();
+
+        // Label
+        renderSmallText(x + 0.1f, y + height - 0.07f, FONT_SMALL, "Original Delay", 0.8f, 0.5f, 0.2f);
+    }
+
+    // Draw processed delay graph
+    if (!processedDelays.empty()) {
+        glColor3f(0.2f, 0.7f, 0.9f);  // Blue
+        glBegin(GL_LINE_STRIP);
+        float xStep = (width - 0.04f) / MAX_GRAPH_POINTS;
+        float yScale = (height - 0.1f) / maxDelay;
+
+        int idx = 0;
+        for (const auto& pair : processedDelays) {
+            float xPos = x + 0.02f + (idx * xStep);
+            float yPos = y + 0.05f + (pair.second * yScale);
+            glVertex2f(xPos, yPos);
+            idx++;
+        }
+        glEnd();
+
+        // Label
+        renderSmallText(x + 0.25f, y + height - 0.07f, FONT_SMALL, "Processing Delay", 0.2f, 0.7f, 0.9f);
+    }
+
+    // Draw delay settings
+    float settingsY = y + 0.02f;
+
+    // Uniform delay status
+    if (UNIFORM_DELAY_ENABLED) {
+        char uniDelayStr[64];
+        snprintf(uniDelayStr, sizeof(uniDelayStr), "Uniform Delay: %d ms", UNIFORM_DELAY_MS);
+        renderSmallText(x + width - 0.3f, settingsY, FONT_SMALL, uniDelayStr, 0.2f, 0.9f, 0.2f);
+    }
+    else {
+        renderSmallText(x + width - 0.3f, settingsY, FONT_SMALL, "Uniform Delay: Off", 0.7f, 0.7f, 0.7f);
+    }
+    settingsY += 0.03f;
+
+    // Random delay status
+    if (RANDOM_DELAY_ENABLED) {
+        char randDelayStr[64];
+        snprintf(randDelayStr, sizeof(randDelayStr), "Random Delay: %d-%d ms",
+            RANDOM_DELAY_MIN_MS, RANDOM_DELAY_MAX_MS);
+        renderSmallText(x + width - 0.3f, settingsY, FONT_SMALL, randDelayStr, 0.2f, 0.9f, 0.2f);
+    }
+    else {
+        renderSmallText(x + width - 0.3f, settingsY, FONT_SMALL, "Random Delay: Off", 0.7f, 0.7f, 0.7f);
+    }
+}
+
+// Draw feedback history panel with active/inactive packet highlighting
+void drawFeedbackPanel(float x, float y, float width, float height) {
+    std::deque<FeedbackPacket> feedbackData;
+    {
+        std::lock_guard<std::mutex> lock(feedbackMutex);
+        feedbackData = feedbackHistory;
+    }
+
+    if (feedbackData.empty()) return;
+
+    // Draw background
+    drawRectangle(x, y, width, height, 0.1f, 0.1f, 0.2f, 0.5f);
+
+    // Draw title
+    renderSmallText(x + 0.02f, y + height - 0.03f, FONT_MEDIUM, "Recent Feedback Data", 0.9f, 0.9f, 1.0f);
+
+    // Show latest feedback
+    const FeedbackPacket& latest = feedbackData.back();
+
+    float textY = y + height - 0.06f;
+    char fbStr[128];
+
+    // Show if it's an active packet
+    if (latest.isActive) {
+        renderSmallText(x + 0.02f, textY, FONT_MEDIUM, "Latest Feedback (ACTIVE):", 0.2f, 0.2f, 0.9f);
+    }
+    else {
+        renderSmallText(x + 0.02f, textY, FONT_MEDIUM, "Latest Feedback (passive):", 0.7f, 0.7f, 0.7f);
+    }
+    textY -= TEXT_SPACING;
+
+    snprintf(fbStr, sizeof(fbStr), "Packet: #%d", latest.packetNumber);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, fbStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(fbStr, sizeof(fbStr), "Force: [%.2f, %.2f, %.2f] N",
+        latest.force[0], latest.force[1], latest.force[2]);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, fbStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(fbStr, sizeof(fbStr), "Position: [%.2f, %.2f, %.2f] m",
+        latest.position[0], latest.position[1], latest.position[2]);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, fbStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(fbStr, sizeof(fbStr), "Stiffness: %.2f N/m | Damping: %.2f Ns/m",
+        latest.stiffness, latest.damping);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, fbStr);
+
+    // Display active/passive packet ratio
+    int activeCount = 0;
+    for (const auto& fb : feedbackData) {
+        if (fb.isActive) activeCount++;
+    }
+
+    float ratioY = y + 0.05f;
+    char ratioStr[128];
+    snprintf(ratioStr, sizeof(ratioStr), "Packet utilization: %d active / %zu total (%.1f%%)",
+        activeCount, feedbackData.size(), (activeCount * 100.0f) / feedbackData.size());
+    renderSmallText(x + 0.02f, ratioY, FONT_MEDIUM, ratioStr);
+}
+
+// Draw statistics panel
+void drawStatisticsPanel(float x, float y, float width, float height) {
+    // Get statistics data
+    int totalReceived, totalProcessed, totalFeedback;
+    double avgRate, avgInterPacketTime;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        totalReceived = globalPacketStats.totalPacketsReceived;
+        totalProcessed = globalPacketStats.totalPacketsProcessed;
+        avgRate = globalPacketStats.avgReceiveRate;
+        avgInterPacketTime = globalPacketStats.avgInterPacketTime;
+        totalFeedback = globalPacketStats.totalFeedbackSent;
+    }
+
+    // Buffer size
+    size_t bufferSize = adaptiveBuffer.getBufferSize();
+    size_t windowSize = adaptiveBuffer.getSlidingWindowSize();
+
+    // Draw background
+    drawRectangle(x, y, width, height, 0.0f, 0.1f, 0.2f, 0.5f);
+
+    // Draw title
+    renderSmallText(x + 0.02f, y + height - 0.03f, FONT_MEDIUM, "Statistics", 0.9f, 0.9f, 1.0f);
+
+    // Draw stats
+    float textY = y + height - 0.06f;
+    char statStr[128];
+
+    snprintf(statStr, sizeof(statStr), "Total Packets Received: %d", totalReceived);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Total Packets Processed: %d", totalProcessed);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Total Feedback Messages: %d", totalFeedback);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Average Rate: %.2f packets/s", avgRate);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Avg Inter-Packet Time: %.2f ms", avgInterPacketTime);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Packet Buffer: %zu | Sliding Window: %zu",
+        bufferSize, windowSize);
+    renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    // Get client information
+    bool clientConnected = false;
+    char clientIP[INET_ADDRSTRLEN];
+    int clientPort = 0;
+    {
+        std::lock_guard<std::mutex> lock(clientMutex);
+        clientConnected = lastClient.valid;
+        if (clientConnected) {
+            strcpy_s(clientIP, lastClient.ipStr);
+            clientPort = lastClient.port;
+        }
+    }
+
+    if (clientConnected) {
+        snprintf(statStr, sizeof(statStr), "Connected Client: %s:%d", clientIP, clientPort);
+        renderSmallText(x + 0.02f, textY, FONT_MEDIUM, statStr, 0.2f, 0.9f, 0.2f);
+    }
+    else {
+        renderSmallText(x + 0.02f, textY, FONT_MEDIUM, "No Client Connected", 0.9f, 0.3f, 0.3f);
+    }
+    textY -= TEXT_SPACING;
+
+    snprintf(statStr, sizeof(statStr), "Logging to: %s", CSV_FILENAME.c_str());
+    renderSmallText(x + 0.01f, textY, FONT_MEDIUM, statStr);
+    textY -= TEXT_SPACING;
+
+    // Show packet utilization info
+    snprintf(statStr, sizeof(statStr), "Active packets: Every %d after %d packets",
+        FEEDBACK_ACTIVE_PKTS, PACKET_UTILIZATION_INTERVAL);
+    renderSmallText(x + 0.01f, textY, FONT_MEDIUM, statStr, 0.2f, 0.7f, 0.9f);
+}
+
+// Display function
+void display() {
+    // Clear the screen
+    glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Enable blending for transparency
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Set up projection
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(-1.0, 1.0, -1.0, 1.0);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    // Apply global scaling if needed
+    glScalef(scaleFactor, scaleFactor, 1.0f);
+
+    // Get packet data
+    auto bufferedPackets = adaptiveBuffer.getBufferedPackets();
+    auto processedPackets = adaptiveBuffer.getProcessedPackets();
+
+    // Draw packet visualizations
+    if (!bufferedPackets.empty()) {
+        drawPacketVisualization(bufferedPackets, -0.8f, "Incoming Packets", false);
+    }
+
+    if (!processedPackets.empty()) {
+        drawPacketVisualization(processedPackets, 0.0f, "Processed Packets", true);
+    }
+
+    // Draw haptic device status
+    drawHapticStatus(-0.9f, 0.2f);
+
+    // Draw network configuration info
+    char netInfoStr[128];
+    snprintf(netInfoStr, sizeof(netInfoStr),
+        "Network: Port %d (receive+send) | Release Rate: %.1fx | Walls: %s",
+        UDP_PORT, GLOBAL_RELEASE_RATE_FACTOR,
+        ENABLE_VIRTUAL_WALLS ? "On" : "Off");
+    renderSmallText(-0.9f, -0.9f, FONT_MEDIUM, netInfoStr);
+
+    // Draw delay settings info
+    char delayInfoStr[128];
+    snprintf(delayInfoStr, sizeof(delayInfoStr),
+        "Adaptive Buffering: %s | Window Size: %d packets",
+        "Enabled", SLIDING_WINDOW_SIZE);
+    renderSmallText(0.1f, -0.9f, FONT_MEDIUM, delayInfoStr);
+
+    // Draw statistics if enabled
+    if (showStats) {
+        drawStatisticsPanel(0.0f, -0.1f, 0.5f, 0.3f);
+    }
+
+    // Draw feedback information
+    drawFeedbackPanel(-0.9f, -0.8f, 0.8f, 0.3f);
+
+    // Draw delay graphs if enabled
+    if (showGraphs) {
+        drawDelayGraphs(0.1f, -0.8f, 0.8f, 0.3f);
+    }
+
+    // Draw network jitter analysis if enabled
+    if (showJitterAnalysis) {
+        drawNetworkJitterAnalysis(0.65f, -0.1f, 0.5f, 0.3f);
+    }
+
+    // Draw legend box
+    if (showLegend) {
+        drawLegendBox(0.7f, 0.7f, LEGEND_WIDTH, LEGEND_HEIGHT);
+    }
+
+    // Draw help screen if enabled
+    if (showHelp) {
+        drawHelpScreen();
+    }
+
+    // Swap buffers
+    glutSwapBuffers();
+}
+
+// Reshape function
+void reshape(int w, int h) {
+    windowWidth = w;
+    windowHeight = h;
+    glViewport(0, 0, windowWidth, windowHeight);
+}
+
+// Keyboard function
+void keyboard(unsigned char key, int x, int y) {
+    bool hapticEnabled, wallsEnabled;
+    double forceScale, Kp, Kd;
+
+    // Get current haptic parameters
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticEnabled = hapticConfig.hapticEnabled;
+        wallsEnabled = hapticConfig.wallsEnabled;
+        forceScale = hapticConfig.forceScale;
+        Kp = hapticConfig.Kp;
+        Kd = hapticConfig.Kd;
+    }
+
+    switch (key) {
+    case 27:  // Escape key
+        if (showHelp) {
+            showHelp = false; // Close help if it's open
+        }
+        else {
+            // Cleanup and exit
+            cleanup();
+            exit(0);
+        }
+        break;
+
+    case 'f':
+    case 'F':
+        // Toggle fullscreen
+        fullscreen = !fullscreen;
+        if (fullscreen) {
+            glutFullScreen();
+        }
+        else {
+            glutReshapeWindow(1280, 800);
+        }
+        break;
+
+    case 'h':
+    case 'H':
+        // Toggle haptic feedback
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.hapticEnabled = !hapticConfig.hapticEnabled;
+        std::cout << "Haptic feedback "
+            << (hapticConfig.hapticEnabled ? "enabled" : "disabled") << std::endl;
+    }
+    break;
+
+    case 'w':
+    case 'W':
+        // Toggle virtual walls
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.wallsEnabled = !hapticConfig.wallsEnabled;
+        std::cout << "Virtual walls "
+            << (hapticConfig.wallsEnabled ? "enabled" : "disabled") << std::endl;
+    }
+    break;
+
+    case 's':
+    case 'S':
+        // Toggle statistics display
+        showStats = !showStats;
+        break;
+
+    case 'g':
+    case 'G':
+        // Toggle graphs
+        showGraphs = !showGraphs;
+        break;
+
+    case 'j':
+    case 'J':
+        // Toggle jitter analysis
+        showJitterAnalysis = !showJitterAnalysis;
+        break;
+
+    case 'l':
+    case 'L':
+        // Toggle legend
+        showLegend = !showLegend;
+        break;
+
+    case 'v':
+    case 'V':
+        // Toggle vector visualization
+        showVectorVis = !showVectorVis;
+        break;
+
+    case 'u':
+    case 'U':
+        // Toggle uniform delay
+        UNIFORM_DELAY_ENABLED = !UNIFORM_DELAY_ENABLED;
+        std::cout << "Uniform delay "
+            << (UNIFORM_DELAY_ENABLED ? "enabled" : "disabled") << std::endl;
+        break;
+
+    case 'r':
+    case 'R':
+        // Toggle random delay
+        RANDOM_DELAY_ENABLED = !RANDOM_DELAY_ENABLED;
+        std::cout << "Random delay "
+            << (RANDOM_DELAY_ENABLED ? "enabled" : "disabled") << std::endl;
+        break;
+
+    case '+':
+    case '=':
+        // Increase force scaling
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.forceScale *= 1.1;
+        std::cout << "Force scaling increased to " << hapticConfig.forceScale << std::endl;
+    }
+    break;
+
+    case '-':
+    case '_':
+        // Decrease force scaling
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.forceScale *= 0.9;
+        std::cout << "Force scaling decreased to " << hapticConfig.forceScale << std::endl;
+    }
+    break;
+
+    case 'k':
+    case 'K':
+        // Increase stiffness
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.Kp *= 1.1;
+        std::cout << "Stiffness increased to " << hapticConfig.Kp << " N/m" << std::endl;
+    }
+    break;
+
+    case 'i':
+    case 'I':
+        // Decrease stiffness
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.Kp *= 0.9;
+        std::cout << "Stiffness decreased to " << hapticConfig.Kp << " N/m" << std::endl;
+    }
+    break;
+
+    case 'd':
+    case 'D':
+        // Increase damping
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.Kd *= 1.1;
+        std::cout << "Damping increased to " << hapticConfig.Kd << " Ns/m" << std::endl;
+    }
+    break;
+
+    case 'a':
+    case 'A':
+        // Decrease damping
+    {
+        std::lock_guard<std::mutex> lock(hapticMutex);
+        hapticConfig.Kd *= 0.9;
+        std::cout << "Damping decreased to " << hapticConfig.Kd << " Ns/m" << std::endl;
+    }
+    break;
+
+    case '1': case '2': case '3': case '4': case '5':
+    case '6': case '7': case '8': case '9':
+        // Set global release rate factor
+        GLOBAL_RELEASE_RATE_FACTOR = (float)(key - '0');
+        std::cout << "Global release rate factor set to " << GLOBAL_RELEASE_RATE_FACTOR << std::endl;
+        break;
+    }
+
+    // Force redraw
+    glutPostRedisplay();
+}
+
+// Special keys handler
+void specialKeyboard(int key, int x, int y) {
+    switch (key) {
+    case GLUT_KEY_F1:
+        // Toggle help screen
+        showHelp = !showHelp;
+        break;
+
+    case GLUT_KEY_UP:
+        // Increase uniform delay
+        if (UNIFORM_DELAY_ENABLED) {
+            UNIFORM_DELAY_MS += 10;
+            std::cout << "Uniform delay increased to " << UNIFORM_DELAY_MS << " ms" << std::endl;
+        }
+        break;
+
+    case GLUT_KEY_DOWN:
+        // Decrease uniform delay
+        if (UNIFORM_DELAY_ENABLED && UNIFORM_DELAY_MS >= 10) {
+            UNIFORM_DELAY_MS -= 10;
+            std::cout << "Uniform delay decreased to " << UNIFORM_DELAY_MS << " ms" << std::endl;
+        }
+        break;
+    }
+
+    // Force redraw
+    glutPostRedisplay();
+}
+
+// Timer function to force regular redraws
+void timerCallback(int value) {
+    glutPostRedisplay();
+    glutTimerFunc(16, timerCallback, 0);  // ~60fps refresh rate
+}
+
+//------------------------------------------------------------------------------
+// MAIN FUNCTION
+//------------------------------------------------------------------------------
+int main(int argc, char** argv) {
+    // Initialize GLUT
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);
+    glutInitWindowSize(windowWidth, windowHeight);
+    glutCreateWindow("Enhanced Haptic Teleoperation System with Adaptive Buffering");
+
+    // Register callbacks
+    glutDisplayFunc(display);
+    glutReshapeFunc(reshape);
+    glutKeyboardFunc(keyboard);
+    glutSpecialFunc(specialKeyboard);
+    glutTimerFunc(16, timerCallback, 0);
+
+    // Initialize network
+    if (!initNetwork()) {
+        std::cerr << "Failed to initialize network. Exiting..." << std::endl;
+        return 1;
+    }
+
+    // Initialize haptic device
+    initHapticDevice();
+
+    // Initialize CSV log file with timestamp-based name
+    initCSVFile();
+
+    // Print instructions
+    std::cout << "------------------------------------------------------" << std::endl;
+    std::cout << "Enhanced Haptic Teleoperation System with Adaptive Buffering" << std::endl;
+    std::cout << "Network Port: " << UDP_PORT << " (for both receiving and sending feedback)" << std::endl;
+    std::cout << "Adaptive Buffering: Window Size = " << SLIDING_WINDOW_SIZE << " packets" << std::endl;
+    std::cout << "Packet Utilization: Marking every " << FEEDBACK_ACTIVE_PKTS
+        << " packets after " << PACKET_UTILIZATION_INTERVAL << " as active" << std::endl;
+    std::cout << "Press F1 for help, Esc to exit" << std::endl;
+    std::cout << "------------------------------------------------------" << std::endl;
+
+    // Start threads
+    std::thread networkRecvThread(receivePackets);
+    networkRecvThread.detach();
+
+    std::thread processingThread(processPacketsThread);
+    processingThread.detach();
+
+    std::thread hapticThread(updateHapticState);
+    hapticThread.detach();
+
+    std::thread feedbackThread(continuousFeedbackThread);
+    feedbackThread.detach();
+
+    // Enter GLUT main loop
+    glutMainLoop();
+
+    return 0;
+}
