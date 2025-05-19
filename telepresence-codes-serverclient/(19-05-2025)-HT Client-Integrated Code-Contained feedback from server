@@ -1,0 +1,664 @@
+//------------------------------------------------------------------------------
+// Haptic Teleoperation Client
+// - Sends haptic device position (x,y,z) to server via SEND_PORT
+// - Receives force feedback from server via RECV_PORT (or FALLBACK_PORT)
+// - Applies smoothed force feedback with adaptive damping/stiffness
+// - Allows free movement when no force feedback is received
+// - Displays all data on console with raw packet debugging
+//------------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mmsystem.h>
+#include "chai3d.h"
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <string>
+#include <vector>
+#include <numeric>
+#include <cmath>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winmm.lib")
+
+using namespace chai3d;
+using namespace std;
+
+//------------------------------------------------------------------------------
+// CONFIGURATION PARAMETERS
+//------------------------------------------------------------------------------
+
+// Network Settings
+const char CLIENT_IP[] = "169.254.50.63";        // Client IP address
+const char SERVER_IP[] = "169.254.213.206";      // Server IP address
+const int SEND_PORT = 4000;                      // Port for sending position data
+const int RECV_PORT = 4001;                      // Primary port for receiving force feedback
+const int FALLBACK_PORT = 4000;                  // Fallback port to try receiving
+const int BUFFER_SIZE = 5000;                    // Packet buffer size (bytes)
+const int SOCKET_TIMEOUT_MS = 1;                 // Socket select timeout (ms)
+const int SOCKET_RCVBUF_SIZE = 65536;           // Socket receive buffer size (bytes)
+
+// Haptic Device Settings
+const int HAPTIC_RATE_HZ = 1000;                // Haptic loop update rate (Hz)
+const double MAX_FORCE = 8.0;                    // Max force for Novint Falcon (N)
+
+// Control Parameters
+const int FORCE_PACKET_WINDOW = 5;               // Number of packets for force averaging
+const int ADAPTIVE_UPDATE_MS = 100;              // Interval for adaptive damping/stiffness update (ms)
+const bool USE_ADAPTIVE_DAMPING = true;         // Enable adaptive damping/stiffness
+const double ERROR_VARIANCE_SCALE = 0.5;        // Scaling factor for error variance
+const double MAX_DAMPING = 10.0;                // Max damping (N·s/m)
+const double MAX_STIFFNESS = 1000.0;            // Max stiffness (N/m)
+
+mutex forceFeedbackMutex;                        // Mutex for force feedback data
+cVector3d forceFeedback(0.0, 0.0, 0.0);          // Force vector to be applied
+bool newForceFeedback = false;                   // Flag for new force data
+int packetCount = 0;                            // Total packets sent
+int successfulSends = 0;                        // Successful packet sends
+int successfulReceives = 0;                     // Successful packet receives
+int failedSends = 0;                            // Failed packet sends
+int failedReceives = 0;                         // Failed packet receives
+int timeoutReceives = 0;                        // Timeout receive failures
+double lastStiffness = 0.0;                      // Last received stiffness (K)
+double lastDamping = 0.0;                        // Last received damping (B)
+double adaptiveStiffness = 0.0;                 // Adaptive stiffness
+double adaptiveDamping = 0.0;                   // Adaptive damping
+cVector3d lastError(0.0, 0.0, 0.0);             // Last received position error
+double lastPacketTime = 0.0;                    // Timestamp of last sent packet (ms)
+double avgLatency = 0.0;                        // Average round-trip latency (ms)
+int latencyCount = 0;                           // Number of latency measurements
+volatile bool running = true;                    // Program running flag
+volatile bool hapticRunning = true;              // Haptic thread running flag
+const int FEEDBACK_DISPLAY_RATE_MS = 100;       // Console update rate (ms)
+
+// Force Feedback Buffer
+vector<cVector3d> forceBuffer;                  // Buffer for force smoothing
+vector<double> stiffnessBuffer;                 // Buffer for stiffness
+vector<double> dampingBuffer;                   // Buffer for damping
+vector<cVector3d> errorBuffer;                  // Buffer for position errors
+mutex bufferMutex;                              // Mutex for buffer access
+
+// Packet Structures
+struct OutgoingPacket {
+    int packetNumber;
+    float x, y, z;
+    float delay;
+    char timestamp[64];
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int srcPort;                                // SEND_PORT
+    int dstPort;                                // SEND_PORT (server's listening port)
+};
+
+struct IncomingPacket {
+    int packetNumber;        // 4 bytes
+    double force[3];        // 24 bytes (3 * 8)
+    double position[3];     // 24 bytes (3 * 8)
+    double error[3];        // 24 bytes (3 * 8)
+    double stiffness;       // 8 bytes
+    double damping;         // 8 bytes
+    bool isActive;          // 1 byte (padded to 4 bytes)
+    char timestamp[64];     // 64 bytes
+}; // Total: 4 + 24 + 24 + 24 + 8 + 8 + 4 + 64 = 176 bytes
+
+//------------------------------------------------------------------------------
+// GLOBAL VARIABLES
+//------------------------------------------------------------------------------
+SOCKET sock = INVALID_SOCKET;
+SOCKET fallbackSock = INVALID_SOCKET;
+cHapticDeviceHandler* handler;
+cGenericHapticDevicePtr hapticDevice;
+cFrequencyCounter freqCounterHaptics;
+
+//------------------------------------------------------------------------------
+// FUNCTION PROTOTYPES
+//------------------------------------------------------------------------------
+void initializeWinsock();
+void setupSocket(SOCKET& s, int port);
+void networkCommunication();
+void hapticLoop();
+void feedbackDisplay();
+void cleanupSocket();
+void getCurrentTimestamp(char* buffer, size_t size);
+void handleError(const string& message);
+void logRawPacket(const char* buffer, int size);
+void updateAdaptiveParameters();
+
+//------------------------------------------------------------------------------
+// MAIN FUNCTION
+//------------------------------------------------------------------------------
+int main() {
+    timeBeginPeriod(1); // Enable high-resolution timer
+
+    cout << "===== Haptic Teleoperation Client =====" << endl;
+    cout << "Client IP: " << CLIENT_IP << endl;
+    cout << "Server IP: " << SERVER_IP << endl;
+    cout << "Send Port: " << SEND_PORT << endl;
+    cout << "Receive Port: " << RECV_PORT << " (Fallback: " << FALLBACK_PORT << ")" << endl;
+    cout << "Haptic Rate: " << HAPTIC_RATE_HZ << " Hz" << endl;
+    cout << "Expected IncomingPacket size: " << sizeof(IncomingPacket) << " bytes" << endl;
+    cout << "Force Packet Window: " << FORCE_PACKET_WINDOW << " packets" << endl;
+    cout << "Adaptive Update Interval: " << ADAPTIVE_UPDATE_MS << " ms" << endl;
+    cout << "Adaptive Damping: " << (USE_ADAPTIVE_DAMPING ? "Enabled" : "Disabled") << endl;
+    cout << "Press Ctrl+C or close console to exit" << endl;
+    cout << "=======================================" << endl << endl;
+
+    // Initialize Winsock
+    initializeWinsock();
+
+    // Set up sockets
+    setupSocket(sock, RECV_PORT);
+    setupSocket(fallbackSock, FALLBACK_PORT);
+
+    // Initialize haptic device
+    handler = new cHapticDeviceHandler();
+    handler->getDevice(hapticDevice, 0);
+    if (hapticDevice) {
+        cHapticDeviceInfo info = hapticDevice->getSpecifications();
+        if (!hapticDevice->open()) {
+            cout << "Failed to open haptic device!" << endl;
+        }
+        else {
+            cout << "Haptic device opened: " << info.m_modelName << endl;
+            hapticDevice->setEnableGripperUserSwitch(true);
+            hapticDevice->calibrate();
+        }
+    }
+    else {
+        cout << "No haptic device found! Exiting..." << endl;
+        cleanupSocket();
+        timeEndPeriod(1);
+        return 1;
+    }
+
+    // Initialize force buffer
+    forceBuffer.reserve(FORCE_PACKET_WINDOW);
+    stiffnessBuffer.reserve(FORCE_PACKET_WINDOW);
+    dampingBuffer.reserve(FORCE_PACKET_WINDOW);
+    errorBuffer.reserve(FORCE_PACKET_WINDOW);
+
+    // Start threads
+    thread networkThread(networkCommunication);
+    thread hapticThread(hapticLoop);
+    thread feedbackThread(feedbackDisplay);
+
+    // Main loop (keep alive until interrupted)
+    try {
+        while (running) {
+            this_thread::sleep_for(chrono::milliseconds(100));
+        }
+    }
+    catch (const exception& e) {
+        cerr << "ERROR: " << e.what() << endl;
+    }
+
+    // Clean up
+    running = false;
+    hapticRunning = false;
+    networkThread.join();
+    hapticThread.join();
+    feedbackThread.join();
+    if (hapticDevice) {
+        hapticDevice->close();
+    }
+    delete handler;
+    cleanupSocket();
+    timeEndPeriod(1);
+
+    return 0;
+}
+
+//------------------------------------------------------------------------------
+// FUNCTION IMPLEMENTATIONS
+//------------------------------------------------------------------------------
+void initializeWinsock() {
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        handleError("WSAStartup failed with error: " + to_string(result));
+    }
+    cout << "Winsock initialized successfully" << endl;
+}
+
+void setupSocket(SOCKET& s, int port) {
+    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
+        handleError("Socket creation failed with error: " + to_string(WSAGetLastError()));
+    }
+    sockaddr_in clientAddr;
+    memset(&clientAddr, 0, sizeof(clientAddr));
+    clientAddr.sin_family = AF_INET;
+    clientAddr.sin_port = htons(port);
+    inet_pton(AF_INET, CLIENT_IP, &clientAddr.sin_addr);
+    int bindResult = ::bind(s, (sockaddr*)&clientAddr, sizeof(clientAddr));
+    if (bindResult == SOCKET_ERROR) {
+        closesocket(s);
+        handleError("Bind failed on port " + to_string(port) + " with error: " + to_string(WSAGetLastError()));
+    }
+    int rcvbuf = SOCKET_RCVBUF_SIZE;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, sizeof(rcvbuf));
+    cout << "Socket bound to " << CLIENT_IP << ":" << port << endl;
+}
+
+void logRawPacket(const char* buffer, int size) {
+    cout << "Raw packet data (" << size << " bytes): ";
+    for (int i = 0; i < min(size, 32); i++) {
+        printf("%02x ", (unsigned char)buffer[i]);
+    }
+    if (size > 32) cout << "...";
+    cout << endl;
+}
+
+void updateAdaptiveParameters() {
+    lock_guard<mutex> lock(bufferMutex);
+    if (errorBuffer.empty()) {
+        adaptiveDamping = 0.0;
+        adaptiveStiffness = 0.0;
+        return;
+    }
+
+    // Compute mean error
+    cVector3d meanError(0.0, 0.0, 0.0);
+    for (const auto& err : errorBuffer) {
+        meanError += err; // Ensure err is cVector3d
+    }
+    meanError /= static_cast<double>(errorBuffer.size());
+
+    // Compute variance of error
+    cVector3d variance(0.0, 0.0, 0.0);
+    for (const auto& err : errorBuffer) {
+        cVector3d diff = err - meanError;
+        //variance += diff * diff; // Element-wise multiplication
+    }
+    variance /= static_cast<double>(errorBuffer.size());
+    double totalVariance = variance.length();
+
+    // Compute adaptive damping/stiffness
+    double avgDamping = dampingBuffer.empty() ? 0.0 :
+        accumulate(dampingBuffer.begin(), dampingBuffer.end(), 0.0) / dampingBuffer.size();
+    double avgStiffness = stiffnessBuffer.empty() ? 0.0 :
+        accumulate(stiffnessBuffer.begin(), stiffnessBuffer.end(), 0.0) / stiffnessBuffer.size();
+    adaptiveDamping = avgDamping * (1.0 - ERROR_VARIANCE_SCALE * totalVariance);
+    adaptiveStiffness = avgStiffness * (1.0 - ERROR_VARIANCE_SCALE * totalVariance);
+
+    // Clamp values
+    adaptiveDamping = max(0.0, min(adaptiveDamping, MAX_DAMPING));
+    adaptiveStiffness = max(0.0, min(adaptiveStiffness, MAX_STIFFNESS));
+
+    cout << "Updated adaptive parameters: Damping=" << adaptiveDamping
+        << " N·s/m, Stiffness=" << adaptiveStiffness << " N/m" << endl;
+}
+
+void networkCommunication() {
+    cout << "Network thread started" << endl;
+    sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(SEND_PORT);
+    inet_pton(AF_INET, SERVER_IP, &serverAddr.sin_addr);
+    char recvBuffer[BUFFER_SIZE];
+    sockaddr_in senderAddr;
+    int senderAddrSize = sizeof(senderAddr);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    fd_set readSet;
+    timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = SOCKET_TIMEOUT_MS * 1000;
+
+    auto lastAdaptiveUpdate = chrono::steady_clock::now();
+
+    while (running) {
+        auto loopStart = chrono::high_resolution_clock::now();
+        auto sendTime = chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+        cVector3d position;
+        bool validPosition = hapticDevice && hapticDevice->getPosition(position);
+        if (validPosition) {
+            OutgoingPacket packet;
+            memset(&packet, 0, sizeof(packet));
+            packet.packetNumber = ++packetCount;
+            packet.x = static_cast<float>(position.x());
+            packet.y = static_cast<float>(position.y());
+            packet.z = static_cast<float>(position.z());
+            packet.delay = 1000.0f / HAPTIC_RATE_HZ;
+            getCurrentTimestamp(packet.timestamp, sizeof(packet.timestamp));
+            strcpy_s(packet.srcIP, CLIENT_IP);
+            strcpy_s(packet.dstIP, SERVER_IP);
+            packet.srcPort = SEND_PORT;
+            packet.dstPort = SEND_PORT;
+            int sendResult = sendto(sock, (char*)&packet, sizeof(packet), 0,
+                (sockaddr*)&serverAddr, sizeof(serverAddr));
+            if (sendResult == SOCKET_ERROR) {
+                failedSends++;
+                cerr << "Send failed: " << WSAGetLastError() << endl;
+            }
+            else {
+                successfulSends++;
+                lastPacketTime = sendTime;
+                cout << "SENT #" << packet.packetNumber << " | Position: ("
+                    << fixed << setprecision(6) << packet.x << ", "
+                    << fixed << setprecision(6) << packet.y << ", "
+                    << fixed << setprecision(6) << packet.z << ") | "
+                    << packet.timestamp << endl;
+            }
+        }
+        else {
+            failedSends++;
+            cerr << "Failed to read haptic position" << endl;
+        }
+
+        // Check primary receive port (4001)
+        FD_ZERO(&readSet);
+        FD_SET(sock, &readSet);
+        int selectResult = select(0, &readSet, nullptr, nullptr, &timeout);
+        if (selectResult > 0 && FD_ISSET(sock, &readSet)) {
+            int recvResult = recvfrom(sock, recvBuffer, BUFFER_SIZE, 0,
+                (sockaddr*)&senderAddr, &senderAddrSize);
+            if (recvResult > 0) {
+                cout << "Received " << recvResult << " bytes from "
+                    << inet_ntoa(senderAddr.sin_addr) << ":" << ntohs(senderAddr.sin_port)
+                    << " on port " << RECV_PORT << endl;
+                logRawPacket(recvBuffer, recvResult);
+                if (recvResult >= sizeof(IncomingPacket)) {
+                    IncomingPacket* packet = reinterpret_cast<IncomingPacket*>(recvBuffer);
+                    cout << "Packet contents: packetNumber=" << packet->packetNumber
+                        << ", isActive=" << packet->isActive
+                        << ", force=[" << packet->force[0] << ", " << packet->force[1] << ", " << packet->force[2] << "]"
+                        << ", timestamp=" << packet->timestamp << endl;
+                    if (packet->isActive) {
+                        lock_guard<mutex> lock(forceFeedbackMutex);
+                        cVector3d force(packet->force[0], packet->force[1], packet->force[2]);
+                        if (force.length() > MAX_FORCE) {
+                            force = force * (MAX_FORCE / force.length());
+                        }
+                        {
+                            lock_guard<mutex> bufferLock(bufferMutex);
+                            forceBuffer.push_back(force);
+                            stiffnessBuffer.push_back(packet->stiffness);
+                            dampingBuffer.push_back(packet->damping);
+                            errorBuffer.push_back(cVector3d(packet->error[0], packet->error[1], packet->error[2]));
+                            if (forceBuffer.size() > FORCE_PACKET_WINDOW) {
+                                forceBuffer.erase(forceBuffer.begin());
+                                stiffnessBuffer.erase(stiffnessBuffer.begin());
+                                dampingBuffer.erase(dampingBuffer.begin());
+                                errorBuffer.erase(errorBuffer.begin());
+                            }
+                            // Compute average force
+                            cVector3d avgForce(0, 0, 0);
+                            for (const auto& f : forceBuffer) {
+                                avgForce += f;
+                            }
+                            avgForce /= static_cast<double>(forceBuffer.size());
+                            forceFeedback = avgForce;
+                        }
+                        lastStiffness = packet->stiffness;
+                        lastDamping = packet->damping;
+                        lastError.set(packet->error[0], packet->error[1], packet->error[2]);
+                        auto recvTime = chrono::duration_cast<chrono::milliseconds>(
+                            chrono::system_clock::now().time_since_epoch()).count();
+                        if (packet->packetNumber == packetCount) {
+                            double latency = recvTime - lastPacketTime;
+                            if (latencyCount == 0) {
+                                avgLatency = latency;
+                            }
+                            else {
+                                avgLatency = (avgLatency * latencyCount + latency) / (latencyCount + 1);
+                            }
+                            latencyCount++;
+                        }
+                        successfulReceives++;
+                        newForceFeedback = true;
+                        cout << "RECEIVED #" << packet->packetNumber << " | Force: ("
+                            << fixed << setprecision(6) << forceFeedback.x() << ", "
+                            << fixed << setprecision(6) << forceFeedback.y() << ", "
+                            << fixed << setprecision(6) << forceFeedback.z() << ") | "
+                            << "Stiffness: " << packet->stiffness << " | Damping: " << packet->damping
+                            << " | Timestamp: " << packet->timestamp << endl;
+                    }
+                    else {
+                        cout << "Received inactive packet, ignoring" << endl;
+                        lock_guard<mutex> lock(forceFeedbackMutex);
+                        newForceFeedback = false; // Ensure no damping when inactive
+                    }
+                }
+                else {
+                    failedReceives++;
+                    cout << "Received packet too small: " << recvResult << " bytes (expected >= "
+                        << sizeof(IncomingPacket) << ")" << endl;
+                }
+            }
+            else {
+                failedReceives++;
+                cerr << "Receive failed on port " << RECV_PORT << ": " << WSAGetLastError() << endl;
+            }
+        }
+        else {
+            timeoutReceives++;
+            cout << "Receive timeout on port " << RECV_PORT << " (" << timeoutReceives << " total)" << endl;
+            lock_guard<mutex> lock(forceFeedbackMutex);
+            newForceFeedback = false; // No new feedback, allow free movement
+        }
+
+        // Check fallback port (4000)
+        FD_ZERO(&readSet);
+        FD_SET(fallbackSock, &readSet);
+        selectResult = select(0, &readSet, nullptr, nullptr, &timeout);
+        if (selectResult > 0 && FD_ISSET(fallbackSock, &readSet)) {
+            int recvResult = recvfrom(fallbackSock, recvBuffer, BUFFER_SIZE, 0,
+                (sockaddr*)&senderAddr, &senderAddrSize);
+            if (recvResult > 0) {
+                cout << "Received " << recvResult << " bytes from "
+                    << inet_ntoa(senderAddr.sin_addr) << ":" << ntohs(senderAddr.sin_port)
+                    << " on port " << FALLBACK_PORT << endl;
+                logRawPacket(recvBuffer, recvResult);
+                if (recvResult >= sizeof(IncomingPacket)) {
+                    IncomingPacket* packet = reinterpret_cast<IncomingPacket*>(recvBuffer);
+                    cout << "Packet contents: packetNumber=" << packet->packetNumber
+                        << ", isActive=" << packet->isActive
+                        << ", force=[" << packet->force[0] << ", " << packet->force[1] << ", " << packet->force[2] << "]"
+                        << ", timestamp=" << packet->timestamp << endl;
+                    if (packet->isActive) {
+                        lock_guard<mutex> lock(forceFeedbackMutex);
+                        cVector3d force(packet->force[0], packet->force[1], packet->force[2]);
+                        if (force.length() > MAX_FORCE) {
+                            force = force * (MAX_FORCE / force.length());
+                        }
+                        {
+                            lock_guard<mutex> bufferLock(bufferMutex);
+                            forceBuffer.push_back(force);
+                            stiffnessBuffer.push_back(packet->stiffness);
+                            dampingBuffer.push_back(packet->damping);
+                            errorBuffer.push_back(cVector3d(packet->error[0], packet->error[1], packet->error[2]));
+                            if (forceBuffer.size() > FORCE_PACKET_WINDOW) {
+                                forceBuffer.erase(forceBuffer.begin());
+                                stiffnessBuffer.erase(stiffnessBuffer.begin());
+                                dampingBuffer.erase(dampingBuffer.begin());
+                                errorBuffer.erase(errorBuffer.begin());
+                            }
+                            cVector3d avgForce(0, 0, 0);
+                            for (const auto& f : forceBuffer) {
+                                avgForce += f;
+                            }
+                            avgForce /= static_cast<double>(forceBuffer.size());
+                            forceFeedback = avgForce;
+                        }
+                        lastStiffness = packet->stiffness;
+                        lastDamping = packet->damping;
+                        lastError.set(packet->error[0], packet->error[1], packet->error[2]);
+                        auto recvTime = chrono::duration_cast<chrono::milliseconds>(
+                            chrono::system_clock::now().time_since_epoch()).count();
+                        if (packet->packetNumber == packetCount) {
+                            double latency = recvTime - lastPacketTime;
+                            if (latencyCount == 0) {
+                                avgLatency = latency;
+                            }
+                            else {
+                                avgLatency = (avgLatency * latencyCount + latency) / (latencyCount + 1);
+                            }
+                            latencyCount++;
+                        }
+                        successfulReceives++;
+                        newForceFeedback = true;
+                        cout << "RECEIVED #" << packet->packetNumber << " | Force: ("
+                            << fixed << setprecision(6) << forceFeedback.x() << ", "
+                            << fixed << setprecision(6) << forceFeedback.y() << ", "
+                            << fixed << setprecision(6) << forceFeedback.z() << ") | "
+                            << "Stiffness: " << packet->stiffness << " | Damping: " << packet->damping
+                            << " | Timestamp: " << packet->timestamp << endl;
+                    }
+                    else {
+                        cout << "Received inactive packet on fallback port, ignoring" << endl;
+                        lock_guard<mutex> lock(forceFeedbackMutex);
+                        newForceFeedback = false;
+                    }
+                }
+                else {
+                    failedReceives++;
+                    cout << "Received packet too small on fallback port: " << recvResult << " bytes (expected >= "
+                        << sizeof(IncomingPacket) << ")" << endl;
+                }
+            }
+            else {
+                failedReceives++;
+                cerr << "Receive failed on port " << FALLBACK_PORT << ": " << WSAGetLastError() << endl;
+            }
+        }
+
+        // Update adaptive parameters periodically
+        auto now = chrono::steady_clock::now();
+        auto elapsedMs = chrono::duration_cast<chrono::milliseconds>(now - lastAdaptiveUpdate).count();
+        if (elapsedMs >= ADAPTIVE_UPDATE_MS && USE_ADAPTIVE_DAMPING) {
+            updateAdaptiveParameters();
+            lastAdaptiveUpdate = now;
+        }
+
+        auto loopEnd = chrono::high_resolution_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::microseconds>(loopEnd - loopStart);
+        auto sleepTime = chrono::microseconds(1000000 / HAPTIC_RATE_HZ) - elapsed;
+        if (sleepTime.count() > 0) {
+            this_thread::sleep_for(sleepTime);
+        }
+    }
+    cout << "Network thread exiting" << endl;
+}
+
+void hapticLoop() {
+    cout << "Haptic thread started" << endl;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    cVector3d lastVelocity(0.0, 0.0, 0.0);
+    while (hapticRunning) {
+        auto loopStart = chrono::high_resolution_clock::now();
+        cVector3d force(0.0, 0.0, 0.0);
+        double damping = 0.0;
+        {
+            lock_guard<mutex> lock(forceFeedbackMutex);
+            if (newForceFeedback) {
+                force = forceFeedback;
+                damping = USE_ADAPTIVE_DAMPING ? adaptiveDamping : lastDamping;
+            }
+            // Else, damping remains 0, allowing free movement
+        }
+        if (hapticDevice) {
+            cVector3d velocity;
+            if (hapticDevice->getLinearVelocity(velocity)) {
+                if (newForceFeedback) {
+                    force -= damping * velocity;
+                }
+                lastVelocity = velocity;
+            }
+            if (force.length() > 0.0) {
+                hapticDevice->setForce(force);
+            }
+            else {
+                hapticDevice->setForce(cVector3d(0, 0, 0)); // Ensure no residual force
+            }
+        }
+        freqCounterHaptics.signal(1);
+        auto loopEnd = chrono::high_resolution_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::microseconds>(loopEnd - loopStart);
+        auto sleepTime = chrono::microseconds(1000000 / HAPTIC_RATE_HZ) - elapsed;
+        if (sleepTime.count() > 0) {
+            this_thread::sleep_for(sleepTime);
+        }
+    }
+    cout << "Haptic thread exiting" << endl;
+}
+
+void feedbackDisplay() {
+    cout << "Feedback thread started" << endl;
+    while (running) {
+        cVector3d currentForce, currentError;
+        double stiffness, damping;
+        {
+            lock_guard<mutex> lock(forceFeedbackMutex);
+            currentForce = forceFeedback;
+            stiffness = USE_ADAPTIVE_DAMPING ? adaptiveStiffness : lastStiffness;
+            damping = USE_ADAPTIVE_DAMPING ? adaptiveDamping : lastDamping;
+            currentError = lastError;
+        }
+        cout << "\rHaptic Rate: " << fixed << setprecision(0) << freqCounterHaptics.getFrequency() << " Hz | "
+            << "Force: [" << fixed << setprecision(4) << currentForce.x() << ", "
+            << currentForce.y() << ", " << currentForce.z() << "] | "
+            << "Latency: " << fixed << setprecision(2) << avgLatency << " ms";
+
+        static int counter = 0;
+        if (++counter >= 50) {
+            counter = 0;
+            cout << endl << "Statistics:" << endl;
+            cout << "  Packets sent: " << packetCount
+                << " (Success: " << successfulSends << ", Failed: " << failedSends << ")" << endl;
+            cout << "  Packets received: " << successfulReceives
+                << " (Failed: " << failedReceives << ", Timeouts: " << timeoutReceives << ")" << endl;
+            cout << "  Force: [" << fixed << setprecision(4) << currentForce.x() << ", "
+                << currentForce.y() << ", " << currentForce.z() << "] N" << endl;
+            cout << "  Stiffness (K): " << stiffness << " N/m" << endl;
+            cout << "  Damping (B): " << damping << " N·s/m" << endl;
+            cout << "  Position error: [" << currentError.x() << ", "
+                << currentError.y() << ", " << currentError.z() << "]" << endl;
+            cVector3d position;
+            if (hapticDevice && hapticDevice->getPosition(position)) {
+                cout << "  Position: [" << fixed << setprecision(4) << position.x() << ", "
+                    << position.y() << ", " << position.z() << "] m" << endl;
+            }
+            cout << "  Average latency: " << fixed << setprecision(2) << avgLatency << " ms" << endl;
+            cout << endl;
+        }
+        this_thread::sleep_for(chrono::milliseconds(FEEDBACK_DISPLAY_RATE_MS));
+    }
+    cout << "Feedback thread exiting" << endl;
+}
+
+void cleanupSocket() {
+    if (sock != INVALID_SOCKET) {
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+    if (fallbackSock != INVALID_SOCKET) {
+        closesocket(fallbackSock);
+        fallbackSock = INVALID_SOCKET;
+    }
+    WSACleanup();
+    cout << "Sockets closed and Winsock cleaned up" << endl;
+}
+
+void getCurrentTimestamp(char* buffer, size_t size) {
+    auto now = chrono::system_clock::now();
+    auto time = chrono::system_clock::to_time_t(now);
+    auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    struct tm tstruct;
+    localtime_s(&tstruct, &time);
+    char temp[64];
+    strftime(temp, sizeof(temp), "%Y-%m-%d %H:%M:%S", &tstruct);
+    snprintf(buffer, size, "%s.%03lld", temp, (long long)ms.count());
+}
+
+void handleError(const string& message) {
+    throw runtime_error(message);
+}
