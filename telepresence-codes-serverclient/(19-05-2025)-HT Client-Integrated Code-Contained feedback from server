@@ -5,10 +5,11 @@
 // - Applies smoothed force feedback with adaptive damping/stiffness
 // - Allows free movement when no force feedback is received
 // - Displays all data on console with raw packet debugging
-// - Integrates a virtual environment with textured plane and spheres
+// - Integrates a virtual environment with untextured plane and spheres
 //------------------------------------------------------------------------------
 #define WIN32_LEAN_AND_MEAN
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mmsystem.h>
@@ -204,7 +205,6 @@ void logMessage(const string& message) {
 
 void handleError(const string& message) {
     logMessage("Error: " + message);
-    // No throwing; just log the error
 }
 
 int main() {
@@ -363,26 +363,6 @@ int main() {
     plane->setUseDisplayList(true);
     plane->m_material->setWhite();
 
-    // Create texture for plane and spheres
-    cTexture2dPtr texture = cTexture2d::create();
-    string texturePath = RESOURCE_PATH("resources/images/coin-normal.png");
-    bool fileload = texture->loadFromFile(texturePath);
-    if (!fileload) {
-        texturePath = "../../../bin/resources/images/coin-normal.png";
-        fileload = texture->loadFromFile(texturePath);
-    }
-    if (!fileload) {
-        logMessage("Texture image failed to load at " + texturePath + ". Continuing without texture.");
-    }
-
-    // Apply texture to plane
-    if (fileload) {
-        plane->setTexture(texture);
-        plane->setUseTexture(true);
-        plane->m_material->setWhite();
-        logMessage("Texture applied to plane successfully");
-    }
-
     // Create spheres
     for (int i = 0; i < NUM_SPHERES; i++) {
         spheres[i] = new cShapeSphere(SPHERE_RADIUS);
@@ -395,12 +375,7 @@ int main() {
         spheres[i]->setLocalPos(0.8 * SPHERE_RADIUS * (double)(i + 2) * cos(1.0 * (double)(i)),
             0.8 * SPHERE_RADIUS * (double)(i + 2) * sin(1.0 * (double)(i)),
             SPHERE_RADIUS);
-        if (fileload) {
-            spheres[i]->setTexture(texture);
-            spheres[i]->m_texture->setSphericalMappingEnabled(true);
-            spheres[i]->setUseTexture(true);
-            spheres[i]->m_material->setWhite();
-        }
+        spheres[i]->m_material->setWhite();
         sphereVel[i].zero();
     }
     logMessage("Spheres created successfully");
@@ -440,7 +415,7 @@ int main() {
     camera->m_backLayer->addChild(background);
     background->setFixedAspectRatio(true);
     string bgPath = RESOURCE_PATH("resources/images/HHRCM background.png");
-    fileload = background->loadFromFile(bgPath);
+    bool fileload = background->loadFromFile(bgPath);
     if (!fileload) {
         bgPath = "../../../bin/resources/images/HHRCM background.png";
         fileload = background->loadFromFile(bgPath);
@@ -897,43 +872,49 @@ void hapticLoop() {
                     for (int j = i + 1; j < NUM_SPHERES; j++) {
                         force.zero();
                         cVector3d pos1 = spheres[j]->getLocalPos();
-                        cVector3d dir01 = cNormalize(pos1 - pos0);
-                        double distance = cDistance(pos0, pos1);
+                        cVector3d dir01 = pos1 - pos0;
+                        double distance = dir01.length();
+                        if (distance > 1e-8) {
+                            dir01 /= distance;
+                        }
+                        else {
+                            dir01.zero();
+                        }
                         if (!button) {
                             if ((distance < 2.5 * SPHERE_RADIUS) && (distance > 2.0 * SPHERE_RADIUS)) {
-                                force.add(-K_MAGNET * (distance - 2.5 * SPHERE_RADIUS) * dir01);
+                                force += (-K_MAGNET * (distance - 2.5 * SPHERE_RADIUS) * dir01);
                             }
                         }
                         if (distance < 2.0 * SPHERES_RADIUS) {
-                            force.add(SPHERE_STIFFNESS * (distance - 2.0 * SPHERE_RADIUS) * dir01);
+                            force += (SPHERE_STIFFNESS * (distance - 2.0 * SPHERE_RADIUS) * dir01);
                         }
-                        sphereFce[i].add(force);
-                        sphereFce[j].add(-force);
+                        sphereFce[i] += force;
+                        sphereFce[j] += (-force);
                     }
                     if (pos0.z() < WALL_GROUND) {
-                        sphereFce[i].add(cVector3d(0.0, 0.0, SPHERE_STIFFNESS * (WALL_GROUND - pos0.z())));
+                        sphereFce[i] += cVector3d(0.0, 0.0, SPHERE_STIFFNESS * (WALL_GROUND - pos0.z()));
                     }
                     if (pos0.y() < WALL_LEFT) {
-                        sphereFce[i].add(cVector3d(0.0, SPHERE_STIFFNESS * (WALL_LEFT - pos0.y()), 0.0));
+                        sphereFce[i] += cVector3d(0.0, SPHERE_STIFFNESS * (WALL_LEFT - pos0.y()), 0.0);
                     }
                     if (pos0.y() > WALL_RIGHT) {
-                        sphereFce[i].add(cVector3d(0.0, SPHERE_STIFFNESS * (WALL_RIGHT - pos0.y()), 0.0));
+                        sphereFce[i] += cVector3d(0.0, SPHERE_STIFFNESS * (WALL_RIGHT - pos0.y()), 0.0);
                     }
                     if (pos0.x() < WALL_BACK) {
-                        sphereFce[i].add(cVector3d(SPHERE_STIFFNESS * (WALL_BACK - pos0.x()), 0.0, 0.0));
+                        sphereFce[i] += cVector3d(SPHERE_STIFFNESS * (WALL_BACK - pos0.x()), 0.0, 0.0);
                     }
                     if (pos0.x() > WALL_FRONT) {
-                        sphereFce[i].add(cVector3d(SPHERE_STIFFNESS * (WALL_FRONT - pos0.x()), 0.0, 0.0));
+                        sphereFce[i] += cVector3d(SPHERE_STIFFNESS * (WALL_FRONT - pos0.x()), 0.0, 0.0);
                     }
                 }
                 cVector3d dirHapticSphere = spheres[0]->getLocalPos() - position;
                 cVector3d forceSphere = -SPHERE_STIFFNESS * dirHapticSphere;
                 force = HAPTIC_STIFFNESS * dirHapticSphere;
-                sphereFce[0].add(forceSphere);
+                sphereFce[0] += forceSphere;
                 for (int i = 0; i < NUM_SPHERES; i++) {
                     cVector3d sphereAcc = (sphereFce[i] / SPHERE_MASS) + cVector3d(0.0, 0.0, -9.81);
                     sphereVel[i] = K_DAMPING * (sphereVel[i] + timeInterval * sphereAcc);
-                    cVector3d spherePos = spheres[i]->getLocalPos() + timeInterval * sphereVel[i] + cSqr(timeInterval) * sphereAcc;
+                    cVector3d spherePos = spheres[i]->getLocalPos() + timeInterval * sphereVel[i] + (timeInterval * timeInterval) * sphereAcc;
                     spheres[i]->setLocalPos(spherePos);
                 }
                 if (!flagHapticsEnabled) {
