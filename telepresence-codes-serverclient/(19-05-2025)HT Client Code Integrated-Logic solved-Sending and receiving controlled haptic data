@@ -1,0 +1,636 @@
+//------------------------------------------------------------------------------
+// Haptic Teleoperation System with Force Feedback
+// - Creates a haptic virtual environment with CHAI3D
+// - Sends position data to server via SEND_PORT
+// - Receives force feedback from server via RECV_PORT
+// - Applies force feedback to the haptic device
+//------------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <windows.h>
+#include <winsock2.h>  // Include before windows.h if both are needed
+#include <ws2tcpip.h>  // For additional socket functions
+#include <mmsystem.h>  // For high-resolution timer
+#include "chai3d.h"
+//------------------------------------------------------------------------------
+#include <GLFW/glfw3.h>
+#include <iphlpapi.h>
+#include <thread>
+#include <random>
+#include <mutex>
+#include <iomanip>
+#include <chrono>
+#include <iostream>
+#include <cstring>
+#include <sstream>
+//------------------------------------------------------------------------------
+using namespace chai3d;
+using namespace std;
+//------------------------------------------------------------------------------
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "winmm.lib") // Link winmm.lib for timeBeginPeriod
+
+//------------------------------------------------------------------------------
+// CONFIGURATION PARAMETERS
+//------------------------------------------------------------------------------
+
+// Network Settings
+const char SRC_IP[] = "169.254.50.63";           // Client IP address
+const char DST_IP[] = "169.254.213.206";         // Server IP address
+const int SEND_PORT = 4000;                      // Port for sending position data to server
+const int RECV_PORT = 4001;                      // Port for receiving force feedback from server
+const int BUFFER_SIZE = 1024;                    // Packet buffer size (bytes)
+
+// Haptic Device Settings
+const int HAPTIC_RATE_HZ = 1000;                 // Haptic loop update rate (Hz)
+const double SPHERE_RADIUS = 0.007;              // Radius of virtual spheres (meters)
+const int NUM_SPHERES = 2;                       // Number of spheres in the scene
+
+// Force Feedback Parameters
+cVector3d forceFeedback(0.0, 0.0, 0.0);          // Force vector to be applied
+bool newForceFeedback = false;                   // Flag for new force data
+int forcePacketsReceived = 0;                    // Counter for received force packets
+int successfulSends = 0;                        // Counter for successful packet sends
+int failedSends = 0;                            // Counter for failed packet sends
+int packetCount = 0;                            // Total packets sent
+
+// Control Parameters
+std::mutex forceFeedbackMutex;                  // Mutex for force feedback data
+const int FEEDBACK_DISPLAY_RATE_MS = 1;       // Feedback console update rate (ms)
+bool simulationRunning = false;                 // Haptic simulation running flag
+bool simulationFinished = true;                 // Haptic simulation finished flag
+volatile bool networkRunning = true;            // Network thread running flag
+volatile bool feedbackRunning = true;           // Feedback display thread running flag
+
+// Display Settings
+cStereoMode stereoMode = C_STEREO_DISABLED;     // Stereo display mode
+bool fullscreen = false;                        // Fullscreen display flag
+bool mirroredDisplay = false;                   // Vertical mirroring flag
+int swapInterval = 1;                           // Vertical synchronization interval
+
+// Packet Structures
+struct OutgoingPacket {
+    int packetNumber;
+    float x, y, z;
+    float delay;
+    char timestamp[64];
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int srcPort;                                // SEND_PORT
+    int dstPort;                                // SEND_PORT (server's listening port)
+};
+
+struct IncomingPacket {
+    int packetNumber;        // Must match outgoing packet number
+    double force[3];         // Force vector (x,y,z)
+    double position[3];      // Current device position
+    double error[3];         // Position error
+    double stiffness;        // Current stiffness value used (K)
+    double damping;          // Current damping value used (B)
+    bool isActive;           // Flag indicating if this is an "active" packet
+    char message[64];        // Message/status
+    char timestamp[64];      // Timestamp from server
+};
+
+//------------------------------------------------------------------------------
+// GLOBAL VARIABLES
+//------------------------------------------------------------------------------
+cWorld* world;                                  // Virtual world
+cCamera* camera;                                // Camera for rendering
+cSpotLight* light;                              // Light source
+cHapticDeviceHandler* handler;                  // Haptic device handler
+cGenericHapticDevicePtr hapticDevice;           // Haptic device
+double hapticDeviceMaxStiffness;                // Maximum stiffness of haptic device
+cShapeSphere* spheres[NUM_SPHERES];             // Sphere objects
+cVector3d sphereVel[NUM_SPHERES];               // Linear velocity of spheres
+cBackground* background;                        // Colored background
+cFontPtr font;                                  // Font for text rendering
+cLabel* labelRates;                             // Label for simulation rates
+cLabel* labelMessage;                           // Label for informational message
+cLabel* labelNetwork;                           // Label for network status
+cFrequencyCounter freqCounterGraphics;          // Graphic rate counter
+cFrequencyCounter freqCounterHaptics;           // Haptic rate counter
+cThread* hapticsThread;                         // Haptic thread
+std::thread* feedbackThread = nullptr;          // Feedback display thread
+GLFWwindow* window = NULL;                      // Window display context
+int width = 0;                                  // Window width
+int height = 0;                                 // Window height
+string resourceRoot;                            // Root resource path
+SOCKET sock = INVALID_SOCKET;                   // Network socket
+
+//------------------------------------------------------------------------------
+// DECLARED MACROS
+//------------------------------------------------------------------------------
+#define RESOURCE_PATH(p)    (char*)((resourceRoot+string(p)).c_str())
+
+//------------------------------------------------------------------------------
+// DECLARED FUNCTIONS
+//------------------------------------------------------------------------------
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
+void errorCallback(int error, const char* a_description);
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
+void updateGraphics(void);
+void updateHaptics(void);
+void networkCommunication(void);
+void feedbackDisplay(void);
+void close(void);
+void getLocalIP(char* ipBuffer);
+void getCurrentTimestamp(char* buffer, size_t size);
+bool initializeWinsock();
+bool setupSocket();
+void cleanupSocket();
+
+//------------------------------------------------------------------------------
+// IMPLEMENTATION OF FUNCTIONS
+//------------------------------------------------------------------------------
+void getLocalIP(char* ipBuffer) {
+    char hostname[256];
+    struct addrinfo hints {}, * info, * p;
+    struct sockaddr_in* sockaddr_ipv4;
+
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_PASSIVE;
+
+        if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
+            for (p = info; p != NULL; p = p->ai_next) {
+                sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
+                inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, INET_ADDRSTRLEN);
+                break;
+            }
+            freeaddrinfo(info);
+        }
+    }
+}
+
+void getCurrentTimestamp(char* buffer, size_t size) {
+    auto now = chrono::system_clock::now();
+    auto time = chrono::system_clock::to_time_t(now);
+    auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    struct tm tstruct;
+    localtime_s(&tstruct, &time);
+    char temp[64];
+    strftime(temp, sizeof(temp), "%Y-%m-%d %H:%M:%S", &tstruct);
+    snprintf(buffer, size, "%s.%03lld", temp, (long long)ms.count());
+}
+
+bool initializeWinsock() {
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        cerr << "WSAStartup failed with error: " << result << endl;
+        return false;
+    }
+    cout << "Winsock initialized successfully" << endl;
+    return true;
+}
+
+bool setupSocket() {
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        cerr << "Socket creation failed with error: " << WSAGetLastError() << endl;
+        return false;
+    }
+
+    // Bind socket to RECV_PORT for receiving force feedback
+    sockaddr_in clientAddr;
+    memset(&clientAddr, 0, sizeof(clientAddr));
+    clientAddr.sin_family = AF_INET;
+    clientAddr.sin_port = htons(RECV_PORT);
+    inet_pton(AF_INET, SRC_IP, &clientAddr.sin_addr);
+
+    int bindResult = ::bind(sock, (sockaddr*)&clientAddr, sizeof(clientAddr));
+    if (bindResult == SOCKET_ERROR) {
+        cerr << "Bind failed with error: " << WSAGetLastError() << endl;
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+        return false;
+    }
+
+    DWORD timeout = 1; // 1 millisecond timeout
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+    cout << "Socket set up successfully and bound to " << SRC_IP << ":" << RECV_PORT << endl;
+    return true;
+}
+
+void cleanupSocket() {
+    if (sock != INVALID_SOCKET) {
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+    WSACleanup();
+    cout << "Socket closed and Winsock cleaned up" << endl;
+}
+
+void networkCommunication(void) {
+    cout << "Network communication thread started" << endl;
+
+    // Setup server address for sending position data
+    sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(SEND_PORT);
+    inet_pton(AF_INET, DST_IP, &serverAddr.sin_addr);
+
+    // Buffer for receiving force feedback
+    char recvBuffer[BUFFER_SIZE];
+    sockaddr_in senderAddr;
+    int senderAddrSize = sizeof(senderAddr);
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    while (networkRunning) {
+        // Send position data
+        cVector3d position;
+        if (hapticDevice && hapticDevice->getPosition(position)) {
+            OutgoingPacket packet;
+            memset(&packet, 0, sizeof(packet));
+            packet.packetNumber = ++packetCount;
+            packet.x = static_cast<float>(position.x());
+            packet.y = static_cast<float>(position.y());
+            packet.z = static_cast<float>(position.z());
+            packet.delay = 1000.0f / HAPTIC_RATE_HZ;
+            getCurrentTimestamp(packet.timestamp, sizeof(packet.timestamp));
+            strcpy_s(packet.srcIP, SRC_IP);
+            strcpy_s(packet.dstIP, DST_IP);
+            packet.srcPort = SEND_PORT;
+            packet.dstPort = SEND_PORT;
+
+            int sendResult = sendto(sock, (char*)&packet, sizeof(packet), 0,
+                (sockaddr*)&serverAddr, sizeof(serverAddr));
+            if (sendResult == SOCKET_ERROR) {
+                failedSends++;
+            }
+            else {
+                successfulSends++;
+            }
+        }
+
+        // Receive force feedback
+        int recvResult = recvfrom(sock, recvBuffer, sizeof(recvBuffer), 0,
+            (sockaddr*)&senderAddr, &senderAddrSize);
+        if (recvResult > 0 && recvResult >= sizeof(IncomingPacket)) {
+            IncomingPacket* feedbackPacket = reinterpret_cast<IncomingPacket*>(recvBuffer);
+            if (feedbackPacket->isActive) {
+                lock_guard<mutex> lock(forceFeedbackMutex);
+                forceFeedback.set(
+                    feedbackPacket->force[0],
+                    feedbackPacket->force[1],
+                    feedbackPacket->force[2]
+                );
+                cout << "Received force: [" << forceFeedback.x() << ", " << forceFeedback.y() << ", " << forceFeedback.z() << "]" << endl;
+                newForceFeedback = true;
+                forcePacketsReceived++;
+            }
+        }
+
+        this_thread::sleep_for(chrono::microseconds(1000000 / HAPTIC_RATE_HZ));
+    }
+    cout << "Network communication thread exiting" << endl;
+}
+
+void feedbackDisplay(void) {
+    SetConsoleTitleA("Haptic Teleoperation Feedback");
+    AllocConsole();
+    FILE* dummyFile;
+    freopen_s(&dummyFile, "CONOUT$", "w", stdout);
+    cout << "-------------------------------------------------------" << endl;
+    cout << "Haptic Teleoperation Feedback Console" << endl;
+    cout << "-------------------------------------------------------" << endl;
+    cout << "Client IP: " << SRC_IP << endl;
+    cout << "Server IP: " << DST_IP << endl;
+    cout << "Send Port: " << SEND_PORT << endl;
+    cout << "Receive Port: " << RECV_PORT << endl;
+    cout << "-------------------------------------------------------" << endl;
+
+    while (feedbackRunning) {
+        cVector3d currentForce;
+        {
+            lock_guard<mutex> lock(forceFeedbackMutex);
+            currentForce = forceFeedback;
+        }
+
+        cout << "\rForce: ["
+            << fixed << setprecision(4) << currentForce.x() << ", "
+            << fixed << setprecision(4) << currentForce.y() << ", "
+            << fixed << setprecision(4) << currentForce.z() << "]  "
+            << "Magnitude: " << fixed << setprecision(4) << currentForce.length() << "  "
+            << "Packets: " << forcePacketsReceived << "   ";
+
+        static int counter = 0;
+        if (++counter >= 50) {
+            counter = 0;
+            cout << endl;
+            cout << "Statistics:" << endl;
+            cout << "  Packets sent: " << packetCount
+                << " (Success: " << successfulSends
+                << ", Failed: " << failedSends << ")" << endl;
+            cout << "  Force packets received: " << forcePacketsReceived << endl;
+            cout << "  Current force magnitude: " << currentForce.length() << " N" << endl;
+
+            cVector3d position;
+            if (hapticDevice && hapticDevice->getPosition(position)) {
+                cout << "  Current position: ["
+                    << fixed << setprecision(4) << position.x() << ", "
+                    << fixed << setprecision(4) << position.y() << ", "
+                    << fixed << setprecision(4) << position.z() << "]" << endl;
+            }
+            cout << endl;
+        }
+        this_thread::sleep_for(chrono::milliseconds(FEEDBACK_DISPLAY_RATE_MS));
+    }
+    cout << "Feedback display thread exiting" << endl;
+}
+
+int main(int argc, char* argv[])
+{
+    timeBeginPeriod(1); // Set high-resolution timer
+
+    cout << endl;
+    cout << "-----------------------------------" << endl;
+    cout << "Haptic Teleoperation System" << endl;
+    cout << "-----------------------------------" << endl;
+    cout << "Keyboard Options:" << endl << endl;
+    cout << "[f] - Enable/Disable full screen mode" << endl;
+    cout << "[m] - Enable/Disable vertical mirroring" << endl;
+    cout << "[q] - Exit application" << endl;
+    cout << endl << endl;
+
+    if (!initializeWinsock()) {
+        cerr << "Failed to initialize Winsock. Exiting..." << endl;
+        timeEndPeriod(1);
+        return 1;
+    }
+
+    if (!setupSocket()) {
+        cerr << "Failed to setup network socket. Exiting..." << endl;
+        WSACleanup();
+        timeEndPeriod(1);
+        return 1;
+    }
+
+    cout << "Network initialized with the following settings:" << endl;
+    cout << "Client IP: " << SRC_IP << endl;
+    cout << "Server IP: " << DST_IP << endl;
+    cout << "Send Port: " << SEND_PORT << endl;
+    cout << "Receive Port: " << RECV_PORT << endl;
+    cout << "Update Rate: " << HAPTIC_RATE_HZ << " Hz" << endl << endl;
+
+    feedbackRunning = true;
+    feedbackThread = new thread(feedbackDisplay);
+
+    if (!glfwInit()) {
+        cout << "Failed to initialize GLFW" << endl;
+        timeEndPeriod(1);
+        return 1;
+    }
+
+    glfwSetErrorCallback(errorCallback);
+    const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
+    int w = 0.8 * mode->height;
+    int h = 0.5 * mode->height;
+    int x = 0.5 * (mode->width - w);
+    int y = 0.5 * (mode->height - h);
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_STEREO, stereoMode == C_STEREO_ACTIVE ? GL_TRUE : GL_FALSE);
+
+    window = glfwCreateWindow(w, h, "Haptic Teleoperation System", NULL, NULL);
+    if (!window) {
+        cout << "Failed to create window" << endl;
+        glfwTerminate();
+        timeEndPeriod(1);
+        return 1;
+    }
+
+    glfwGetWindowSize(window, &width, &height);
+    glfwSetWindowPos(window, x, y);
+    glfwSetKeyCallback(window, keyCallback);
+    glfwSetWindowSizeCallback(window, windowSizeCallback);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(swapInterval);
+
+#ifdef GLEW_VERSION
+    if (glewInit() != GLEW_OK) {
+        cout << "Failed to initialize GLEW library" << endl;
+        glfwTerminate();
+        timeEndPeriod(1);
+        return 1;
+    }
+#endif
+
+    world = new cWorld();
+    world->m_backgroundColor.setWhite();
+    camera = new cCamera(world);
+    world->addChild(camera);
+    camera->set(cVector3d(0.20, 0.00, 0.10), cVector3d(0.00, 0.00, 0.00), cVector3d(0.00, 0.00, 1.00));
+    camera->setClippingPlanes(0.01, 10.0);
+    camera->setStereoMode(stereoMode);
+    camera->setStereoEyeSeparation(0.02);
+    camera->setStereoFocalLength(0.5);
+    camera->setMirrorVertical(mirroredDisplay);
+
+    light = new cSpotLight(world);
+    world->addChild(light);
+    light->setEnabled(true);
+    light->setLocalPos(0.5, 0.0, 0.5);
+    light->setDir(-0.5, 0.0, -0.5);
+
+    font = NEW_CFONTCALIBRI20();
+    labelRates = new cLabel(font);
+    labelRates->m_fontColor.setBlack();
+    camera->m_frontLayer->addChild(labelRates);
+
+    labelMessage = new cLabel(font);
+    labelMessage->m_fontColor.setBlack();
+    camera->m_frontLayer->addChild(labelMessage);
+
+    labelNetwork = new cLabel(font);
+    labelNetwork->m_fontColor.setBlueRoyal();
+    camera->m_frontLayer->addChild(labelNetwork);
+
+    background = new cBackground();
+    camera->m_backLayer->addChild(background);
+    background->setCornerColors(cColorf(1.0f, 1.0f, 1.0f), cColorf(1.0f, 1.0f, 1.0f),
+        cColorf(0.8f, 0.8f, 0.8f), cColorf(0.8f, 0.8f, 0.8f));
+
+    handler = new cHapticDeviceHandler();
+    handler->getDevice(hapticDevice, 0);
+    cHapticDeviceInfo hapticDeviceInfo;
+    if (hapticDevice) {
+        hapticDeviceInfo = hapticDevice->getSpecifications();
+        if (!hapticDevice->open()) {
+            cout << "Failed to open haptic device!" << endl;
+        }
+        else {
+            cout << "Haptic device opened successfully: " << hapticDeviceInfo.m_modelName << endl;
+            hapticDevice->setEnableGripperUserSwitch(true);
+            hapticDevice->calibrate();
+        }
+    }
+    else {
+        cout << "No haptic device found! Simulation will run without haptic feedback." << endl;
+    }
+
+    for (int i = 0; i < NUM_SPHERES; i++) {
+        spheres[i] = new cShapeSphere(SPHERE_RADIUS);
+        world->addChild(spheres[i]);
+        cEffectSurface* sphereEffect = new cEffectSurface(spheres[i]);
+        spheres[i]->addEffect(sphereEffect);
+        if (hapticDevice) {
+            spheres[i]->m_material->setStiffness(0.9 * hapticDeviceInfo.m_maxLinearStiffness);
+        }
+        spheres[i]->m_material->setRedIndian();
+        spheres[i]->setLocalPos(0.0, 0.0, 0.0);
+        sphereVel[i].zero();
+    }
+
+    if (hapticDevice) {
+        hapticDeviceMaxStiffness = hapticDeviceInfo.m_maxLinearStiffness;
+    }
+
+    hapticsThread = new cThread();
+    if (hapticDevice) {
+        hapticsThread->start(updateHaptics, CTHREAD_PRIORITY_HAPTICS);
+    }
+
+    networkRunning = true;
+    thread networkThread(networkCommunication);
+    atexit(close);
+    windowSizeCallback(window, width, height);
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwGetWindowSize(window, &width, &height);
+        updateGraphics();
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+        freqCounterGraphics.signal(1);
+    }
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    networkRunning = false;
+    networkThread.join();
+    timeEndPeriod(1);
+    return 0;
+}
+
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
+    width = a_width;
+    height = a_height;
+}
+
+void errorCallback(int a_error, const char* a_description) {
+    cout << "Error: " << a_description << endl;
+}
+
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
+    if ((a_action != GLFW_PRESS) && (a_action != GLFW_REPEAT)) {
+        return;
+    }
+    if ((a_key == GLFW_KEY_ESCAPE) || (a_key == GLFW_KEY_Q)) {
+        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+    }
+    else if (a_key == GLFW_KEY_F) {
+        fullscreen = !fullscreen;
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        if (fullscreen) {
+            glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+            glfwSwapInterval(swapInterval);
+        }
+        else {
+            int w = 0.8 * mode->height;
+            int h = 0.5 * mode->height;
+            int x = 0.5 * (mode->width - w);
+            int y = 0.5 * (mode->height - h);
+            glfwSetWindowMonitor(window, NULL, x, y, w, h, mode->refreshRate);
+            glfwSwapInterval(swapInterval);
+        }
+    }
+    else if (a_key == GLFW_KEY_M) {
+        mirroredDisplay = !mirroredDisplay;
+        camera->setMirrorVertical(mirroredDisplay);
+    }
+}
+
+void close(void) {
+    simulationRunning = false;
+    while (!simulationFinished) { cSleepMs(100); }
+    networkRunning = false;
+    feedbackRunning = false;
+    if (feedbackThread) {
+        feedbackThread->join();
+        delete feedbackThread;
+        feedbackThread = nullptr;
+    }
+    cleanupSocket();
+    if (hapticDevice) {
+        hapticDevice->close();
+    }
+    delete hapticsThread;
+    delete world;
+    delete handler;
+    timeEndPeriod(1);
+}
+
+void updateGraphics(void) {
+    labelRates->setText(cStr(freqCounterGraphics.getFrequency(), 0) + " Hz / " +
+        cStr(freqCounterHaptics.getFrequency(), 0) + " Hz");
+    labelRates->setLocalPos((int)(0.5 * (width - labelRates->getWidth())), 15);
+    labelMessage->setText("Haptic Teleoperation System - Press 'q' to quit");
+    labelMessage->setLocalPos((int)(0.5 * (width - labelMessage->getWidth())), 45);
+    stringstream ss;
+    ss << "Network: Sent " << packetCount << " pkts | Received " << forcePacketsReceived << " pkts";
+    labelNetwork->setText(ss.str());
+    labelNetwork->setLocalPos((int)(0.5 * (width - labelNetwork->getWidth())), 75);
+    world->updateShadowMaps(false, mirroredDisplay);
+    camera->renderView(width, height);
+    glFinish();
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) cout << "Error: " << gluErrorString(err) << endl;
+}
+
+void updateHaptics(void) {
+    simulationRunning = true;
+    simulationFinished = false;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    while (simulationRunning) {
+        auto loopStart = chrono::high_resolution_clock::now();
+        cVector3d pos;
+        if (hapticDevice && hapticDevice->getPosition(pos)) {
+            // Debug output (uncomment to verify position)
+            // cout << "Haptic position: [" << pos.x() << ", " << pos.y() << ", " << pos.z() << "]" << endl;
+            spheres[0]->setLocalPos(pos);
+            pos.z(pos.z() + 0.1);
+            spheres[1]->setLocalPos(pos);
+            pos.z(pos.z() - 0.2);
+            spheres[2]->setLocalPos(pos);
+            cVector3d force(0.0, 0.0, 0.0);
+            {
+                lock_guard<mutex> lock(forceFeedbackMutex);
+                if (newForceFeedback) {
+                    force = forceFeedback;
+                    newForceFeedback = false;
+                }
+            }
+            if (force.length() > 0.0) {
+                hapticDevice->setForce(force);
+            }
+        }
+        freqCounterHaptics.signal(1);
+        auto loopEnd = chrono::high_resolution_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::microseconds>(loopEnd - loopStart);
+        auto sleepTime = chrono::microseconds(1000000 / HAPTIC_RATE_HZ) - elapsed;
+        if (sleepTime.count() > 0) {
+            this_thread::sleep_for(sleepTime);
+        }
+    }
+    simulationFinished = true;
+}
