@@ -110,13 +110,13 @@ int RANDOM_DELAY_MAX_MS = 50;        // Maximum random delay in milliseconds
 //------------------------------------------------------------------------------
 // DISPLAY AND UI CONFIGURATION
 //------------------------------------------------------------------------------
-const int MAX_DISPLAY_PACKETS = 15;     // Maximum packets shown in visualization windows
+const int MAX_DISPLAY_PACKETS = 30;     // Maximum packets shown in visualization windows
 const int TIMESTAMP_DISPLAY_INTERVAL = 4; // Display every nth timestamp to avoid crowding
-const float TEXT_SPACING = 0.035f;      // Vertical spacing between text lines
+const float TEXT_SPACING = 0.04f;      // Vertical spacing between text lines
 const float BAR_WIDTH = 0.016f;         // Width of packet visualization bars
-const float BAR_MAX_HEIGHT = 0.3f;      // Maximum height for packet bars
+const float BAR_MAX_HEIGHT = 2.0f;      // Maximum height for packet bars
 const float TEXT_Y_OFFSET = 0.030f;     // Offset for text to prevent overlap
-const float GRAPH_HEIGHT = 0.25f;       // Height of delay graphs
+const float GRAPH_HEIGHT = 0.2f;       // Height of delay graphs
 const float LEGEND_WIDTH = 0.30f;       // Width of legend box
 const float LEGEND_HEIGHT = 0.20f;      // Height of legend box
 const float GUI_MARGIN = 0.05f;         // Margin around UI elements
@@ -1580,11 +1580,11 @@ void drawPacketVisualization(const std::deque<Packet>& packets, float xOffset,
     glColor3f(0.4f, 0.4f, 0.4f);
     glBegin(GL_LINES);
     // Horizontal axis
-    glVertex2f(xOffset - 0.05f, 0.35f);
-    glVertex2f(xOffset + 0.65f, 0.35f);
+    glVertex2f(xOffset - 0.05f, 0.55f);
+    glVertex2f(xOffset + 0.65f, 0.55f);
     // Vertical axis
-    glVertex2f(xOffset - 0.05f, 0.35f);
-    glVertex2f(xOffset - 0.05f, 0.65f);
+    glVertex2f(xOffset - 0.05f, 0.55f);
+    glVertex2f(xOffset - 0.05f, 0.85f);
     glEnd();
 
     // Draw packets as bars
@@ -1606,10 +1606,10 @@ void drawPacketVisualization(const std::deque<Packet>& packets, float xOffset,
         }
 
         glBegin(GL_QUADS);
-        glVertex2f(x, 0.35f);
-        glVertex2f(x + barWidth, 0.35f);
-        glVertex2f(x + barWidth, 0.35f + normalizedHeight);
-        glVertex2f(x, 0.35f + normalizedHeight);
+        glVertex2f(x, 0.55f);
+        glVertex2f(x + barWidth, 0.55f);
+        glVertex2f(x + barWidth, 0.55f + normalizedHeight);
+        glVertex2f(x, 0.55f + normalizedHeight);
         glEnd();
 
         // Draw packet number if enabled
@@ -1618,20 +1618,20 @@ void drawPacketVisualization(const std::deque<Packet>& packets, float xOffset,
             snprintf(packetNumStr, sizeof(packetNumStr), "%d", packet.packetNumber);
 
             // Calculate text position to avoid overlap
-            float textY = 0.35f - 0.03f;
+            float textY = 0.55f - 0.05f;
 
             // Stagger text positions to prevent overlap
             if (index % 2 == 0) {
                 textY -= TEXT_Y_OFFSET;
             }
 
-            renderSmallText(x - 0.005f, textY, FONT_SMALL, packetNumStr);
+            renderSmallText(x - 0.003f, textY, FONT_SMALL, packetNumStr);
         }
 
         // Show timestamp for some packets to avoid crowding
         if (index % TIMESTAMP_DISPLAY_INTERVAL == 0) {
             std::string formattedTime = formatTimestampForDisplay(packet.timestamp);
-            renderSmallText(x - 0.02f, 0.35f + normalizedHeight + 0.01f, FONT_SMALL, formattedTime.c_str());
+            renderSmallText(x - 0.02f, 0.70f + normalizedHeight + 0.01f, FONT_SMALL, formattedTime.c_str());
         }
 
         // Show time gap between packets if enabled
@@ -1640,7 +1640,7 @@ void drawPacketVisualization(const std::deque<Packet>& packets, float xOffset,
             if (timeGap > 0) {
                 char timeGapStr[32];
                 snprintf(timeGapStr, sizeof(timeGapStr), "%.1f ms", timeGap);
-                renderSmallText(x - 0.02f, 0.32f, FONT_SMALL, timeGapStr);
+                renderSmallText(x - 0.08f, 0.40f, FONT_SMALL, timeGapStr);
             }
         }
 
@@ -1650,7 +1650,7 @@ void drawPacketVisualization(const std::deque<Packet>& packets, float xOffset,
     // Add packet info section at the bottom
     if (!packets.empty()) {
         const Packet& latestPacket = packets.back();
-        float infoY = 0.28f;
+        float infoY = 0.30;
 
         std::ostringstream packetInfo;
         packetInfo << "Latest Packet: #" << latestPacket.packetNumber
