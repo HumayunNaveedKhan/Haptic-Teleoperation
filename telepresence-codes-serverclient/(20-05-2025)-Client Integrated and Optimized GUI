@@ -73,8 +73,8 @@ string resourceRoot = "../../../bin/";
 bool sendPacketsEnabled = true;
 bool receiveFeedbackEnabled = true;
 bool applyHapticFeedback = true;
-int networkThreadPriority = THREAD_PRIORITY_TIME_CRITICAL;
-int hapticThreadPriority = THREAD_PRIORITY_TIME_CRITICAL;
+//int networkThreadPriority = THREAD_PRIORITY_TIME_CRITICAL;
+//int hapticThreadPriority = THREAD_PRIORITY_TIME_CRITICAL;
 double packetDelayMin = 0.0;
 double packetDelayMax = 0.0;
 int maxPacketsToSend = 0;
@@ -82,6 +82,16 @@ double packetIntervalMs = 1000.0 / HAPTIC_RATE_HZ;
 bool rawModeEnabled = false;
 mutex controlMutex;
 const int GRAPH_WINDOW = 60;
+//vector<int> sentPacketCounts(GRAPH_WINDOW, 0);
+//vector<int> receivedPacketCounts(GRAPH_WINDOW, 0);
+//vector<double> sendDelays(GRAPH_WINDOW, 0.0);
+//vector<double> receiveDelays(GRAPH_WINDOW, 0.0);
+//mutex graphMutex;
+//chrono::steady_clock::time_point graphStartTime;
+// Graph data
+mutex forceFeedbackMutex;
+cVector3d forceFeedback(0.0, 0.0, 0.0);
+bool tempNewFeedback = false;
 vector<int> sentPacketCounts(GRAPH_WINDOW, 0);
 vector<int> receivedPacketCounts(GRAPH_WINDOW, 0);
 vector<double> sendDelays(GRAPH_WINDOW, 0.0);
@@ -89,9 +99,13 @@ vector<double> receiveDelays(GRAPH_WINDOW, 0.0);
 mutex graphMutex;
 chrono::steady_clock::time_point graphStartTime;
 
+// Thread priorities
+int networkThreadPriority = THREAD_PRIORITY_ABOVE_NORMAL;
+int hapticThreadPriority = THREAD_PRIORITY_ABOVE_NORMAL;
+
 // Global Variables
-mutex forceFeedbackMutex;
-cVector3d forceFeedback(0.0, 0.0, 0.0);
+//mutex forceFeedbackMutex;
+//cVector3d forceFeedback(0.0, 0.0, 0.0);
 bool newForceFeedback = false;
 int packetCount = 0;
 int successfulSends = 0;
@@ -651,9 +665,14 @@ void networkCommunication() {
     timeout.tv_usec = SOCKET_TIMEOUT_MS * 1000;
     auto lastAdaptiveUpdate = chrono::steady_clock::now();
     auto lastSendTime = chrono::steady_clock::now();
-    auto lastGraphReset = chrono::steady_clock::now();
+    auto lastGraphUpdate = chrono::steady_clock::now();
     random_device rd;
     mt19937 gen(rd());
+    // Temporary graph data to reduce mutex locking
+    vector<int> tempSentCounts(GRAPH_WINDOW, 0);
+    vector<int> tempReceivedCounts(GRAPH_WINDOW, 0);
+    vector<double> tempSendDelays(GRAPH_WINDOW, 0.0);
+    vector<double> tempReceiveDelays(GRAPH_WINDOW, 0.0);
 
     while (running) {
         auto loopStart = chrono::steady_clock::now();
@@ -689,15 +708,15 @@ void networkCommunication() {
                     strcpy_s(packet.dstIP, SERVER_IP);
                     packet.srcPort = SEND_PORT;
                     packet.dstPort = SEND_PORT;
+                    // Perform send outside mutex scope
                     int sendResult = sendto(sock, (char*)&packet, sizeof(packet), 0,
                         (sockaddr*)&serverAddr, sizeof(serverAddr));
                     if (sendResult == SOCKET_ERROR) {
                         int error = WSAGetLastError();
                         failedSends++;
                         logMessage("Send failed: " + to_string(error));
-                        // Attempt to reconnect socket if send fails
                         if (error == WSAECONNRESET || error == WSAENOTCONN) {
-                            logMessage("Attempting to reconnect primary socket...");
+                            logMessage("Reconnecting primary socket...");
                             closesocket(sock);
                             setupSocket(sock, RECV_PORT, 1);
                         }
@@ -708,11 +727,11 @@ void networkCommunication() {
                         logMessage("SENT #" + to_string(packet.packetNumber) + " | Position: (" +
                             to_string(packet.x) + ", " + to_string(packet.y) + ", " + to_string(packet.z) +
                             ") | " + packet.timestamp);
-                        lock_guard<mutex> lock(graphMutex);
+                        // Update temporary graph data
                         auto elapsedSec = chrono::duration_cast<chrono::seconds>(now - graphStartTime).count();
                         int index = elapsedSec % GRAPH_WINDOW;
-                        sentPacketCounts[index]++;
-                        sendDelays[index] = elapsedMs;
+                        tempSentCounts[index]++;
+                        tempSendDelays[index] = elapsedMs;
                     }
                     lastSendTime = now;
                     if (!currentRawMode && packetDelayMax > packetDelayMin) {
@@ -748,11 +767,6 @@ void networkCommunication() {
                     logRawPacket(recvBuffer, recvResult);
                     if (recvResult >= sizeof(IncomingPacket)) {
                         IncomingPacket* packet = reinterpret_cast<IncomingPacket*>(recvBuffer);
-                        logMessage("Packet contents: packetNumber=" + to_string(packet->packetNumber) +
-                            ", isActive=" + to_string(packet->isActive) +
-                            ", force=[" + to_string(packet->force[0]) + ", " +
-                            to_string(packet->force[1]) + ", " + to_string(packet->force[2]) + "]" +
-                            ", timestamp=" + string(packet->timestamp));
                         if (packet->isActive) {
                             lock_guard<mutex> lock(forceFeedbackMutex);
                             cVector3d force(packet->force[0], packet->force[1], packet->force[2]);
@@ -782,13 +796,11 @@ void networkCommunication() {
                             lastDamping = packet->damping;
                             lastError.set(packet->error[0], packet->error[1], packet->error[2]);
                             double latency = recvTime - lastPacketTime;
-                            {
-                                lock_guard<mutex> lock(graphMutex);
-                                auto elapsedSec = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - graphStartTime).count();
-                                int index = elapsedSec % GRAPH_WINDOW;
-                                receivedPacketCounts[index]++;
-                                receiveDelays[index] = latency >= 0 ? latency : 0.0;
-                            }
+                            // Update temporary graph data
+                            auto elapsedSec = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - graphStartTime).count();
+                            int index = elapsedSec % GRAPH_WINDOW;
+                            tempReceivedCounts[index]++;
+                            tempReceiveDelays[index] = latency >= 0 ? latency : 0.0;
                             if (packet->packetNumber == packetCount) {
                                 if (latencyCount == 0) {
                                     avgLatency = latency;
@@ -813,26 +825,13 @@ void networkCommunication() {
                     }
                     else {
                         failedReceives++;
-                        logMessage("Received packet too small: " + to_string(recvResult) + " bytes (expected >= " +
-                            to_string(sizeof(IncomingPacket)) + ")");
+                        logMessage("Received packet too small: " + to_string(recvResult) + " bytes");
                     }
                 }
                 else {
                     failedReceives++;
-                    int error = WSAGetLastError();
-                    logMessage("Receive failed on port " + to_string(RECV_PORT) + ": " + to_string(error));
-                    if (error == WSAECONNRESET || error == WSAENOTCONN) {
-                        logMessage("Attempting to reconnect primary socket...");
-                        closesocket(sock);
-                        setupSocket(sock, RECV_PORT, 1);
-                    }
+                    logMessage("Receive failed on port " + to_string(RECV_PORT) + ": " + to_string(WSAGetLastError()));
                 }
-            }
-            else {
-                timeoutReceives++;
-                logMessage("Receive timeout on port " + to_string(RECV_PORT) + " (" + to_string(timeoutReceives) + " total)");
-                lock_guard<mutex> lock(forceFeedbackMutex);
-                newForceFeedback = false;
             }
             FD_ZERO(&readSet);
             FD_SET(fallbackSock, &readSet);
@@ -849,11 +848,6 @@ void networkCommunication() {
                     logRawPacket(recvBuffer, recvResult);
                     if (recvResult >= sizeof(IncomingPacket)) {
                         IncomingPacket* packet = reinterpret_cast<IncomingPacket*>(recvBuffer);
-                        logMessage("Packet contents: packetNumber=" + to_string(packet->packetNumber) +
-                            ", isActive=" + to_string(packet->isActive) +
-                            ", force=[" + to_string(packet->force[0]) + ", " +
-                            to_string(packet->force[1]) + ", " + to_string(packet->force[2]) + "]" +
-                            ", timestamp=" + string(packet->timestamp));
                         if (packet->isActive) {
                             lock_guard<mutex> lock(forceFeedbackMutex);
                             cVector3d force(packet->force[0], packet->force[1], packet->force[2]);
@@ -883,13 +877,11 @@ void networkCommunication() {
                             lastDamping = packet->damping;
                             lastError.set(packet->error[0], packet->error[1], packet->error[2]);
                             double latency = recvTime - lastPacketTime;
-                            {
-                                lock_guard<mutex> lock(graphMutex);
-                                auto elapsedSec = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - graphStartTime).count();
-                                int index = elapsedSec % GRAPH_WINDOW;
-                                receivedPacketCounts[index]++;
-                                receiveDelays[index] = latency >= 0 ? latency : 0.0;
-                            }
+                            // Update temporary graph data
+                            auto elapsedSec = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - graphStartTime).count();
+                            int index = elapsedSec % GRAPH_WINDOW;
+                            tempReceivedCounts[index]++;
+                            tempReceiveDelays[index] = latency >= 0 ? latency : 0.0;
                             if (packet->packetNumber == packetCount) {
                                 if (latencyCount == 0) {
                                     avgLatency = latency;
@@ -914,41 +906,51 @@ void networkCommunication() {
                     }
                     else {
                         failedReceives++;
-                        logMessage("Received packet too small on fallback port: " + to_string(recvResult) + " bytes (expected >= " +
-                            to_string(sizeof(IncomingPacket)) + ")");
+                        logMessage("Received packet too small on fallback port: " + to_string(recvResult) + " bytes");
                     }
                 }
                 else {
                     failedReceives++;
-                    int error = WSAGetLastError();
-                    logMessage("Receive failed on port " + to_string(FALLBACK_PORT) + ": " + to_string(error));
-                    if (error == WSAECONNRESET || error == WSAENOTCONN) {
-                        logMessage("Attempting to reconnect fallback socket...");
-                        closesocket(fallbackSock);
-                        setupSocket(fallbackSock, FALLBACK_PORT, 1);
-                    }
+                    logMessage("Receive failed on port " + to_string(FALLBACK_PORT) + ": " + to_string(WSAGetLastError()));
                 }
             }
         }
-        // Periodically reset graph data to prevent stale values
+        // Update graph data periodically to reduce mutex contention
         auto now = chrono::steady_clock::now();
-        auto elapsedMs = chrono::duration_cast<chrono::milliseconds>(now - lastGraphReset).count();
-        if (elapsedMs >= GRAPH_WINDOW * 1000) {
+        auto elapsedGraphMs = chrono::duration_cast<chrono::milliseconds>(now - lastGraphUpdate).count();
+        if (elapsedGraphMs >= 100) { // Update every 100ms
             lock_guard<mutex> lock(graphMutex);
+            for (size_t i = 0; i < GRAPH_WINDOW; i++) {
+                sentPacketCounts[i] = tempSentCounts[i];
+                receivedPacketCounts[i] = tempReceivedCounts[i];
+                sendDelays[i] = tempSendDelays[i];
+                receiveDelays[i] = tempReceiveDelays[i];
+            }
+            lastGraphUpdate = now;
+        }
+        // Reset graph data periodically
+        auto elapsedSec = chrono::duration_cast<chrono::seconds>(now - graphStartTime).count();
+        if (elapsedSec >= GRAPH_WINDOW) {
+            lock_guard<mutex> lock(graphMutex);
+            fill(tempSentCounts.begin(), tempSentCounts.end(), 0);
+            fill(tempReceivedCounts.begin(), tempReceivedCounts.end(), 0);
+            fill(tempSendDelays.begin(), tempSendDelays.end(), 0.0);
+            fill(tempReceiveDelays.begin(), tempReceiveDelays.end(), 0.0);
             fill(sentPacketCounts.begin(), sentPacketCounts.end(), 0);
             fill(receivedPacketCounts.begin(), receivedPacketCounts.end(), 0);
             fill(sendDelays.begin(), sendDelays.end(), 0.0);
             fill(receiveDelays.begin(), receiveDelays.end(), 0.0);
             graphStartTime = now;
-            lastGraphReset = now;
+            lastGraphUpdate = now;
             logMessage("Graph data reset");
         }
-        // Reset packet count if maxPacketsToSend is reached
-        if (maxPacketsToSend > 0 && packetCount >= maxPacketsToSend) {
+        // Reset packet count
+        if (currentMaxPackets > 0 && packetCount >= currentMaxPackets) {
             lock_guard<mutex> lock(controlMutex);
             packetCount = 0;
-            logMessage("Packet count reset to allow continuous sending");
+            logMessage("Packet count reset");
         }
+        // Update adaptive parameters
         auto elapsedAdaptiveMs = chrono::duration_cast<chrono::milliseconds>(now - lastAdaptiveUpdate).count();
         if (elapsedAdaptiveMs >= ADAPTIVE_UPDATE_MS && USE_ADAPTIVE_DAMPING && !currentRawMode) {
             updateAdaptiveParameters();
@@ -995,6 +997,7 @@ void hapticLoop() {
         if (hapticDevice) {
             if (!hapticDevice->getUserSwitch(0, button)) {
                 logMessage("Failed to read user switch");
+                button = false; // Prevent stalling
             }
         }
         if (button) {
@@ -1085,23 +1088,29 @@ void hapticLoop() {
         }
         else {
             bool shouldApplyFeedback = false;
+            cVector3d tempForce;
+            bool tempNewFeedback = false;
             {
                 lock_guard<mutex> lock(controlMutex);
                 shouldApplyFeedback = applyHapticFeedback || rawModeEnabled;
             }
             if (shouldApplyFeedback) {
-                lock_guard<mutex> lock(forceFeedbackMutex);
-                logMessage("Acquired forceFeedbackMutex in hapticLoop");
-                if (newForceFeedback) {
-                    force = forceFeedback;
+                if (forceFeedbackMutex.try_lock()) { // Non-blocking lock
+                    tempForce = forceFeedback;
+                    tempNewFeedback = newForceFeedback;
                     damping = USE_ADAPTIVE_DAMPING ? adaptiveDamping : lastDamping;
+                    forceFeedbackMutex.unlock();
+                }
+                if (tempNewFeedback) {
+                    force = tempForce;
                 }
             }
         }
         if (hapticDevice) {
             cVector3d velocity;
-            if (hapticDevice->getLinearVelocity(velocity)) {
-                if (!useVirtualEnvironment && newForceFeedback && (applyHapticFeedback || rawModeEnabled)) {
+            bool velocityValid = hapticDevice->getLinearVelocity(velocity);
+            if (velocityValid) {
+                if (!useVirtualEnvironment && tempNewFeedback && (applyHapticFeedback || rawModeEnabled)) {
                     force -= damping * velocity;
                 }
                 lastVelocity = velocity;
@@ -1132,8 +1141,8 @@ void hapticLoop() {
     logMessage("Haptic thread exiting");
 }
 void timerCallback(int value) {
-    glutPostRedisplay(); // Trigger redraw of the GLUT window
-    glutTimerFunc(50, timerCallback, 0); // Schedule next update in 50ms
+    glutPostRedisplay();
+    glutTimerFunc(33, timerCallback, 0); // 33ms for ~30Hz
 }
 
 void glutGUI() {
@@ -1149,7 +1158,7 @@ void glutGUI() {
     glutReshapeFunc(glutReshape);
     glutKeyboardFunc(glutKeyboard);
     glClearColor(COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, 1.0f);
-    glutTimerFunc(50, timerCallback, 0); // Start the timer with 50ms interval
+    glutTimerFunc(33, timerCallback, 0); // 33ms for ~30Hz
     glutMainLoop();
     logMessage("GLUT GUI thread exiting");
 }
@@ -1201,12 +1210,23 @@ void glutDisplay() {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    lock_guard<mutex> lock(graphMutex);
+    // Copy graph data to avoid holding mutex
+    vector<int> localSentCounts(GRAPH_WINDOW);
+    vector<int> localReceivedCounts(GRAPH_WINDOW);
+    vector<double> localSendDelays(GRAPH_WINDOW);
+    vector<double> localReceiveDelays(GRAPH_WINDOW);
+    {
+        lock_guard<mutex> lock(graphMutex);
+        localSentCounts = sentPacketCounts;
+        localReceivedCounts = receivedPacketCounts;
+        localSendDelays = sendDelays;
+        localReceiveDelays = receiveDelays;
+    }
 
     float yOffset = glutHeight - MARGIN;
     float xOffset = MARGIN;
-    float rightOffset = glutWidth * 0.6f; // Right side for packet coordinates
-    float graphWidth = glutWidth * 0.55f - 2 * MARGIN; // Adjusted graph width
+    float rightOffset = glutWidth * 0.6f;
+    float graphWidth = glutWidth * 0.55f - 2 * MARGIN;
 
     // Section 1: Network Statistics
     drawText(xOffset, yOffset, "Network Statistics", TITLE_FONT);
@@ -1214,7 +1234,7 @@ void glutDisplay() {
 
     cVector3d position(0.0, 0.0, 0.0);
     if (hapticDevice) {
-        hapticDevice->getPosition(position);
+        hapticDevice->getPosition(position); // Non-critical, no error handling
     }
     drawText(xOffset, yOffset, "Mode: " + string(useVirtualEnvironment ? "Virtual Environment" : "Network"));
     yOffset -= TEXT_HEIGHT;
@@ -1230,28 +1250,24 @@ void glutDisplay() {
     yOffset -= TEXT_HEIGHT;
 
     float graphY = yOffset - GRAPH_HEIGHT;
-    int maxPackets = max(*max_element(sentPacketCounts.begin(), sentPacketCounts.end()),
-        *max_element(receivedPacketCounts.begin(), receivedPacketCounts.end()));
+    int maxPackets = max(*max_element(localSentCounts.begin(), localSentCounts.end()),
+        *max_element(localReceivedCounts.begin(), localReceivedCounts.end()));
     maxPackets = max(maxPackets, 1);
 
-    // Draw Grid
     drawGrid(xOffset, graphY, graphWidth, GRAPH_HEIGHT, 5, COLOR_GRID);
-
-    // Draw Axes
     glColor3f(COLOR_AXIS.r, COLOR_AXIS.g, COLOR_AXIS.b);
     glBegin(GL_LINES);
     glVertex2f(xOffset, graphY);
-    glVertex2f(xOffset, graphY + GRAPH_HEIGHT); // Y-axis
+    glVertex2f(xOffset, graphY + GRAPH_HEIGHT);
     glVertex2f(xOffset, graphY);
-    glVertex2f(xOffset + graphWidth, graphY); // X-axis
+    glVertex2f(xOffset + graphWidth, graphY);
     glEnd();
 
-    // Draw Bars for Sent Packets (Blue)
     glBegin(GL_QUADS);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
-        if (sentPacketCounts[i] > 0) {
+        if (localSentCounts[i] > 0) {
             float barX = xOffset + i * BAR_WIDTH;
-            float sentHeight = (sentPacketCounts[i] / (float)maxPackets) * GRAPH_HEIGHT;
+            float sentHeight = (localSentCounts[i] / (float)maxPackets) * GRAPH_HEIGHT;
             glColor3f(COLOR_SENT.r, COLOR_SENT.g, COLOR_SENT.b);
             glVertex2f(barX, graphY);
             glVertex2f(barX + BAR_WIDTH * 0.45f, graphY);
@@ -1261,12 +1277,11 @@ void glutDisplay() {
     }
     glEnd();
 
-    // Draw Bars for Received Packets (Red)
     glBegin(GL_QUADS);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
-        if (receivedPacketCounts[i] > 0) {
-            float barX = xOffset + i * BAR_WIDTH + BAR_WIDTH * 0.5f; // Offset to right of sent bars
-            float receivedHeight = (receivedPacketCounts[i] / (float)maxPackets) * GRAPH_HEIGHT;
+        if (localReceivedCounts[i] > 0) {
+            float barX = xOffset + i * BAR_WIDTH + BAR_WIDTH * 0.5f;
+            float receivedHeight = (localReceivedCounts[i] / (float)maxPackets) * GRAPH_HEIGHT;
             glColor3f(COLOR_RECEIVED.r, COLOR_RECEIVED.g, COLOR_RECEIVED.b);
             glVertex2f(barX, graphY);
             glVertex2f(barX + BAR_WIDTH * 0.45f, graphY);
@@ -1276,7 +1291,6 @@ void glutDisplay() {
     }
     glEnd();
 
-    // Draw Axis Labels
     drawText(xOffset - 40, graphY + GRAPH_HEIGHT + 5, "Packets");
     drawText(xOffset + graphWidth + 5, graphY - 5, "Time (s)");
 
@@ -1286,43 +1300,37 @@ void glutDisplay() {
     drawText(xOffset, yOffset, "Packet Delays (ms)", TITLE_FONT);
     yOffset -= TEXT_HEIGHT;
 
-    double maxDelay = max(*max_element(sendDelays.begin(), sendDelays.end()),
-        *max_element(receiveDelays.begin(), receiveDelays.end()));
+    double maxDelay = max(*max_element(localSendDelays.begin(), localSendDelays.end()),
+        *max_element(localReceiveDelays.begin(), localReceiveDelays.end()));
     maxDelay = max(maxDelay, 1.0);
 
-    // Draw Grid
     drawGrid(xOffset, graphY - GRAPH_HEIGHT, graphWidth, GRAPH_HEIGHT, 5, COLOR_GRID);
-
-    // Draw Axes
     glColor3f(COLOR_AXIS.r, COLOR_AXIS.g, COLOR_AXIS.b);
     glBegin(GL_LINES);
     glVertex2f(xOffset, graphY - GRAPH_HEIGHT);
-    glVertex2f(xOffset, graphY); // Y-axis
+    glVertex2f(xOffset, graphY);
     glVertex2f(xOffset, graphY - GRAPH_HEIGHT);
-    glVertex2f(xOffset + graphWidth, graphY - GRAPH_HEIGHT); // X-axis
+    glVertex2f(xOffset + graphWidth, graphY - GRAPH_HEIGHT);
     glEnd();
 
-    // Draw Send Delay Line (Blue)
     glColor3f(COLOR_SENT.r, COLOR_SENT.g, COLOR_SENT.b);
     glBegin(GL_LINE_STRIP);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
         float x = xOffset + i * BAR_WIDTH;
-        float y = graphY - GRAPH_HEIGHT + (float)(sendDelays[i] / maxDelay) * GRAPH_HEIGHT;
+        float y = graphY - GRAPH_HEIGHT + (float)(localSendDelays[i] / maxDelay) * GRAPH_HEIGHT;
         glVertex2f(x + BAR_WIDTH / 2, y);
     }
     glEnd();
 
-    // Draw Receive Delay Line (Red)
     glColor3f(COLOR_RECEIVED.r, COLOR_RECEIVED.g, COLOR_RECEIVED.b);
     glBegin(GL_LINE_STRIP);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
         float x = xOffset + i * BAR_WIDTH;
-        float y = graphY - GRAPH_HEIGHT + (float)(receiveDelays[i] / maxDelay) * GRAPH_HEIGHT;
+        float y = graphY - GRAPH_HEIGHT + (float)(localReceiveDelays[i] / maxDelay) * GRAPH_HEIGHT;
         glVertex2f(x + BAR_WIDTH / 2, y);
     }
     glEnd();
 
-    // Draw Axis Labels
     drawText(xOffset - 40, graphY - 5, "Delay (ms)");
     drawText(xOffset + graphWidth + 5, graphY - GRAPH_HEIGHT - 5, "Time (s)");
 
@@ -1365,11 +1373,11 @@ void glutDisplay() {
     drawText(xOffset, yOffset, "[4] Raw Mode");
     drawCircle(statusX, yOffset, STATUS_RADIUS, rawModeEnabled ? COLOR_ON : COLOR_OFF);
     yOffset -= TEXT_HEIGHT;
-    drawText(xOffset, yOffset, "[5] Net Priority: " + string(networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
-    drawCircle(statusX, yOffset, STATUS_RADIUS, networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? COLOR_ON : COLOR_OFF);
+    drawText(xOffset, yOffset, "[5] Net Priority: " + string(networkThreadPriority == THREAD_PRIORITY_ABOVE_NORMAL ? "ABOVE_NORMAL" : "NORMAL"));
+    drawCircle(statusX, yOffset, STATUS_RADIUS, networkThreadPriority == THREAD_PRIORITY_ABOVE_NORMAL ? COLOR_ON : COLOR_OFF);
     yOffset -= TEXT_HEIGHT;
-    drawText(xOffset, yOffset, "[6] Hap Priority: " + string(hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
-    drawCircle(statusX, yOffset, STATUS_RADIUS, hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? COLOR_ON : COLOR_OFF);
+    drawText(xOffset, yOffset, "[6] Hap Priority: " + string(hapticThreadPriority == THREAD_PRIORITY_ABOVE_NORMAL ? "ABOVE_NORMAL" : "NORMAL"));
+    drawCircle(statusX, yOffset, STATUS_RADIUS, hapticThreadPriority == THREAD_PRIORITY_ABOVE_NORMAL ? COLOR_ON : COLOR_OFF);
     yOffset -= TEXT_HEIGHT;
     drawText(xOffset, yOffset, "[7] Delay Min: " + to_string_with_precision(packetDelayMin, 1) + " ms");
     yOffset -= TEXT_HEIGHT;
@@ -1383,12 +1391,11 @@ void glutDisplay() {
     yOffset -= TEXT_HEIGHT;
     drawText(xOffset, yOffset, "[q] or [Esc] Exit");
 
-    // Section 4: Real-Time Packet Coordinates (Right Side)
+    // Section 4: Real-Time Packet Coordinates
     yOffset = glutHeight - MARGIN;
     drawText(rightOffset, yOffset, "Latest Packet Data", TITLE_FONT);
     yOffset -= TEXT_HEIGHT * 2;
 
-    // Latest Sent Packet (Position)
     static cVector3d lastSentPosition(0.0, 0.0, 0.0);
     if (successfulSends > 0) {
         cVector3d pos;
@@ -1403,7 +1410,6 @@ void glutDisplay() {
         to_string_with_precision(lastSentPosition.z(), 4) + ") m");
     yOffset -= TEXT_HEIGHT * 2;
 
-    // Latest Received Packet (Force)
     static cVector3d lastReceivedForce(0.0, 0.0, 0.0);
     if (newForceFeedback) {
         lock_guard<mutex> lock(forceFeedbackMutex);
