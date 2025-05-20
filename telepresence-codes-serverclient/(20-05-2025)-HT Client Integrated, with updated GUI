@@ -1182,8 +1182,8 @@ void glutDisplay() {
     drawText(xOffset, yOffset, "Avg Latency: " + to_string_with_precision(avgLatency, 1) + " ms");
     yOffset -= SECTION_SPACING;
 
-    // Graph 1: Sent Packets
-    drawText(xOffset, yOffset, "Sent Packets (Last " + to_string(GRAPH_WINDOW) + "s)", TITLE_FONT);
+    // Graph 1: Sent and Received Packets
+    drawText(xOffset, yOffset, "Sent and Received Packets (Last " + to_string(GRAPH_WINDOW) + "s)", TITLE_FONT);
     yOffset -= TEXT_HEIGHT;
 
     float graphY = yOffset - GRAPH_HEIGHT;
