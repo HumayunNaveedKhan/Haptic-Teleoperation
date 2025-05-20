@@ -1163,7 +1163,7 @@ void glutDisplay() {
     float yOffset = glutHeight - MARGIN;
     float xOffset = MARGIN;
     float rightOffset = glutWidth * 0.6f; // Right side for packet coordinates
-    float graphWidth = glutWidth * 0.55f - 2 * MARGIN; // Adjusted graph width to leave space on right
+    float graphWidth = glutWidth * 0.55f - 2 * MARGIN; // Adjusted graph width
 
     // Section 1: Network Statistics
     drawText(xOffset, yOffset, "Network Statistics", TITLE_FONT);
@@ -1182,13 +1182,14 @@ void glutDisplay() {
     drawText(xOffset, yOffset, "Avg Latency: " + to_string_with_precision(avgLatency, 1) + " ms");
     yOffset -= SECTION_SPACING;
 
-    // Graph 1: Sent Packets (Position)
+    // Graph 1: Sent Packets
     drawText(xOffset, yOffset, "Sent Packets (Last " + to_string(GRAPH_WINDOW) + "s)", TITLE_FONT);
     yOffset -= TEXT_HEIGHT;
 
     float graphY = yOffset - GRAPH_HEIGHT;
-    int maxSentPackets = *max_element(sentPacketCounts.begin(), sentPacketCounts.end());
-    maxSentPackets = max(maxSentPackets, 1);
+    int maxPackets = max(*max_element(sentPacketCounts.begin(), sentPacketCounts.end()),
+        *max_element(receivedPacketCounts.begin(), receivedPacketCounts.end()));
+    maxPackets = max(maxPackets, 1);
 
     // Draw Grid
     drawGrid(xOffset, graphY, graphWidth, GRAPH_HEIGHT, 5, COLOR_GRID);
@@ -1202,12 +1203,12 @@ void glutDisplay() {
     glVertex2f(xOffset + graphWidth, graphY); // X-axis
     glEnd();
 
-    // Draw Bars for Sent Packets (Blue, each bar = one packet)
+    // Draw Bars for Sent Packets (Blue)
     glBegin(GL_QUADS);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
         if (sentPacketCounts[i] > 0) {
             float barX = xOffset + i * BAR_WIDTH;
-            float sentHeight = (sentPacketCounts[i] / (float)maxSentPackets) * GRAPH_HEIGHT;
+            float sentHeight = (sentPacketCounts[i] / (float)maxPackets) * GRAPH_HEIGHT;
             glColor3f(COLOR_SENT.r, COLOR_SENT.g, COLOR_SENT.b);
             glVertex2f(barX, graphY);
             glVertex2f(barX + BAR_WIDTH * 0.45f, graphY);
@@ -1217,18 +1218,34 @@ void glutDisplay() {
     }
     glEnd();
 
+    // Draw Bars for Received Packets (Red)
+    glBegin(GL_QUADS);
+    for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
+        if (receivedPacketCounts[i] > 0) {
+            float barX = xOffset + i * BAR_WIDTH + BAR_WIDTH * 0.5f; // Offset to right of sent bars
+            float receivedHeight = (receivedPacketCounts[i] / (float)maxPackets) * GRAPH_HEIGHT;
+            glColor3f(COLOR_RECEIVED.r, COLOR_RECEIVED.g, COLOR_RECEIVED.b);
+            glVertex2f(barX, graphY);
+            glVertex2f(barX + BAR_WIDTH * 0.45f, graphY);
+            glVertex2f(barX + BAR_WIDTH * 0.45f, graphY + receivedHeight);
+            glVertex2f(barX, graphY + receivedHeight);
+        }
+    }
+    glEnd();
+
     // Draw Axis Labels
-    drawText(xOffset - 30, graphY + GRAPH_HEIGHT + 5, "Packets");
+    drawText(xOffset - 40, graphY + GRAPH_HEIGHT + 5, "Packets");
     drawText(xOffset + graphWidth + 5, graphY - 5, "Time (s)");
 
     yOffset -= (GRAPH_HEIGHT + SECTION_SPACING);
 
-    // Graph 2: Received Packets (Force Vector)
-    drawText(xOffset, yOffset, "Received Packets (Last " + to_string(GRAPH_WINDOW) + "s)", TITLE_FONT);
+    // Graph 2: Packet Delays
+    drawText(xOffset, yOffset, "Packet Delays (ms)", TITLE_FONT);
     yOffset -= TEXT_HEIGHT;
 
-    int maxReceivedPackets = *max_element(receivedPacketCounts.begin(), receivedPacketCounts.end());
-    maxReceivedPackets = max(maxReceivedPackets, 1);
+    double maxDelay = max(*max_element(sendDelays.begin(), sendDelays.end()),
+        *max_element(receiveDelays.begin(), receiveDelays.end()));
+    maxDelay = max(maxDelay, 1.0);
 
     // Draw Grid
     drawGrid(xOffset, graphY - GRAPH_HEIGHT, graphWidth, GRAPH_HEIGHT, 5, COLOR_GRID);
@@ -1242,53 +1259,12 @@ void glutDisplay() {
     glVertex2f(xOffset + graphWidth, graphY - GRAPH_HEIGHT); // X-axis
     glEnd();
 
-    // Draw Bars for Received Packets (Red, each bar = one packet)
-    glBegin(GL_QUADS);
-    for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
-        if (receivedPacketCounts[i] > 0) {
-            float barX = xOffset + i * BAR_WIDTH + BAR_WIDTH * 0.5f; // Offset to avoid overlap with sent bars
-            float receivedHeight = (receivedPacketCounts[i] / (float)maxReceivedPackets) * GRAPH_HEIGHT;
-            glColor3f(COLOR_RECEIVED.r, COLOR_RECEIVED.g, COLOR_RECEIVED.b);
-            glVertex2f(barX, graphY - GRAPH_HEIGHT);
-            glVertex2f(barX + BAR_WIDTH * 0.45f, graphY - GRAPH_HEIGHT);
-            glVertex2f(barX + BAR_WIDTH * 0.45f, graphY - GRAPH_HEIGHT + receivedHeight);
-            glVertex2f(barX, graphY - GRAPH_HEIGHT + receivedHeight);
-        }
-    }
-    glEnd();
-
-    // Draw Axis Labels
-    drawText(xOffset - 30, graphY - 5, "Packets");
-    drawText(xOffset + graphWidth + 5, graphY - GRAPH_HEIGHT - 5, "Time (s)");
-
-    yOffset -= (GRAPH_HEIGHT + SECTION_SPACING);
-
-    // Graph 3: Packet Delays
-    drawText(xOffset, yOffset, "Packet Delays (ms)", TITLE_FONT);
-    yOffset -= TEXT_HEIGHT;
-
-    double maxDelay = *max_element(sendDelays.begin(), sendDelays.end());
-    maxDelay = std::max(maxDelay, *max_element(receiveDelays.begin(), receiveDelays.end()));
-    maxDelay = std::max(maxDelay, 1.0);
-
-    // Draw Grid
-    drawGrid(xOffset, graphY - 2 * GRAPH_HEIGHT, graphWidth, GRAPH_HEIGHT, 5, COLOR_GRID);
-
-    // Draw Axes
-    glColor3f(COLOR_AXIS.r, COLOR_AXIS.g, COLOR_AXIS.b);
-    glBegin(GL_LINES);
-    glVertex2f(xOffset, graphY - 2 * GRAPH_HEIGHT);
-    glVertex2f(xOffset, graphY - GRAPH_HEIGHT); // Y-axis
-    glVertex2f(xOffset, graphY - 2 * GRAPH_HEIGHT);
-    glVertex2f(xOffset + graphWidth, graphY - 2 * GRAPH_HEIGHT); // X-axis
-    glEnd();
-
     // Draw Send Delay Line (Blue)
     glColor3f(COLOR_SENT.r, COLOR_SENT.g, COLOR_SENT.b);
     glBegin(GL_LINE_STRIP);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
         float x = xOffset + i * BAR_WIDTH;
-        float y = graphY - 2 * GRAPH_HEIGHT + (float)(sendDelays[i] / maxDelay) * GRAPH_HEIGHT;
+        float y = graphY - GRAPH_HEIGHT + (float)(sendDelays[i] / maxDelay) * GRAPH_HEIGHT;
         glVertex2f(x + BAR_WIDTH / 2, y);
     }
     glEnd();
@@ -1298,14 +1274,14 @@ void glutDisplay() {
     glBegin(GL_LINE_STRIP);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
         float x = xOffset + i * BAR_WIDTH;
-        float y = graphY - 2 * GRAPH_HEIGHT + (float)(receiveDelays[i] / maxDelay) * GRAPH_HEIGHT;
+        float y = graphY - GRAPH_HEIGHT + (float)(receiveDelays[i] / maxDelay) * GRAPH_HEIGHT;
         glVertex2f(x + BAR_WIDTH / 2, y);
     }
     glEnd();
 
     // Draw Axis Labels
-    drawText(xOffset - 30, graphY - GRAPH_HEIGHT - 5, "Delay (ms)");
-    drawText(xOffset + graphWidth + 5, graphY - 2 * GRAPH_HEIGHT - 5, "Time (s)");
+    drawText(xOffset - 40, graphY - 5, "Delay (ms)");
+    drawText(xOffset + graphWidth + 5, graphY - GRAPH_HEIGHT - 5, "Time (s)");
 
     yOffset -= (GRAPH_HEIGHT + SECTION_SPACING);
 
