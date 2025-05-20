@@ -1,0 +1,354 @@
+//==============================================================================
+//   Integrated Haptic Client: Magnetic Virtual Environment + Network Teleop
+//   - Uses CHAI3D for magnetic spheres
+//   - Sends position to remote server via UDP (networkCommunication thread)
+//==============================================================================
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <GLFW/glfw3.h>
+#include <thread>
+#include <atomic>
+#include <iostream>
+#include "chai3d.h"
+using namespace chai3d;
+using namespace std;
+
+#pragma comment(lib, "ws2_32.lib")
+
+//---------------- NETWORK CONFIG ------------------
+char SRC_IP[INET_ADDRSTRLEN] = "0.0.0.0"; // Will be fetched
+const char DST_IP[] = "169.254.213.206";
+const int SRC_PORT = 1000;
+const int DST_PORT = 4000;
+const int HAPTIC_RATE_HZ = 1000;
+
+volatile bool networkRunning = true;
+std::thread* networkThread = nullptr;
+SOCKET clientSocket = INVALID_SOCKET;
+
+struct Packet {
+    int packetNumber;
+    float x, y, z;
+    float delay;
+    char timestamp[64];
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int srcPort;
+    int dstPort;
+};
+
+//------------------ CHAI3D ENV CONFIG -------------------
+cWorld* world;
+cCamera* camera;
+cSpotLight* light;
+cHapticDeviceHandler* handler;
+cGenericHapticDevicePtr hapticDevice;
+double hapticDeviceMaxStiffness;
+cShapeSphere* spheres[3];
+cVector3d sphereVel[3];
+cFontPtr font;
+cLabel* labelRates;
+cLabel* labelMessage;
+cBackground* background;
+cThread* hapticsThread;
+GLFWwindow* window = NULL;
+int width = 0, height = 0;
+bool simulationRunning = false;
+bool simulationFinished = true;
+bool fullscreen = false;
+bool mirroredDisplay = false;
+cFrequencyCounter freqCounterGraphics;
+cFrequencyCounter freqCounterHaptics;
+string resourceRoot;
+int packetNumber = 0;
+std::atomic<float> lastX, lastY, lastZ;
+
+//----------------- UTILS -----------------
+void getLocalIP(char* ipBuffer) {
+    char hostname[256];
+    struct addrinfo hints {}, *info, *p;
+    struct sockaddr_in* sockaddr_ipv4;
+    if (gethostname(hostname, sizeof(hostname)) == 0) {
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_PASSIVE;
+        if (getaddrinfo(hostname, NULL, &hints, &info) == 0) {
+            for (p = info; p != NULL; p = p->ai_next) {
+                sockaddr_ipv4 = (struct sockaddr_in*)p->ai_addr;
+                inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipBuffer, INET_ADDRSTRLEN);
+                break;
+            }
+            freeaddrinfo(info);
+        }
+    }
+}
+void getTimestamp(char* timestamp) {
+    time_t now = time(0);
+    struct tm tstruct;
+    localtime_s(&tstruct, &now);
+    strftime(timestamp, 64, "%Y-%m-%d %X", &tstruct);
+}
+
+//---------------- NETWORK THREAD ----------------
+void networkCommunication(void) {
+    WSADATA wsaData;
+    sockaddr_in serverAddr;
+    Packet packet;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        cerr << "WSAStartup failed: " << WSAGetLastError() << endl;
+        return;
+    }
+    clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (clientSocket == INVALID_SOCKET) {
+        cerr << "Socket creation failed: " << WSAGetLastError() << endl;
+        WSACleanup();
+        return;
+    }
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(DST_PORT);
+    inet_pton(AF_INET, DST_IP, &serverAddr.sin_addr);
+    cout << "Network thread sending to " << DST_IP << ":" << DST_PORT << endl;
+
+    // Set high priority
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    while (networkRunning) {
+        // Prepare packet (read atomically from lastX/Y/Z)
+        packet.packetNumber = ++packetNumber;
+        packet.x = lastX.load();
+        packet.y = lastY.load();
+        packet.z = lastZ.load();
+        packet.delay = 1000.0f / HAPTIC_RATE_HZ;
+        getTimestamp(packet.timestamp);
+        strcpy_s(packet.srcIP, SRC_IP);
+        strcpy_s(packet.dstIP, DST_IP);
+        packet.srcPort = SRC_PORT;
+        packet.dstPort = DST_PORT;
+
+        sendto(clientSocket, reinterpret_cast<char*>(&packet), sizeof(Packet), 0,
+            (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+        this_thread::sleep_for(chrono::microseconds(1000000 / HAPTIC_RATE_HZ));
+    }
+    closesocket(clientSocket);
+    WSACleanup();
+}
+
+//---------------- CHAI3D/OPENGL CALLBACKS & SIM ----------------
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height)
+{
+    width = a_width;
+    height = a_height;
+    labelMessage->setLocalPos((int)(0.5 * (width - labelMessage->getWidth())), 50);
+}
+void errorCallback(int a_error, const char* a_description) { cout << "Error: " << a_description << endl; }
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods)
+{
+    if ((a_action != GLFW_PRESS) && (a_action != GLFW_REPEAT)) return;
+    else if ((a_key == GLFW_KEY_ESCAPE) || (a_key == GLFW_KEY_Q)) glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+    else if (a_key == GLFW_KEY_F) {
+        fullscreen = !fullscreen;
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        if (fullscreen)
+            glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+        else {
+            int w = 0.8 * mode->height, h = 0.5 * mode->height, x = 0.5 * (mode->width - w), y = 0.5 * (mode->height - h);
+            glfwSetWindowMonitor(window, NULL, x, y, w, h, mode->refreshRate);
+        }
+    }
+    else if (a_key == GLFW_KEY_M) {
+        mirroredDisplay = !mirroredDisplay;
+        camera->setMirrorVertical(mirroredDisplay);
+    }
+}
+void close(void)
+{
+    simulationRunning = false;
+    networkRunning = false;
+    while (!simulationFinished) { cSleepMs(100); }
+    if (networkThread && networkThread->joinable()) { networkThread->join(); delete networkThread; }
+    delete hapticsThread;
+    delete world;
+    delete handler;
+}
+void updateGraphics(void)
+{
+    labelRates->setText(cStr(freqCounterGraphics.getFrequency(), 0) + " Hz / " + cStr(freqCounterHaptics.getFrequency(), 0) + " Hz");
+    labelRates->setLocalPos((int)(0.5 * (width - labelRates->getWidth())), 15);
+    world->updateShadowMaps(false, mirroredDisplay);
+    camera->renderView(width, height);
+    glFinish();
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) cout << "Error: " << gluErrorString(err) << endl;
+}
+
+//-------------------- HAPTICS THREAD ----------------------
+void updateHaptics(void)
+{
+    simulationRunning = true;
+    simulationFinished = false;
+    bool flagHapticsEnabled = false;
+    cPrecisionClock clock; clock.reset();
+    hapticDevice->open();
+    hapticDevice->calibrate();
+    while (simulationRunning)
+    {
+        clock.stop();
+        double timeInterval = cMin(0.001, clock.getCurrentTimeSeconds());
+        clock.reset(); clock.start();
+        freqCounterHaptics.signal(1);
+
+        cVector3d position;
+        hapticDevice->getPosition(position);
+
+        lastX = (float)position.x();
+        lastY = (float)position.y();
+        lastZ = (float)position.z();
+
+        bool button; hapticDevice->getUserSwitch(0, button);
+
+        const double SPHERE_RADIUS = 0.007;
+        const int NUM_SPHERES = 3;
+        const double WALL_GROUND = 0.0 + SPHERE_RADIUS;
+        const double WALL_LEFT = -0.1;
+        const double WALL_RIGHT = 0.2;
+        const double WALL_FRONT = 0.08;
+        const double WALL_BACK = -0.08;
+        const double SPHERE_STIFFNESS = 1000.0;
+        const double SPHERE_MASS = 0.04;
+        const double K_DAMPING = 0.996;
+        const double K_MAGNET = 500.0;
+        const double HAPTIC_STIFFNESS = 500.0;
+        cVector3d sphereFce[NUM_SPHERES];
+        for (int i = 0; i < NUM_SPHERES; i++) sphereFce[i].zero();
+        for (int i = 0; i < NUM_SPHERES; i++) {
+            cVector3d force, pos0 = spheres[i]->getLocalPos();
+            for (int j = i + 1; j < NUM_SPHERES; j++) {
+                force.zero();
+                cVector3d pos1 = spheres[j]->getLocalPos();
+                cVector3d dir01 = cNormalize(pos1 - pos0);
+                double distance = cDistance(pos0, pos1);
+                if (!button) if ((distance < 2.5 * SPHERE_RADIUS) && (distance > 2.0 * SPHERE_RADIUS))
+                    force.add(-K_MAGNET * (distance - 2.5 * SPHERE_RADIUS) * dir01);
+                if (distance < 2.0 * SPHERE_RADIUS)
+                    force.add(SPHERE_STIFFNESS * (distance - 2.0 * SPHERE_RADIUS) * dir01);
+                sphereFce[i].add(force); sphereFce[j].add(-force);
+            }
+            if (pos0.z() < WALL_GROUND) sphereFce[i].add(cVector3d(0.0, 0.0, SPHERE_STIFFNESS * (WALL_GROUND - pos0.z())));
+            if (pos0.y() < WALL_LEFT) sphereFce[i].add(cVector3d(0.0, SPHERE_STIFFNESS * (WALL_LEFT - pos0.y()), 0.0));
+            if (pos0.y() > WALL_RIGHT) sphereFce[i].add(cVector3d(0.0, SPHERE_STIFFNESS * (WALL_RIGHT - pos0.y()), 0.0));
+            if (pos0.x() < WALL_BACK) sphereFce[i].add(cVector3d(SPHERE_STIFFNESS * (WALL_BACK - pos0.x()), 0.0, 0.0));
+            if (pos0.x() > WALL_FRONT) sphereFce[i].add(cVector3d(SPHERE_STIFFNESS * (WALL_FRONT - pos0.x()), 0.0, 0.0));
+        }
+        cVector3d dirHapticSphere = spheres[0]->getLocalPos() - position;
+        cVector3d forceSphere = -SPHERE_STIFFNESS * dirHapticSphere;
+        cVector3d forceHaptic = HAPTIC_STIFFNESS * dirHapticSphere;
+        sphereFce[0].add(forceSphere);
+
+        for (int i = 0; i < NUM_SPHERES; i++) {
+            cVector3d sphereAcc = (sphereFce[i] / SPHERE_MASS) + cVector3d(0.0, 0.0, -9.81);
+            sphereVel[i] = K_DAMPING * (sphereVel[i] + timeInterval * sphereAcc);
+            cVector3d spherePos = spheres[i]->getLocalPos() + timeInterval * sphereVel[i] + cSqr(timeInterval) * sphereAcc;
+            spheres[i]->setLocalPos(spherePos);
+        }
+
+        if (!flagHapticsEnabled) {
+            if (forceHaptic.length() < 1.0) flagHapticsEnabled = true;
+            else forceHaptic.zero();
+        }
+        double stiffnessRatio = 1.0;
+        if (hapticDeviceMaxStiffness < HAPTIC_STIFFNESS)
+            stiffnessRatio = hapticDeviceMaxStiffness / HAPTIC_STIFFNESS;
+        hapticDevice->setForce(stiffnessRatio * forceHaptic);
+    }
+    hapticDevice->close();
+    simulationFinished = true;
+}
+
+//---------------------- MAIN ---------------------------
+int main(int argc, char* argv[])
+{
+    cout << "\n--- Integrated Virtual Haptic Client ---\n";
+    cout << "[f] fullscreen | [m] mirror | [q] quit\n";
+    getLocalIP(SRC_IP);
+    cout << "Local IP: " << SRC_IP << endl;
+    cout << "Dest IP: " << DST_IP << "  Port: " << DST_PORT << endl;
+
+    // OpenGL window
+    if (!glfwInit()) { cout << "Failed to init GLFW\n"; return 1; }
+    glfwSetErrorCallback(errorCallback);
+    const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
+    int w = 0.8 * mode->height, h = 0.5 * mode->height, x = 0.5 * (mode->width - w), y = 0.5 * (mode->height - h);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2); glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_STEREO, GL_FALSE);
+    window = glfwCreateWindow(w, h, "Haptic Teleoperation Client", NULL, NULL);
+    if (!window) { cout << "Failed to create window\n"; glfwTerminate(); return 1; }
+    glfwGetWindowSize(window, &width, &height);
+    glfwSetWindowPos(window, x, y);
+    glfwSetKeyCallback(window, keyCallback);
+    glfwSetWindowSizeCallback(window, windowSizeCallback);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+
+    // World & camera
+    world = new cWorld();
+    world->m_backgroundColor.setWhite();
+    camera = new cCamera(world); world->addChild(camera);
+    camera->set(cVector3d(0.20, 0.00, 0.10), cVector3d(0.00, 0.00, 0.05), cVector3d(0.00, 0.00, 1.00));
+    camera->setClippingPlanes(0.01, 10.0);
+    camera->setMirrorVertical(mirroredDisplay);
+
+    light = new cSpotLight(world); world->addChild(light); light->setEnabled(true);
+    light->setLocalPos(0.0, 0.3, 0.4); light->setDir(0.0, -0.25, -0.4);
+    light->setShadowMapEnabled(true); light->m_shadowMap->setQualityHigh();
+    world->setShadowIntensity(0.3); light->setCutOffAngleDeg(30);
+
+    // Haptic device setup
+    handler = new cHapticDeviceHandler();
+    handler->getDevice(hapticDevice, 0);
+    cHapticDeviceInfo hapticDeviceInfo = hapticDevice->getSpecifications();
+    hapticDeviceMaxStiffness = hapticDeviceInfo.m_maxLinearStiffness;
+    hapticDevice->setEnableGripperUserSwitch(true);
+
+    // Plane and spheres
+    cMesh* plane = new cMesh(); world->addChild(plane);
+    cCreateMap(plane, 0.2, 1.0, 20, 20); plane->setUseDisplayList(true); plane->m_material->setWhite();
+    cTexture2dPtr texture = cTexture2d::create();
+    bool fileload = texture->loadFromFile("../resources/images/coin-normal.png");
+    if (!fileload) { cout << "Texture failed.\n"; close(); return -1; }
+    for (int i = 0; i < 3; i++) {
+        cShapeSphere* sphere = new cShapeSphere(0.007);
+        spheres[i] = sphere; world->addChild(sphere);
+        sphere->setLocalPos(0.8 * 0.007 * (double)(i + 2) * cos(1.0 * (double)(i)),
+            0.8 * 0.007 * (double)(i + 2) * sin(1.0 * (double)(i)), 0.007);
+        sphere->setTexture(texture); sphere->m_texture->setSphericalMappingEnabled(true);
+        sphere->setUseTexture(true); sphere->m_material->setWhite();
+    }
+
+    // Labels, widgets, background
+    font = NEW_CFONTCALIBRI20();
+    labelRates = new cLabel(font); labelRates->m_fontColor.setBlack(); camera->m_frontLayer->addChild(labelRates);
+    labelMessage = new cLabel(font); camera->m_frontLayer->addChild(labelMessage); labelMessage->m_fontColor.setBlack();
+    background = new cBackground(); camera->m_backLayer->addChild(background); background->setFixedAspectRatio(true);
+
+    // Launch threads
+    networkThread = new std::thread(networkCommunication);
+    hapticsThread = new cThread(); hapticsThread->start(updateHaptics, CTHREAD_PRIORITY_HAPTICS);
+    atexit(close);
+
+    // Main graphics loop
+    windowSizeCallback(window, width, height);
+    while (!glfwWindowShouldClose(window)) {
+        glfwGetWindowSize(window, &width, &height);
+        updateGraphics();
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+        freqCounterGraphics.signal(1);
+    }
+    glfwDestroyWindow(window); glfwTerminate();
+    return 0;
+}
