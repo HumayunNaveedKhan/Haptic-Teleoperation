@@ -6,6 +6,7 @@
 #include <mmsystem.h>
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\freeglut\include\GL\freeglut.h>
 #include "chai3d.h"
 #include <iostream>
 #include <iomanip>
@@ -19,15 +20,14 @@
 #include <cmath>
 #include <fstream>
 #include <algorithm>
-#include <functional>
-#include <atomic>
-#include <cstdint>
 #include <string.h>
 #include <random>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "chai3d.lib")
+//#pragma comment(lib, "glew32.lib")
+#pragma comment(lib, "freeglut.lib")
 
 using namespace chai3d;
 using namespace std;
@@ -40,114 +40,88 @@ string to_string_with_precision(const T a_value, const int n) {
     return out.str();
 }
 
-//------------------------------------------------------------------------------
-// CONFIGURATION PARAMETERS
-//------------------------------------------------------------------------------
+// Configuration Parameters
+const char CLIENT_IP[] = "169.254.50.63";
+const char SERVER_IP[] = "169.254.213.206";
+const int SEND_PORT = 4000;
+const int RECV_PORT = 4001;
+const int FALLBACK_PORT = 4000;
+const int BUFFER_SIZE = 5000;
+const int SOCKET_TIMEOUT_MS = 1;
+const int SOCKET_RCVBUF_SIZE = 65536;
+const int HAPTIC_RATE_HZ = 1000;
+const double MAX_FORCE = 8.0;
+int FORCE_PACKET_WINDOW = 5;
+const int ADAPTIVE_UPDATE_MS = 100;
+const bool USE_ADAPTIVE_DAMPING = true;
+const double ERROR_VARIANCE_SCALE = 0.5;
+const double MAX_DAMPING = 10.0;
+const double MAX_STIFFNESS = 1000.0;
+const int NUM_SPHERES = 3;
+const double SPHERE_RADIUS = 0.007;
+const double SPHERES_RADIUS = 0.007;
+const double SPHERE_STIFFNESS = 1000.0;
+const double SPHERE_MASS = 0.04;
+const double K_DAMPING = 0.996;
+const double K_MAGNET = 500.0;
+const double HAPTIC_STIFFNESS = 500.0;
+cStereoMode stereoMode = C_STEREO_DISABLED;
+bool fullscreen = false;
+bool mirroredDisplay = false;
+string resourceRoot = "../../../bin/";
+bool sendPacketsEnabled = true;
+bool receiveFeedbackEnabled = true;
+bool applyHapticFeedback = true;
+int networkThreadPriority = THREAD_PRIORITY_TIME_CRITICAL;
+int hapticThreadPriority = THREAD_PRIORITY_TIME_CRITICAL;
+double packetDelayMin = 0.0;
+double packetDelayMax = 0.0;
+int maxPacketsToSend = 0;
+double packetIntervalMs = 1000.0 / HAPTIC_RATE_HZ;
+bool rawModeEnabled = false;
+mutex controlMutex;
+const int GRAPH_WINDOW = 60;
+vector<int> sentPacketCounts(GRAPH_WINDOW, 0);
+vector<int> receivedPacketCounts(GRAPH_WINDOW, 0);
+vector<double> sendDelays(GRAPH_WINDOW, 0.0);
+vector<double> receiveDelays(GRAPH_WINDOW, 0.0);
+mutex graphMutex;
+chrono::steady_clock::time_point graphStartTime;
 
-// Network Settings
-const char CLIENT_IP[] = "169.254.50.63";        // Client IP address
-const char SERVER_IP[] = "169.254.213.206";      // Server IP address
-const int SEND_PORT = 4000;                      // Port for sending position data
-const int RECV_PORT = 4001;                      // Primary port for receiving force feedback
-const int FALLBACK_PORT = 4000;                  // Fallback port to try receiving
-const int BUFFER_SIZE = 5000;                    // Packet buffer size (bytes)
-const int SOCKET_TIMEOUT_MS = 1;                 // Socket select timeout (ms)
-const int SOCKET_RCVBUF_SIZE = 65536;           // Socket receive buffer size (bytes)
-
-// Haptic Device Settings
-const int HAPTIC_RATE_HZ = 1000;                // Haptic loop update rate (Hz)
-const double MAX_FORCE = 8.0;                    // Max force for Novint Falcon (N)
-
-// Control Parameters
-int FORCE_PACKET_WINDOW = 5;                     // Number of packets for force averaging (configurable)
-const int ADAPTIVE_UPDATE_MS = 100;              // Interval for adaptive damping/stiffness update (ms)
-const bool USE_ADAPTIVE_DAMPING = true;         // Enable adaptive damping/stiffness
-const double ERROR_VARIANCE_SCALE = 0.5;        // Scaling factor for error variance
-const double MAX_DAMPING = 10.0;                // Max damping (N·s/m)
-const double MAX_STIFFNESS = 1000.0;            // Max stiffness (N/m)
-
-// Virtual Environment Settings
-const int NUM_SPHERES = 3;                      // Number of spheres in the scene
-const double SPHERE_RADIUS = 0.007;             // Radius of each sphere
-const double SPHERES_RADIUS = 0.007;            // Consistent radius for calculations
-const double SPHERE_STIFFNESS = 1000.0;         // Stiffness for sphere collisions
-const double SPHERE_MASS = 0.04;                // Mass of each sphere
-const double K_DAMPING = 0.996;                 // Damping factor for sphere velocity
-const double K_MAGNET = 500.0;                  // Magnetic force constant
-const double HAPTIC_STIFFNESS = 500.0;          // Stiffness for haptic interaction
-
-// General Settings
-cStereoMode stereoMode = C_STEREO_DISABLED;     // Stereo mode
-bool fullscreen = false;                        // Fullscreen mode
-bool mirroredDisplay = false;                    // Mirrored display
-string resourceRoot = "../../../bin/";          // Root resource path
-
-// New Control Variables
-bool sendPacketsEnabled = true;                  // Enable/disable packet sending
-bool receiveFeedbackEnabled = true;              // Enable/disable feedback receiving
-bool applyHapticFeedback = true;                // Enable/disable haptic feedback application
-int networkThreadPriority = THREAD_PRIORITY_TIME_CRITICAL; // Network thread priority
-int hapticThreadPriority = THREAD_PRIORITY_TIME_CRITICAL;  // Haptic thread priority
-double packetDelayMin = 0.0;                    // Min delay for packet sending (ms)
-double packetDelayMax = 0.0;                    // Max delay for packet sending (ms)
-int maxPacketsToSend = 0;                       // 0 means unlimited
-double packetIntervalMs = 1000.0 / HAPTIC_RATE_HZ; // Interval between packets (ms)
-bool rawModeEnabled = false;                     // Raw mode (bypass controls, max rate)
-mutex controlMutex;                              // Mutex for control variables
-
-// Graph Data
-const int GRAPH_WINDOW = 60;                    // Number of samples for graphs
-vector<int> sentPacketCounts(GRAPH_WINDOW, 0);   // Sent packet counts
-vector<int> receivedPacketCounts(GRAPH_WINDOW, 0); // Received packet counts
-vector<double> sendDelays(GRAPH_WINDOW, 0.0);    // Send delays
-vector<double> receiveDelays(GRAPH_WINDOW, 0.0); // Receive delays
-mutex graphMutex;                                // Mutex for graph data
-chrono::steady_clock::time_point graphStartTime; // Start time for graph data
-
-//------------------------------------------------------------------------------
-// GLOBAL VARIABLES
-//------------------------------------------------------------------------------
-mutex forceFeedbackMutex;                        // Mutex for force feedback data
-cVector3d forceFeedback(0.0, 0.0, 0.0);          // Force vector to be applied
-bool newForceFeedback = false;                   // Flag for new force data
-int packetCount = 0;                            // Total packets sent
-int successfulSends = 0;                        // Successful packet sends
-int successfulReceives = 0;                     // Successful packet receives
-int failedSends = 0;                            // Failed packet sends
-int failedReceives = 0;                         // Failed packet receives
-int timeoutReceives = 0;                        // Timeout receive failures
-double lastStiffness = 0.0;                      // Last received stiffness (K)
-double lastDamping = 0.0;                       // Last received damping (B)
-double adaptiveStiffness = 0.0;                 // Adaptive stiffness
-double adaptiveDamping = 0.0;                   // Adaptive damping
-cVector3d lastError(0.0, 0.0, 0.0);             // Last received position error
-double lastPacketTime = 0.0;                    // Timestamp of last sent packet (ms)
-double avgLatency = 0.0;                        // Average round-trip latency (ms)
-int latencyCount = 0;                           // Number of latency measurements
-volatile bool running = true;                    // Program running flag
-volatile bool hapticRunning = true;              // Haptic thread running flag
-bool useVirtualEnvironment = false;             // Flag to toggle VE mode
-bool simulationRunning = false;                 // Haptic simulation running
-bool simulationFinished = true;                 // Haptic simulation finished
-
-// Force Feedback Buffer
-vector<cVector3d> forceBuffer;                  // Buffer for force smoothing
-vector<double> stiffnessBuffer;                 // Buffer for stiffness
-vector<double> dampingBuffer;                   // Buffer for damping
-vector<cVector3d> errorBuffer;                  // Buffer for position errors
-mutex bufferMutex;                              // Mutex for buffer access
-
-// Network Variables
+// Global Variables
+mutex forceFeedbackMutex;
+cVector3d forceFeedback(0.0, 0.0, 0.0);
+bool newForceFeedback = false;
+int packetCount = 0;
+int successfulSends = 0;
+int successfulReceives = 0;
+int failedSends = 0;
+int failedReceives = 0;
+int timeoutReceives = 0;
+double lastStiffness = 0.0;
+double lastDamping = 0.0;
+double adaptiveStiffness = 0.0;
+double adaptiveDamping = 0.0;
+cVector3d lastError(0.0, 0.0, 0.0);
+double lastPacketTime = 0.0;
+double avgLatency = 0.0;
+int latencyCount = 0;
+volatile bool running = true;
+volatile bool hapticRunning = true;
+bool useVirtualEnvironment = false;
+bool simulationRunning = false;
+bool simulationFinished = true;
+vector<cVector3d> forceBuffer;
+vector<double> stiffnessBuffer;
+vector<double> dampingBuffer;
+vector<cVector3d> errorBuffer;
+mutex bufferMutex;
 SOCKET sock = INVALID_SOCKET;
 SOCKET fallbackSock = INVALID_SOCKET;
-
-// Haptic Device Variables
 cHapticDeviceHandler* handler = nullptr;
 cGenericHapticDevicePtr hapticDevice = nullptr;
 cFrequencyCounter freqCounterHaptics;
 double hapticDeviceMaxStiffness = 0.0;
-
-// Virtual Environment Variables
 cWorld* world = nullptr;
 cCamera* camera = nullptr;
 cSpotLight* light = nullptr;
@@ -158,38 +132,16 @@ cBackground* background = nullptr;
 cFontPtr font = nullptr;
 cLabel* labelRates = nullptr;
 cLabel* labelMessage = nullptr;
-cLabel* labelForce = nullptr;
-cLabel* labelLatency = nullptr;
-cLabel* labelMode = nullptr;
-cLabel* labelPackets = nullptr;
-cLabel* labelStiffness = nullptr;
-cLabel* labelDamping = nullptr;
-cLabel* labelError = nullptr;
-cLabel* labelPosition = nullptr;
 GLFWwindow* window = nullptr;
 int width = 0;
 int height = 0;
 int swapInterval = 1;
 cFrequencyCounter freqCounterGraphics;
+int glutWindow = 0;
+int glutWidth = 800;
+int glutHeight = 600;
+ofstream logFile("AppVE.log");
 
-// Control GUI Variables
-GLFWwindow* controlWindow = nullptr;
-cWorld* controlWorld = nullptr;
-cCamera* controlCamera = nullptr;
-cFontPtr controlFont = nullptr;
-vector<cLabel*> controlLabels;                  // Labels for controls and stats
-vector<cShapeBox*> sentPacketBars;              // Bars for sent packets
-vector<cShapeBox*> receivedPacketBars;          // Bars for received packets
-vector<cShapeLine*> delayLines;                 // Lines for delays
-int controlWidth = 800;
-int controlHeight = 600;
-volatile bool controlRunning = true;
-cFrequencyCounter freqCounterControlGraphics;
-
-// Logging
-ofstream logFile("AppVE.log");                  // Log file for debugging
-
-// Packet Structures
 struct OutgoingPacket {
     int packetNumber;
     float x, y, z;
@@ -202,44 +154,39 @@ struct OutgoingPacket {
 };
 
 struct IncomingPacket {
-    int packetNumber;        // 4 bytes
-    double force[3];        // 24 bytes (3 * 8)
-    double position[3];     // 24 bytes (3 * 8)
-    double error[3];        // 24 bytes (3 * 8)
-    double stiffness;       // 8 bytes
-    double damping;         // 8 bytes
-    bool isActive;          // 1 byte (padded to 4 bytes)
-    char timestamp[64];     // 64 bytes
-}; // Total: 176 bytes
+    int packetNumber;
+    double force[3];
+    double position[3];
+    double error[3];
+    double stiffness;
+    double damping;
+    bool isActive;
+    char timestamp[64];
+};
 
-//------------------------------------------------------------------------------
-// FUNCTION PROTOTYPES
-//------------------------------------------------------------------------------
+// Function Prototypes
 void initializeWinsock();
 void setupSocket(SOCKET& s, int port, int maxRetries = 3);
 void networkCommunication();
 void hapticLoop();
-void controlGUI();
+void glutGUI();
+void glutDisplay();
+void glutReshape(int width, int height);
+void glutKeyboard(unsigned char key, int x, int y);
 void cleanupSocket();
 void getCurrentTimestamp(char* buffer, size_t size);
 void handleError(const string& message);
 void logRawPacket(const char* buffer, int size);
 void updateAdaptiveParameters();
 void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
-void controlWindowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
 void errorCallback(int a_error, const char* a_description);
 void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
-void controlKeyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
-void controlMouseButtonCallback(GLFWwindow* a_window, int a_button, int a_action, int a_mods);
 void updateGraphics();
-void updateControlGraphics();
 void close();
 void logMessage(const string& message);
 #define RESOURCE_PATH(p) (char*)((resourceRoot+string(p)).c_str())
 
-//------------------------------------------------------------------------------
-// FUNCTION IMPLEMENTATIONS
-//------------------------------------------------------------------------------
+// Function Implementations
 void logMessage(const string& message) {
     auto now = chrono::system_clock::now();
     auto time = chrono::system_clock::to_time_t(now);
@@ -257,6 +204,14 @@ void logMessage(const string& message) {
 
 void handleError(const string& message) {
     logMessage("Error: " + message);
+}
+
+void getCurrentTimestamp(char* buffer, size_t size) {
+    auto now = chrono::system_clock::now();
+    auto time = chrono::system_clock::to_time_t(now);
+    struct tm tstruct;
+    localtime_s(&tstruct, &time);
+    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", &tstruct);
 }
 
 int main() {
@@ -277,6 +232,18 @@ int main() {
     logMessage("[m] - Toggle vertical mirroring");
     logMessage("[q] - Exit application");
     logMessage("Gripper Button: Toggle between Network and Virtual Environment mode");
+    logMessage("GLUT Stats Window Keys:");
+    logMessage("[1] - Toggle Send Packets");
+    logMessage("[2] - Toggle Receive Feedback");
+    logMessage("[3] - Toggle Apply Haptic");
+    logMessage("[4] - Toggle Raw Mode");
+    logMessage("[5] - Toggle Network Priority");
+    logMessage("[6] - Toggle Haptic Priority");
+    logMessage("[7] - Increase Delay Min");
+    logMessage("[8] - Increase Delay Max");
+    logMessage("[9] - Increase Max Packets");
+    logMessage("[0] - Increase Packet Interval");
+    logMessage("[w] - Increase Feedback Window");
     logMessage("===============================================================");
 
     // Initialize GLFW
@@ -325,23 +292,6 @@ int main() {
     else {
         logMessage("GLEW initialized successfully");
     }
-
-    // Create control window
-    logMessage("Creating control GLFW window...");
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
-    controlWindow = glfwCreateWindow(controlWidth, controlHeight, "Control and Stats GUI", nullptr, window);
-    if (!controlWindow) {
-        handleError("Failed to create control GLFW window");
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return 1;
-    }
-    logMessage("Control GLFW window created successfully");
-    glfwSetWindowPos(controlWindow, x + w + 10, y);
-    glfwSetKeyCallback(controlWindow, controlKeyCallback);
-    glfwSetMouseButtonCallback(controlWindow, controlMouseButtonCallback);
-    glfwSetWindowSizeCallback(controlWindow, controlWindowSizeCallback);
 
     // Initialize Winsock
     logMessage("Initializing Winsock...");
@@ -475,38 +425,6 @@ int main() {
     labelMessage->setText("Press gripper to toggle between Network and Virtual Environment mode");
     camera->m_frontLayer->addChild(labelMessage);
 
-    // Create GUI labels
-    labelForce = new cLabel(font);
-    labelLatency = new cLabel(font);
-    labelMode = new cLabel(font);
-    labelPackets = new cLabel(font);
-    labelStiffness = new cLabel(font);
-    labelDamping = new cLabel(font);
-    labelError = new cLabel(font);
-    labelPosition = new cLabel(font);
-    if (!labelForce || !labelLatency || !labelMode || !labelPackets ||
-        !labelStiffness || !labelDamping || !labelError || !labelPosition) {
-        handleError("Failed to create GUI labels");
-        close();
-        return 1;
-    }
-    labelForce->m_fontColor.setBlack();
-    labelLatency->m_fontColor.setBlack();
-    labelMode->m_fontColor.setBlack();
-    labelPackets->m_fontColor.setBlack();
-    labelStiffness->m_fontColor.setBlack();
-    labelDamping->m_fontColor.setBlack();
-    labelError->m_fontColor.setBlack();
-    labelPosition->m_fontColor.setBlack();
-    camera->m_frontLayer->addChild(labelForce);
-    camera->m_frontLayer->addChild(labelLatency);
-    camera->m_frontLayer->addChild(labelMode);
-    camera->m_frontLayer->addChild(labelPackets);
-    camera->m_frontLayer->addChild(labelStiffness);
-    camera->m_frontLayer->addChild(labelDamping);
-    camera->m_frontLayer->addChild(labelError);
-    camera->m_frontLayer->addChild(labelPosition);
-
     // Create background
     background = new cBackground();
     if (!background) {
@@ -542,14 +460,14 @@ int main() {
     logMessage("Starting threads...");
     thread networkThread(networkCommunication);
     thread hapticThread(hapticLoop);
-    thread controlThread(controlGUI);
+    thread glutThread(glutGUI);
 
     // Setup atexit
     atexit(close);
 
     // Main graphic loop
     windowSizeCallback(window, width, height);
-    while (running && !glfwWindowShouldClose(window) && !glfwWindowShouldClose(controlWindow)) {
+    while (running && !glfwWindowShouldClose(window)) {
         glfwMakeContextCurrent(window);
         glfwGetWindowSize(window, &width, &height);
         updateGraphics();
@@ -562,21 +480,18 @@ int main() {
     logMessage("Cleaning up...");
     running = false;
     hapticRunning = false;
-    controlRunning = false;
     simulationRunning = false;
     while (!simulationFinished) { cSleepMs(100); }
     networkThread.join();
     hapticThread.join();
-    controlThread.join();
+    glutThread.join();
     if (hapticDevice) {
         hapticDevice->close();
     }
     delete handler;
     delete world;
-    delete controlWorld;
     cleanupSocket();
     glfwDestroyWindow(window);
-    glfwDestroyWindow(controlWindow);
     glfwTerminate();
     timeEndPeriod(1);
     logFile.close();
@@ -636,6 +551,18 @@ void setupSocket(SOCKET& s, int port, int maxRetries) {
     }
 }
 
+void cleanupSocket() {
+    if (sock != INVALID_SOCKET) {
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+    if (fallbackSock != INVALID_SOCKET) {
+        closesocket(fallbackSock);
+        fallbackSock = INVALID_SOCKET;
+    }
+    WSACleanup();
+}
+
 void logRawPacket(const char* buffer, int size) {
     stringstream ss;
     ss << "Raw packet data (" << size << " bytes): ";
@@ -662,18 +589,18 @@ void updateAdaptiveParameters() {
     cVector3d variance(0.0, 0.0, 0.0);
     for (const auto& err : errorBuffer) {
         cVector3d diff = err - meanError;
-        //variance += diff * diff;
+        variance += cVector3d(diff.x() * diff.x(), diff.y() * diff.y(), diff.z() * diff.z());
     }
     variance /= static_cast<double>(errorBuffer.size());
     double totalVariance = variance.length();
     double avgDamping = dampingBuffer.empty() ? 0.0 :
         accumulate(dampingBuffer.begin(), dampingBuffer.end(), 0.0) / dampingBuffer.size();
     double avgStiffness = stiffnessBuffer.empty() ? 0.0 :
-        accumulate(stiffnessBuffer.begin(), dampingBuffer.end(), 0.0) / dampingBuffer.size();
+        accumulate(stiffnessBuffer.begin(), stiffnessBuffer.end(), 0.0) / stiffnessBuffer.size();
     adaptiveDamping = avgDamping * (1.0 - ERROR_VARIANCE_SCALE * totalVariance);
     adaptiveStiffness = avgStiffness * (1.0 - ERROR_VARIANCE_SCALE * totalVariance);
-    adaptiveDamping = max(0.0, min(adaptiveDamping, MAX_DAMPING));
-    adaptiveStiffness = max(0.0, min(adaptiveStiffness, MAX_STIFFNESS));
+    adaptiveDamping = std::max<double>(0.0, std::min<double>(adaptiveDamping, MAX_DAMPING));
+    adaptiveStiffness = std::max<double>(0.0, std::min<double>(adaptiveStiffness, MAX_STIFFNESS));
     logMessage("Updated adaptive parameters: Damping=" + to_string(adaptiveDamping) +
         " N·s/m, Stiffness=" + to_string(adaptiveStiffness) + " N/m");
 }
@@ -747,7 +674,6 @@ void networkCommunication() {
                         logMessage("SENT #" + to_string(packet.packetNumber) + " | Position: (" +
                             to_string(packet.x) + ", " + to_string(packet.y) + ", " + to_string(packet.z) +
                             ") | " + packet.timestamp);
-                        // Update graph data
                         lock_guard<mutex> lock(graphMutex);
                         auto elapsedSec = chrono::duration_cast<chrono::seconds>(now - graphStartTime).count();
                         int index = elapsedSec % GRAPH_WINDOW;
@@ -755,7 +681,6 @@ void networkCommunication() {
                         sendDelays[index] = elapsedMs;
                     }
                     lastSendTime = now;
-                    // Apply random/uniform delay
                     if (!currentRawMode && packetDelayMax > packetDelayMin) {
                         uniform_real_distribution<double> dist(packetDelayMin, packetDelayMax);
                         double delay = dist(gen);
@@ -831,7 +756,6 @@ void networkCommunication() {
                                     avgLatency = (avgLatency * latencyCount + latency) / (latencyCount + 1);
                                 }
                                 latencyCount++;
-                                // Update graph data
                                 lock_guard<mutex> lock(graphMutex);
                                 auto elapsedSec = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - graphStartTime).count();
                                 int index = elapsedSec % GRAPH_WINDOW;
@@ -868,7 +792,6 @@ void networkCommunication() {
                 lock_guard<mutex> lock(forceFeedbackMutex);
                 newForceFeedback = false;
             }
-            // Fallback port handling
             FD_ZERO(&readSet);
             FD_SET(fallbackSock, &readSet);
             int fallbackSelectResult = select(0, &readSet, nullptr, nullptr, &timeout);
@@ -926,7 +849,6 @@ void networkCommunication() {
                                     avgLatency = (avgLatency * latencyCount + latency) / (latencyCount + 1);
                                 }
                                 latencyCount++;
-                                // Update graph data
                                 lock_guard<mutex> lock(graphMutex);
                                 auto elapsedSec = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - graphStartTime).count();
                                 int index = elapsedSec % GRAPH_WINDOW;
@@ -1142,393 +1064,212 @@ void hapticLoop() {
     logMessage("Haptic thread exiting");
 }
 
-void controlGUI() {
-    logMessage("Control GUI thread started");
-    glfwMakeContextCurrent(controlWindow);
-    controlWorld = new cWorld();
-    if (!controlWorld) {
-        handleError("Failed to create control world");
-        controlRunning = false;
-        return;
-    }
-    controlWorld->m_backgroundColor.setGrayLevel(0.9);
-    controlCamera = new cCamera(controlWorld);
-    if (!controlCamera) {
-        handleError("Failed to create control camera");
-        controlRunning = false;
-        return;
-    }
-    controlWorld->addChild(controlCamera);
-    // Set orthographic view with single width parameter
-    double aspect = (double)controlWidth / controlHeight;
-    controlCamera->setOrthographicView(200.0 * aspect); // Width scaled by aspect ratio
-    controlCamera->set(cVector3d(0, 0, 10), cVector3d(0, 0, 0), cVector3d(0, 1, 0));
-    controlFont = NEW_CFONTCALIBRI20();
-    if (!controlFont) {
-        handleError("Failed to create control font");
-        controlRunning = false;
-        return;
-    }
-
-    // Initialize graphs
-    for (int i = 0; i < GRAPH_WINDOW; i++) {
-        cShapeBox* sentBar = new cShapeBox(1, 1, 0.1);
-        cShapeBox* receivedBar = new cShapeBox(1, 1, 0.1);
-        cShapeLine* delayLine = new cShapeLine(cVector3d(0, 0, 0), cVector3d(0, 0, 0));
-        if (!sentBar || !receivedBar || !delayLine) {
-            handleError("Failed to create graph elements");
-            controlRunning = false;
-            return;
-        }
-        sentBar->m_material->setBlue();
-        receivedBar->m_material->setRed();
-        delayLine->m_material->setGreen();
-        controlWorld->addChild(sentBar);
-        controlWorld->addChild(receivedBar);
-        controlWorld->addChild(delayLine);
-        sentPacketBars.push_back(sentBar);
-        receivedPacketBars.push_back(receivedBar);
-        delayLines.push_back(delayLine);
-    }
-
-    // Initialize control labels
-    vector<string> controlNames = {
-        "Send Packets: ON", "Receive Feedback: ON", "Apply Haptic: ON", "Raw Mode: OFF",
-        "Net Priority: TIME_CRITICAL", "Hap Priority: TIME_CRITICAL",
-        "Delay Min: 0.0 ms", "Delay Max: 0.0 ms", "Max Packets: 0",
-        "Packet Interval: 1.0 ms", "Feedback Window: 5"
-    };
-    for (int i = 0; i < controlNames.size(); i++) {
-        cLabel* label = new cLabel(controlFont);
-        if (!label) {
-            handleError("Failed to create control label");
-            controlRunning = false;
-            return;
-        }
-        label->m_fontColor.setBlack();
-        label->setText(controlNames[i]);
-        controlCamera->m_frontLayer->addChild(label);
-        controlLabels.push_back(label);
-    }
-
-    controlWindowSizeCallback(controlWindow, controlWidth, controlHeight);
-
-    while (controlRunning && !glfwWindowShouldClose(controlWindow)) {
-        glfwMakeContextCurrent(controlWindow);
-        updateControlGraphics();
-        glfwSwapBuffers(controlWindow);
-        glfwPollEvents();
-        freqCounterControlGraphics.signal(1);
-    }
-
-    logMessage("Control GUI thread exiting");
+void glutGUI() {
+    logMessage("GLUT GUI thread started");
+    int argc = 1;
+    char* argv[] = { (char*)"HapticStats", nullptr };
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE | GLUT_DEPTH);
+    glutInitWindowSize(glutWidth, glutHeight);
+    glutInitWindowPosition(100, 100);
+    glutWindow = glutCreateWindow("Haptic Teleoperation Stats");
+    glutDisplayFunc(glutDisplay);
+    glutReshapeFunc(glutReshape);
+    glutKeyboardFunc(glutKeyboard);
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glutMainLoop();
+    logMessage("GLUT GUI thread exiting");
 }
 
-void controlWindowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
-    controlWidth = a_width;
-    controlHeight = a_height;
-    if (controlCamera) {
-        double aspect = (double)controlWidth / controlHeight;
-        controlCamera->setOrthographicView(200.0 * aspect); // Width scaled by aspect ratio
-    }
-    // Position control labels
-    for (size_t i = 0; i < controlLabels.size(); i++) {
-        controlLabels[i]->setLocalPos(10, controlHeight - 20 - i * 30);
-    }
-    // Position graphs
-    double barWidth = controlWidth / (double)GRAPH_WINDOW;
-    double maxHeight = controlHeight * 0.3;
-    for (int i = 0; i < GRAPH_WINDOW; i++) {
-        sentPacketBars[i]->setLocalPos(i * barWidth + barWidth / 2, maxHeight / 2, 0);
-        receivedPacketBars[i]->setLocalPos(i * barWidth + barWidth / 2, maxHeight * 1.5, 0);
-        delayLines[i]->setLocalPos(i * barWidth, maxHeight * 2.5, 0);
-    }
-}
+void glutDisplay() {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, glutWidth, 0, glutHeight, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
 
-void controlKeyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
-    if (a_action != GLFW_PRESS) return;
-    if (a_key == GLFW_KEY_ESCAPE || a_key == GLFW_KEY_Q) {
-        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
-    }
-}
-
-void controlMouseButtonCallback(GLFWwindow* a_window, int a_button, int a_action, int a_mods) {
-    if (a_button == GLFW_MOUSE_BUTTON_LEFT && a_action == GLFW_PRESS) {
-        double x, y;
-        glfwGetCursorPos(a_window, &x, &y);
-        y = controlHeight - y; // Invert y-coordinate
-        lock_guard<mutex> lock(controlMutex);
-        for (size_t i = 0; i < controlLabels.size(); i++) {
-            cLabel* label = controlLabels[i];
-            int lx = label->getLocalPos().x();
-            int ly = label->getLocalPos().y();
-            int lw = label->getWidth();
-            int lh = label->getHeight();
-            if (x >= lx && x <= lx + lw && y >= ly && y <= ly + lh) {
-                if (i == 0) {
-                    sendPacketsEnabled = !sendPacketsEnabled;
-                    label->setText("Send Packets: " + string(sendPacketsEnabled ? "ON" : "OFF"));
-                }
-                else if (i == 1) {
-                    receiveFeedbackEnabled = !receiveFeedbackEnabled;
-                    label->setText("Receive Feedback: " + string(receiveFeedbackEnabled ? "ON" : "OFF"));
-                }
-                else if (i == 2) {
-                    applyHapticFeedback = !applyHapticFeedback;
-                    label->setText("Apply Haptic: " + string(applyHapticFeedback ? "ON" : "OFF"));
-                }
-                else if (i == 3) {
-                    rawModeEnabled = !rawModeEnabled;
-                    label->setText("Raw Mode: " + string(rawModeEnabled ? "ON" : "OFF"));
-                }
-                else if (i == 4) {
-                    networkThreadPriority = (networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL) ?
-                        THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_TIME_CRITICAL;
-                    label->setText("Net Priority: " + string(networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
-                    SetThreadPriority(GetCurrentThread(), networkThreadPriority);
-                }
-                else if (i == 5) {
-                    hapticThreadPriority = (hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL) ?
-                        THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_TIME_CRITICAL;
-                    label->setText("Hap Priority: " + string(hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
-                }
-                else if (i == 6) {
-                    packetDelayMin += 1.0;
-                    if (packetDelayMin > packetDelayMax) packetDelayMin = packetDelayMax;
-                    label->setText("Delay Min: " + to_string_with_precision(packetDelayMin, 1) + " ms");
-                }
-                else if (i == 7) {
-                    packetDelayMax += 1.0;
-                    label->setText("Delay Max: " + to_string_with_precision(packetDelayMax, 1) + " ms");
-                }
-                else if (i == 8) {
-                    maxPacketsToSend += 100;
-                    label->setText("Max Packets: " + to_string(maxPacketsToSend));
-                }
-                else if (i == 9) {
-                    packetIntervalMs += 0.1;
-                    label->setText("Packet Interval: " + to_string_with_precision(packetIntervalMs, 1) + " ms");
-                }
-                else if (i == 10) {
-                    FORCE_PACKET_WINDOW++;
-                    label->setText("Feedback Window: " + to_string(FORCE_PACKET_WINDOW));
-                }
-                break;
-            }
-        }
-    }
-}
-
-void updateControlGraphics() {
-    // Update graphs
     lock_guard<mutex> lock(graphMutex);
-    double maxHeight = controlHeight * 0.3;
-    double barWidth = controlWidth / (double)GRAPH_WINDOW;
+
+    glColor3f(0.0f, 0.0f, 0.0f);
+    auto drawText = [](float x, float y, const string& text) {
+        glRasterPos2f(x, y);
+        for (char c : text) {
+            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
+        }
+        };
+    cVector3d position(0.0, 0.0, 0.0);
+    if (hapticDevice) {
+        hapticDevice->getPosition(position);
+    }
+    drawText(10, glutHeight - 20, "Force: (" + to_string_with_precision(forceFeedback.x(), 2) + ", " +
+        to_string_with_precision(forceFeedback.y(), 2) + ", " +
+        to_string_with_precision(forceFeedback.z(), 2) + ") N");
+    drawText(10, glutHeight - 40, "Avg Latency: " + to_string_with_precision(avgLatency, 1) + " ms");
+    drawText(10, glutHeight - 60, "Mode: " + string(useVirtualEnvironment ? "Virtual Environment" : "Network"));
+    drawText(10, glutHeight - 80, "Packets: Sent=" + to_string(successfulSends) + "/" + to_string(failedSends) +
+        ", Received=" + to_string(successfulReceives) + "/" + to_string(failedReceives));
+    drawText(10, glutHeight - 100, "Stiffness: " + to_string_with_precision(lastStiffness, 2) + " N/m");
+    drawText(10, glutHeight - 120, "Damping: " + to_string_with_precision(lastDamping, 2) + " N·s/m");
+    drawText(10, glutHeight - 140, "Error: (" + to_string_with_precision(lastError.x(), 4) + ", " +
+        to_string_with_precision(lastError.y(), 4) + ", " +
+        to_string_with_precision(lastError.z(), 4) + ")");
+    drawText(10, glutHeight - 160, "Position: (" + to_string_with_precision(position.x(), 4) + ", " +
+        to_string_with_precision(position.y(), 4) + ", " +
+        to_string_with_precision(position.z(), 4) + ") m");
+    drawText(10, glutHeight - 180, "Controls: [1] Send, [2] Receive, [3] Haptic, [4] Raw, [5] NetPri, [6] HapPri");
+    drawText(10, glutHeight - 200, "[7] DelayMin, [8] DelayMax, [9] MaxPackets, [0] Interval, [w] FeedbackWin");
+
+    float maxHeight = glutHeight * 0.3f;
+    float barWidth = glutWidth / (float)GRAPH_WINDOW;
     int maxPackets = *max_element(sentPacketCounts.begin(), sentPacketCounts.end());
     maxPackets = max(maxPackets, *max_element(receivedPacketCounts.begin(), receivedPacketCounts.end()));
     maxPackets = max(maxPackets, 1);
-    double maxDelay = *max_element(sendDelays.begin(), sendDelays.end());
-    maxDelay = max(maxDelay, *max_element(receiveDelays.begin(), receiveDelays.end()));
-    maxDelay = max(maxDelay, 1.0);
-    for (int i = 0; i < GRAPH_WINDOW; i++) {
-        double sentHeight = (sentPacketCounts[i] / (double)maxPackets) * maxHeight;
-        double receivedHeight = (receivedPacketCounts[i] / (double)maxPackets) * maxHeight;
-        // Remove old bars
-        controlWorld->removeChild(sentPacketBars[i]);
-        controlWorld->removeChild(receivedPacketBars[i]);
-        // Create new bars with updated sizes
-        sentPacketBars[i] = new cShapeBox(barWidth - 2, sentHeight, 0.1);
-        receivedPacketBars[i] = new cShapeBox(barWidth - 2, receivedHeight, 0.1);
-        sentPacketBars[i]->m_material->setBlue();
-        receivedPacketBars[i]->m_material->setRed();
-        sentPacketBars[i]->setLocalPos(i * barWidth + barWidth / 2, maxHeight / 2, 0);
-        receivedPacketBars[i]->setLocalPos(i * barWidth + barWidth / 2, maxHeight * 1.5, 0);
-        controlWorld->addChild(sentPacketBars[i]);
-        controlWorld->addChild(receivedPacketBars[i]);
-        // Update line endpoints
-        double delayY = (sendDelays[i] / maxDelay) * maxHeight;
-        delayLines[i]->m_pointA = cVector3d(i * barWidth, maxHeight * 2.5, 0);
-        delayLines[i]->m_pointB = cVector3d(i * barWidth, maxHeight * 2.5 + delayY, 0);
-    }
+    float maxDelay = *max_element(sendDelays.begin(), sendDelays.end());
+    maxDelay = *max_element(sendDelays.begin(), sendDelays.end());
+    maxDelay = max(maxDelay, 1.0f);
 
-    if (controlWorld) {
-        controlWorld->updateShadowMaps(false, false);
+    glBegin(GL_QUADS);
+    for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
+        float sentHeight = (sentPacketCounts[i] / (float)maxPackets) * maxHeight;
+        float receivedHeight = (receivedPacketCounts[i] / (float)maxPackets) * maxHeight;
+        glColor3f(0.0f, 0.0f, 1.0f);
+        glVertex2f(static_cast<float>(i) * barWidth, maxHeight / 2);
+        glVertex2f(static_cast<float>(i) * barWidth + barWidth - 2, maxHeight / 2);
+        glVertex2f(static_cast<float>(i) * barWidth + barWidth - 2, maxHeight / 2 + sentHeight);
+        glVertex2f(static_cast<float>(i) * barWidth, maxHeight / 2 + sentHeight);
+        glColor3f(1.0f, 0.0f, 0.0f);
+        glVertex2f(static_cast<float>(i) * barWidth, maxHeight * 1.5f);
+        glVertex2f(static_cast<float>(i) * barWidth + barWidth - 2, maxHeight * 1.5f);
+        glVertex2f(static_cast<float>(i) * barWidth + barWidth - 2, maxHeight * 1.5f + receivedHeight);
+        glVertex2f(static_cast<float>(i) * barWidth, maxHeight * 1.5f + receivedHeight);
     }
-    if (controlCamera) {
-        controlCamera->renderView(controlWidth, controlHeight);
+    glEnd();
+
+    glColor3f(0.0f, 1.0f, 0.0f);
+    glBegin(GL_LINES);
+    for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
+        float delayY = (sendDelays[i] / maxDelay) * maxHeight;
+        glVertex2f(static_cast<float>(i) * barWidth, maxHeight * 2.5f);
+        glVertex2f(static_cast<float>(i) * barWidth, maxHeight * 2.5f + delayY);
     }
-    glFinish();
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        logMessage("Control OpenGL Error: " + to_string(err));
-    }
+    glEnd();
+
+    glutSwapBuffers();
 }
 
-void cleanupSocket() {
-    if (sock != INVALID_SOCKET) {
-        closesocket(sock);
-        sock = INVALID_SOCKET;
-    }
-    if (fallbackSock != INVALID_SOCKET) {
-        closesocket(fallbackSock);
-        fallbackSock = INVALID_SOCKET;
-    }
-    WSACleanup();
-    logMessage("Sockets closed and Winsock cleaned up");
+void glutReshape(int width, int height) {
+    glutWidth = width;
+    glutHeight = max(height, 1);
+    glViewport(0, 0, glutWidth, glutHeight);
 }
 
-void getCurrentTimestamp(char* buffer, size_t size) {
-    auto now = chrono::system_clock::now();
-    auto time = chrono::system_clock::to_time_t(now);
-    auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
-    struct tm tstruct;
-    localtime_s(&tstruct, &time);
-    char temp[64];
-    strftime(temp, sizeof(temp), "%Y-%m-%d %H:%M:%S", &tstruct);
-    snprintf(buffer, size, "%s.%03lld", temp, (long long)ms.count());
-}
-
-void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
-    width = a_width;
-    height = a_height;
-    if (labelMessage) {
-        labelMessage->setLocalPos((int)(0.5 * (width - labelMessage->getWidth())), 50);
-    }
-    // Position GUI labels in the top-left corner
-    if (labelRates) {
-        labelRates->setLocalPos(10, height - 20);
-    }
-    if (labelForce) {
-        labelForce->setLocalPos(10, height - 40);
-    }
-    if (labelLatency) {
-        labelLatency->setLocalPos(10, height - 60);
-    }
-    if (labelMode) {
-        labelMode->setLocalPos(10, height - 80);
-    }
-    if (labelPackets) {
-        labelPackets->setLocalPos(10, height - 100);
-    }
-    if (labelStiffness) {
-        labelStiffness->setLocalPos(10, height - 120);
-    }
-    if (labelDamping) {
-        labelDamping->setLocalPos(10, height - 140);
-    }
-    if (labelError) {
-        labelError->setLocalPos(10, height - 160);
-    }
-    if (labelPosition) {
-        labelPosition->setLocalPos(10, height - 180);
-    }
-}
-
-void errorCallback(int a_error, const char* a_description) {
-    logMessage("GLFW Error: " + string(a_description));
-}
-
-void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
-    if ((a_action != GLFW_PRESS) && (a_action != GLFW_REPEAT)) {
-        return;
-    }
-    if (a_key == GLFW_KEY_ESCAPE || a_key == GLFW_KEY_Q) {
-        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
-    }
-    else if (a_key == GLFW_KEY_F) {
-        fullscreen = !fullscreen;
-        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
-        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
-        if (fullscreen) {
-            glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
-            glfwSwapInterval(swapInterval);
-        }
-        else {
-            int w = 0.8 * mode->height;
-            int h = 0.5 * mode->height;
-            int x = 0.5 * (mode->width - w);
-            int y = 0.5 * (mode->height - h);
-            glfwSetWindowMonitor(window, nullptr, x, y, w, h, mode->refreshRate);
-            glfwSwapInterval(swapInterval);
-        }
-    }
-    else if (a_key == GLFW_KEY_M) {
-        mirroredDisplay = !mirroredDisplay;
-        if (camera) {
-            camera->setMirrorVertical(mirroredDisplay);
-        }
+void glutKeyboard(unsigned char key, int x, int y) {
+    lock_guard<mutex> lock(controlMutex);
+    switch (key) {
+    case '1':
+        sendPacketsEnabled = !sendPacketsEnabled;
+        logMessage("Send Packets: " + string(sendPacketsEnabled ? "ON" : "OFF"));
+        break;
+    case '2':
+        receiveFeedbackEnabled = !receiveFeedbackEnabled;
+        logMessage("Receive Feedback: " + string(receiveFeedbackEnabled ? "ON" : "OFF"));
+        break;
+    case '3':
+        applyHapticFeedback = !applyHapticFeedback;
+        logMessage("Apply Haptic: " + string(applyHapticFeedback ? "ON" : "OFF"));
+        break;
+    case '4':
+        rawModeEnabled = !rawModeEnabled;
+        logMessage("Raw Mode: " + string(rawModeEnabled ? "ON" : "OFF"));
+        break;
+    case '5':
+        networkThreadPriority = (networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL) ?
+            THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_TIME_CRITICAL;
+        logMessage("Net Priority: " + string(networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
+        SetThreadPriority(GetCurrentThread(), networkThreadPriority);
+        break;
+    case '6':
+        hapticThreadPriority = (hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL) ?
+            THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_TIME_CRITICAL;
+        logMessage("Hap Priority: " + string(hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
+        break;
+    case '7':
+        packetDelayMin += 1.0;
+        if (packetDelayMin > packetDelayMax) packetDelayMin = packetDelayMax;
+        logMessage("Delay Min: " + to_string_with_precision(packetDelayMin, 1) + " ms");
+        break;
+    case '8':
+        packetDelayMax += 1.0;
+        logMessage("Delay Max: " + to_string_with_precision(packetDelayMax, 1) + " ms");
+        break;
+    case '9':
+        maxPacketsToSend += 100;
+        logMessage("Max Packets: " + to_string(maxPacketsToSend));
+        break;
+    case '0':
+        packetIntervalMs += 0.1;
+        logMessage("Packet Interval: " + to_string_with_precision(packetIntervalMs, 1) + " ms");
+        break;
+    case 'w':
+        FORCE_PACKET_WINDOW++;
+        logMessage("Feedback Window: " + to_string(FORCE_PACKET_WINDOW));
+        break;
+    case 27:
+    case 'q':
+        running = false;
+        glutDestroyWindow(glutWindow);
+        break;
     }
 }
 
 void updateGraphics() {
-    // Update label texts
-    if (labelRates) {
-        labelRates->setText("Haptic: " + cStr(freqCounterHaptics.getFrequency(), 0) + " Hz | Graphic: " +
-            cStr(freqCounterGraphics.getFrequency(), 0) + " Hz");
-    }
-    {
-        lock_guard<mutex> lock(forceFeedbackMutex);
-        if (labelForce) {
-            labelForce->setText("Force: [" + to_string_with_precision(forceFeedback.x(), 4) + ", " +
-                to_string_with_precision(forceFeedback.y(), 4) + ", " +
-                to_string_with_precision(forceFeedback.z(), 4) + "] N");
-        }
-        if (labelLatency) {
-            labelLatency->setText("Latency: " + to_string_with_precision(avgLatency, 2) + " ms");
-        }
-        if (labelMode) {
-            labelMode->setText("Mode: " + string(useVirtualEnvironment ? "VE" : "Network"));
-        }
-        if (labelPackets) {
-            labelPackets->setText("Packets: Sent=" + to_string(packetCount) + " (OK=" + to_string(successfulSends) +
-                ", Fail=" + to_string(failedSends) + ") | Recv=" + to_string(successfulReceives) +
-                " (Fail=" + to_string(failedReceives) + ", TO=" + to_string(timeoutReceives) + ")");
-        }
-        double stiffness = USE_ADAPTIVE_DAMPING ? adaptiveStiffness : lastStiffness;
-        double damping = USE_ADAPTIVE_DAMPING ? adaptiveDamping : lastDamping;
-        if (labelStiffness) {
-            labelStiffness->setText("Stiffness: " + to_string_with_precision(stiffness, 2) + " N/m");
-        }
-        if (labelDamping) {
-            labelDamping->setText("Damping: " + to_string_with_precision(damping, 2) + " N·s/m");
-        }
-        if (labelError) {
-            labelError->setText("Error: [" + to_string_with_precision(lastError.x(), 4) + ", " +
-                to_string_with_precision(lastError.y(), 4) + ", " +
-                to_string_with_precision(lastError.z(), 4) + "] m");
-        }
-        if (labelPosition) {
-            cVector3d position;
-            if (hapticDevice && hapticDevice->getPosition(position)) {
-                labelPosition->setText("Position: [" + to_string_with_precision(position.x(), 4) + ", " +
-                    to_string_with_precision(position.y(), 4) + ", " +
-                    to_string_with_precision(position.z(), 4) + "] m");
-            }
-            else {
-                labelPosition->setText("Position: [N/A, N/A, N/A] m");
-            }
-        }
-    }
-
-    if (world) {
-        world->updateShadowMaps(false, mirroredDisplay);
-    }
-    if (camera) {
-        camera->renderView(width, height);
-    }
-    glFinish();
+    if (!camera) return;
+    labelRates->setText("Graphics: " + to_string((int)freqCounterGraphics.getFrequency()) +
+        " Hz  |  Haptics: " + to_string((int)freqCounterHaptics.getFrequency()) + " Hz");
+    labelMessage->setText("Press gripper to toggle between Network and Virtual Environment mode");
+    labelRates->setLocalPos(10, height - 30, 0);
+    labelMessage->setLocalPos(10, height - 60, 0);
+    camera->renderView(width, height);
     GLenum err = glGetError();
     if (err != GL_NO_ERROR) {
         logMessage("OpenGL Error: " + to_string(err));
     }
 }
 
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
+    width = a_width;
+    height = a_height;
+}
+
+void errorCallback(int a_error, const char* a_description) {
+    logMessage("GLFW Error " + to_string(a_error) + ": " + string(a_description));
+}
+
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
+    if (a_action != GLFW_PRESS) return;
+    if (a_key == GLFW_KEY_F) {
+        fullscreen = !fullscreen;
+        if (fullscreen) {
+            const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
+            glfwSetWindowMonitor(a_window, glfwGetPrimaryMonitor(), 0, 0, mode->width, mode->height, mode->refreshRate);
+        }
+        else {
+            glfwSetWindowMonitor(a_window, nullptr, 100, 100, 1280, 720, 0);
+        }
+    }
+    else if (a_key == GLFW_KEY_M) {
+        if (camera) {
+            mirroredDisplay = !mirroredDisplay;
+            camera->setMirrorVertical(mirroredDisplay);
+        }
+    }
+    else if (a_key == GLFW_KEY_Q || a_key == GLFW_KEY_ESCAPE) {
+        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+    }
+}
+
 void close() {
-    simulationRunning = false;
     running = false;
     hapticRunning = false;
-    controlRunning = false;
-    if (logFile.is_open()) {
-        logFile.close();
-    }
 }
