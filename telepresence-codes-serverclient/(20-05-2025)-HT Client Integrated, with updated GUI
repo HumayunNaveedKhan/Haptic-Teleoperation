@@ -6,7 +6,7 @@
 #include <mmsystem.h>
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
-#include <G:\My Drive\My degrees and Courses\MEngg. (Computer Networks)\HK MEngg Thesis\Haptic Teleoperation (06-12-2024)\freeglut\include\GL\freeglut.h>
+#include <D:\chai3d-3.2.0\extras\freeglut\include\GL\glut.h>
 #include "chai3d.h"
 #include <iostream>
 #include <iomanip>
@@ -26,6 +26,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "chai3d.lib")
+//#pragma comment(lib, "opengl32.lib")
 //#pragma comment(lib, "glew32.lib")
 #pragma comment(lib, "freeglut.lib")
 
@@ -141,6 +142,30 @@ int glutWindow = 0;
 int glutWidth = 800;
 int glutHeight = 600;
 ofstream logFile("AppVE.log");
+
+// New GUI constants
+const float MARGIN = 10.0f;
+const float SECTION_SPACING = 20.0f;
+const float TEXT_HEIGHT = 15.0f;
+const float GRAPH_HEIGHT = 150.0f;
+const float BAR_WIDTH = 10.0f;
+const float STATUS_RADIUS = 8.0f;
+void* LABEL_FONT = GLUT_BITMAP_HELVETICA_12;
+void* TITLE_FONT = GLUT_BITMAP_HELVETICA_18;
+
+// Colors
+struct Color {
+    float r, g, b;
+};
+const Color COLOR_BG = { 0.9f, 0.9f, 0.9f };
+const Color COLOR_TEXT = { 0.0f, 0.0f, 0.0f };
+const Color COLOR_SENT = { 0.0f, 0.5f, 1.0f };
+const Color COLOR_RECEIVED = { 1.0f, 0.2f, 0.2f };
+const Color COLOR_DELAY = { 0.0f, 0.8f, 0.0f };
+const Color COLOR_ON = { 0.0f, 1.0f, 0.0f };
+const Color COLOR_OFF = { 1.0f, 0.0f, 0.0f };
+const Color COLOR_AXIS = { 0.3f, 0.3f, 0.3f };
+const Color COLOR_GRID = { 0.7f, 0.7f, 0.7f };
 
 struct OutgoingPacket {
     int packetNumber;
@@ -1072,13 +1097,52 @@ void glutGUI() {
     glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE | GLUT_DEPTH);
     glutInitWindowSize(glutWidth, glutHeight);
     glutInitWindowPosition(100, 100);
-    glutWindow = glutCreateWindow("Haptic Teleoperation Stats");
+    glutWindow = glutCreateWindow("Haptic Teleoperation Dashboard");
     glutDisplayFunc(glutDisplay);
     glutReshapeFunc(glutReshape);
     glutKeyboardFunc(glutKeyboard);
-    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glClearColor(COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, 1.0f);
     glutMainLoop();
     logMessage("GLUT GUI thread exiting");
+}
+
+// Helper functions
+void drawText(float x, float y, const string& text, void* font = GLUT_BITMAP_HELVETICA_12, Color color = COLOR_TEXT) {
+    glColor3f(color.r, color.g, color.b);
+    glRasterPos2f(x, y);
+    for (char c : text) {
+        glutBitmapCharacter(font, c);
+    }
+}
+
+void drawCircle(float x, float y, float radius, Color color, bool filled = true) {
+    glColor3f(color.r, color.g, color.b);
+    glBegin(filled ? GL_TRIANGLE_FAN : GL_LINE_LOOP);
+    for (int i = 0; i < 360; i++) {
+        float rad = i * 3.14159265f / 180.0f;
+        glVertex2f(x + cos(rad) * radius, y + sin(rad) * radius);
+    }
+    glEnd();
+}
+
+void drawRect(float x, float y, float width, float height, Color color, bool filled = true) {
+    glColor3f(color.r, color.g, color.b);
+    glBegin(filled ? GL_QUADS : GL_LINE_LOOP);
+    glVertex2f(x, y);
+    glVertex2f(x + width, y);
+    glVertex2f(x + width, y + height);
+    glVertex2f(x, y + height);
+    glEnd();
+}
+void drawGrid(float x, float y, float width, float height, int numHLines, Color color) {
+    glColor3f(color.r, color.g, color.b);
+    glBegin(GL_LINES);
+    for (int i = 1; i < numHLines; i++) {
+        float ly = y + (i * height / numHLines);
+        glVertex2f(x, ly);
+        glVertex2f(x + width, ly);
+    }
+    glEnd();
 }
 
 void glutDisplay() {
@@ -1091,69 +1155,168 @@ void glutDisplay() {
 
     lock_guard<mutex> lock(graphMutex);
 
-    glColor3f(0.0f, 0.0f, 0.0f);
-    auto drawText = [](float x, float y, const string& text) {
-        glRasterPos2f(x, y);
-        for (char c : text) {
-            glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, c);
-        }
-        };
+    float yOffset = glutHeight - MARGIN;
+    float xOffset = MARGIN;
+
+    // Section 1: Network Statistics
+    drawText(xOffset, yOffset, "Network Statistics", TITLE_FONT);
+    yOffset -= TEXT_HEIGHT * 2;
+
     cVector3d position(0.0, 0.0, 0.0);
     if (hapticDevice) {
         hapticDevice->getPosition(position);
     }
-    drawText(10, glutHeight - 20, "Force: (" + to_string_with_precision(forceFeedback.x(), 2) + ", " +
-        to_string_with_precision(forceFeedback.y(), 2) + ", " +
-        to_string_with_precision(forceFeedback.z(), 2) + ") N");
-    drawText(10, glutHeight - 40, "Avg Latency: " + to_string_with_precision(avgLatency, 1) + " ms");
-    drawText(10, glutHeight - 60, "Mode: " + string(useVirtualEnvironment ? "Virtual Environment" : "Network"));
-    drawText(10, glutHeight - 80, "Packets: Sent=" + to_string(successfulSends) + "/" + to_string(failedSends) +
-        ", Received=" + to_string(successfulReceives) + "/" + to_string(failedReceives));
-    drawText(10, glutHeight - 100, "Stiffness: " + to_string_with_precision(lastStiffness, 2) + " N/m");
-    drawText(10, glutHeight - 120, "Damping: " + to_string_with_precision(lastDamping, 2) + " N·s/m");
-    drawText(10, glutHeight - 140, "Error: (" + to_string_with_precision(lastError.x(), 4) + ", " +
-        to_string_with_precision(lastError.y(), 4) + ", " +
-        to_string_with_precision(lastError.z(), 4) + ")");
-    drawText(10, glutHeight - 160, "Position: (" + to_string_with_precision(position.x(), 4) + ", " +
-        to_string_with_precision(position.y(), 4) + ", " +
-        to_string_with_precision(position.z(), 4) + ") m");
-    drawText(10, glutHeight - 180, "Controls: [1] Send, [2] Receive, [3] Haptic, [4] Raw, [5] NetPri, [6] HapPri");
-    drawText(10, glutHeight - 200, "[7] DelayMin, [8] DelayMax, [9] MaxPackets, [0] Interval, [w] FeedbackWin");
+    drawText(xOffset, yOffset, "Mode: " + string(useVirtualEnvironment ? "Virtual Environment" : "Network"));
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "Packets Sent: " + to_string(successfulSends) + " (Failed: " + to_string(failedSends) + ")");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "Packets Received: " + to_string(successfulReceives) + " (Failed: " + to_string(failedReceives) + ")");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "Avg Latency: " + to_string_with_precision(avgLatency, 1) + " ms");
+    yOffset -= SECTION_SPACING;
 
-    float maxHeight = glutHeight * 0.3f;
-    float barWidth = glutWidth / (float)GRAPH_WINDOW;
+    // Packet Count Graph
+    drawText(xOffset, yOffset, "Packet Counts (Last " + to_string(GRAPH_WINDOW) + "s)", TITLE_FONT);
+    yOffset -= TEXT_HEIGHT;
+
+    float graphWidth = glutWidth - 2 * MARGIN;
+    float graphX = xOffset;
+    float graphY = yOffset - GRAPH_HEIGHT;
     int maxPackets = *max_element(sentPacketCounts.begin(), sentPacketCounts.end());
     maxPackets = max(maxPackets, *max_element(receivedPacketCounts.begin(), receivedPacketCounts.end()));
     maxPackets = max(maxPackets, 1);
-    float maxDelay = *max_element(sendDelays.begin(), sendDelays.end());
-    maxDelay = *max_element(sendDelays.begin(), sendDelays.end());
-    maxDelay = max(maxDelay, 1.0f);
 
+    // Draw Grid
+    drawGrid(graphX, graphY, graphWidth, GRAPH_HEIGHT, 5, COLOR_GRID);
+
+    // Draw Axes
+    glColor3f(COLOR_AXIS.r, COLOR_AXIS.g, COLOR_AXIS.b);
+    glBegin(GL_LINES);
+    glVertex2f(graphX, graphY);
+    glVertex2f(graphX, graphY + GRAPH_HEIGHT); // Y-axis
+    glVertex2f(graphX, graphY);
+    glVertex2f(graphX + graphWidth, graphY); // X-axis
+    glEnd();
+
+    // Draw Bars
     glBegin(GL_QUADS);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
-        float sentHeight = (sentPacketCounts[i] / (float)maxPackets) * maxHeight;
-        float receivedHeight = (receivedPacketCounts[i] / (float)maxPackets) * maxHeight;
-        glColor3f(0.0f, 0.0f, 1.0f);
-        glVertex2f(static_cast<float>(i) * barWidth, maxHeight / 2);
-        glVertex2f(static_cast<float>(i) * barWidth + barWidth - 2, maxHeight / 2);
-        glVertex2f(static_cast<float>(i) * barWidth + barWidth - 2, maxHeight / 2 + sentHeight);
-        glVertex2f(static_cast<float>(i) * barWidth, maxHeight / 2 + sentHeight);
-        glColor3f(1.0f, 0.0f, 0.0f);
-        glVertex2f(static_cast<float>(i) * barWidth, maxHeight * 1.5f);
-        glVertex2f(static_cast<float>(i) * barWidth + barWidth - 2, maxHeight * 1.5f);
-        glVertex2f(static_cast<float>(i) * barWidth + barWidth - 2, maxHeight * 1.5f + receivedHeight);
-        glVertex2f(static_cast<float>(i) * barWidth, maxHeight * 1.5f + receivedHeight);
+        float barX = graphX + i * BAR_WIDTH;
+        float sentHeight = (sentPacketCounts[i] / (float)maxPackets) * GRAPH_HEIGHT;
+        float receivedHeight = (receivedPacketCounts[i] / (float)maxPackets) * GRAPH_HEIGHT;
+
+        // Sent Packets (Blue)
+        glColor3f(COLOR_SENT.r, COLOR_SENT.g, COLOR_SENT.b);
+        glVertex2f(barX, graphY);
+        glVertex2f(barX + BAR_WIDTH * 0.45f, graphY);
+        glVertex2f(barX + BAR_WIDTH * 0.45f, graphY + sentHeight);
+        glVertex2f(barX, graphY + sentHeight);
+
+        // Received Packets (Red)
+        glColor3f(COLOR_RECEIVED.r, COLOR_RECEIVED.g, COLOR_RECEIVED.b);
+        glVertex2f(barX + BAR_WIDTH * 0.55f, graphY);
+        glVertex2f(barX + BAR_WIDTH, graphY);
+        glVertex2f(barX + BAR_WIDTH, graphY + receivedHeight);
+        glVertex2f(barX + BAR_WIDTH * 0.55f, graphY + receivedHeight);
     }
     glEnd();
 
-    glColor3f(0.0f, 1.0f, 0.0f);
+    // Draw Axis Labels
+    drawText(graphX - 30, graphY + GRAPH_HEIGHT + 5, "Packets");
+    drawText(graphX + graphWidth + 5, graphY - 5, "Time (s)");
+
+    yOffset -= (GRAPH_HEIGHT + SECTION_SPACING);
+
+    // Delay Graph
+    drawText(xOffset, yOffset, "Send Delays (ms)", TITLE_FONT);
+    yOffset -= TEXT_HEIGHT;
+
+    float maxDelay = *max_element(sendDelays.begin(), sendDelays.end());
+    maxDelay = max(maxDelay, 1.0f);
+
+    // Draw Grid
+    drawGrid(graphX, graphY - GRAPH_HEIGHT, graphWidth, GRAPH_HEIGHT, 5, COLOR_GRID);
+
+    // Draw Axes
+    glColor3f(COLOR_AXIS.r, COLOR_AXIS.g, COLOR_AXIS.b);
     glBegin(GL_LINES);
+    glVertex2f(graphX, graphY - GRAPH_HEIGHT);
+    glVertex2f(graphX, graphY); // Y-axis
+    glVertex2f(graphX, graphY - GRAPH_HEIGHT);
+    glVertex2f(graphX + graphWidth, graphY - GRAPH_HEIGHT); // X-axis
+    glEnd();
+
+    // Draw Line
+    glColor3f(COLOR_DELAY.r, COLOR_DELAY.g, COLOR_DELAY.b);
+    glBegin(GL_LINE_STRIP);
     for (size_t i = 0; i < static_cast<size_t>(GRAPH_WINDOW); i++) {
-        float delayY = (sendDelays[i] / maxDelay) * maxHeight;
-        glVertex2f(static_cast<float>(i) * barWidth, maxHeight * 2.5f);
-        glVertex2f(static_cast<float>(i) * barWidth, maxHeight * 2.5f + delayY);
+        float x = graphX + i * BAR_WIDTH;
+        float y = graphY - GRAPH_HEIGHT + (sendDelays[i] / maxDelay) * GRAPH_HEIGHT;
+        glVertex2f(x + BAR_WIDTH / 2, y);
     }
     glEnd();
+
+    // Draw Axis Labels
+    drawText(graphX - 30, graphY - 5, "Delay (ms)");
+    drawText(graphX + graphWidth + 5, graphY - GRAPH_HEIGHT - 5, "Time (s)");
+
+    yOffset -= (GRAPH_HEIGHT + SECTION_SPACING);
+
+    // Section 2: Haptic Feedback
+    drawText(xOffset, yOffset, "Haptic Feedback", TITLE_FONT);
+    yOffset -= TEXT_HEIGHT * 2;
+    drawText(xOffset, yOffset, "Force: (" + to_string_with_precision(forceFeedback.x(), 2) + ", " +
+        to_string_with_precision(forceFeedback.y(), 2) + ", " +
+        to_string_with_precision(forceFeedback.z(), 2) + ") N");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "Stiffness: " + to_string_with_precision(lastStiffness, 2) + " N/m");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "Damping: " + to_string_with_precision(lastDamping, 2) + " N·s/m");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "Error: (" + to_string_with_precision(lastError.x(), 4) + ", " +
+        to_string_with_precision(lastError.y(), 4) + ", " +
+        to_string_with_precision(lastError.z(), 4) + ")");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "Position: (" + to_string_with_precision(position.x(), 4) + ", " +
+        to_string_with_precision(position.y(), 4) + ", " +
+        to_string_with_precision(position.z(), 4) + ") m");
+    yOffset -= SECTION_SPACING;
+
+    // Section 3: Controls
+    drawText(xOffset, yOffset, "Controls", TITLE_FONT);
+    yOffset -= TEXT_HEIGHT * 2;
+
+    // Draw Control Toggles with Status Indicators
+    float statusX = xOffset + 200;
+    drawText(xOffset, yOffset, "[1] Send Packets");
+    drawCircle(statusX, yOffset, STATUS_RADIUS, sendPacketsEnabled ? COLOR_ON : COLOR_OFF);
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[2] Receive Feedback");
+    drawCircle(statusX, yOffset, STATUS_RADIUS, receiveFeedbackEnabled ? COLOR_ON : COLOR_OFF);
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[3] Apply Haptic");
+    drawCircle(statusX, yOffset, STATUS_RADIUS, applyHapticFeedback ? COLOR_ON : COLOR_OFF);
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[4] Raw Mode");
+    drawCircle(statusX, yOffset, STATUS_RADIUS, rawModeEnabled ? COLOR_ON : COLOR_OFF);
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[5] Net Priority: " + string(networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
+    drawCircle(statusX, yOffset, STATUS_RADIUS, networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? COLOR_ON : COLOR_OFF);
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[6] Hap Priority: " + string(hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
+    drawCircle(statusX, yOffset, STATUS_RADIUS, hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? COLOR_ON : COLOR_OFF);
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[7] Delay Min: " + to_string_with_precision(packetDelayMin, 1) + " ms");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[8] Delay Max: " + to_string_with_precision(packetDelayMax, 1) + " ms");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[9] Max Packets: " + to_string(maxPacketsToSend));
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[0] Packet Interval: " + to_string_with_precision(packetIntervalMs, 1) + " ms");
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[w] Feedback Window: " + to_string(FORCE_PACKET_WINDOW));
+    yOffset -= TEXT_HEIGHT;
+    drawText(xOffset, yOffset, "[q] or [Esc] Exit");
 
     glutSwapBuffers();
 }
@@ -1162,6 +1325,7 @@ void glutReshape(int width, int height) {
     glutWidth = width;
     glutHeight = max(height, 1);
     glViewport(0, 0, glutWidth, glutHeight);
+    glutPostRedisplay();
 }
 
 void glutKeyboard(unsigned char key, int x, int y) {
@@ -1221,6 +1385,7 @@ void glutKeyboard(unsigned char key, int x, int y) {
         glutDestroyWindow(glutWindow);
         break;
     }
+    glutPostRedisplay();
 }
 
 void updateGraphics() {
