@@ -1,0 +1,1534 @@
+#define WIN32_LEAN_AND_MEAN
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mmsystem.h>
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#include "chai3d.h"
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <string>
+#include <vector>
+#include <numeric>
+#include <cmath>
+#include <fstream>
+#include <algorithm>
+#include <functional>
+#include <atomic>
+#include <cstdint>
+#include <string.h>
+#include <random>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "chai3d.lib")
+
+using namespace chai3d;
+using namespace std;
+
+// Utility function for string formatting
+template<typename T>
+string to_string_with_precision(const T a_value, const int n) {
+    ostringstream out;
+    out << fixed << setprecision(n) << a_value;
+    return out.str();
+}
+
+//------------------------------------------------------------------------------
+// CONFIGURATION PARAMETERS
+//------------------------------------------------------------------------------
+
+// Network Settings
+const char CLIENT_IP[] = "169.254.50.63";        // Client IP address
+const char SERVER_IP[] = "169.254.213.206";      // Server IP address
+const int SEND_PORT = 4000;                      // Port for sending position data
+const int RECV_PORT = 4001;                      // Primary port for receiving force feedback
+const int FALLBACK_PORT = 4000;                  // Fallback port to try receiving
+const int BUFFER_SIZE = 5000;                    // Packet buffer size (bytes)
+const int SOCKET_TIMEOUT_MS = 1;                 // Socket select timeout (ms)
+const int SOCKET_RCVBUF_SIZE = 65536;           // Socket receive buffer size (bytes)
+
+// Haptic Device Settings
+const int HAPTIC_RATE_HZ = 1000;                // Haptic loop update rate (Hz)
+const double MAX_FORCE = 8.0;                    // Max force for Novint Falcon (N)
+
+// Control Parameters
+int FORCE_PACKET_WINDOW = 5;                     // Number of packets for force averaging (configurable)
+const int ADAPTIVE_UPDATE_MS = 100;              // Interval for adaptive damping/stiffness update (ms)
+const bool USE_ADAPTIVE_DAMPING = true;         // Enable adaptive damping/stiffness
+const double ERROR_VARIANCE_SCALE = 0.5;        // Scaling factor for error variance
+const double MAX_DAMPING = 10.0;                // Max damping (N·s/m)
+const double MAX_STIFFNESS = 1000.0;            // Max stiffness (N/m)
+
+// Virtual Environment Settings
+const int NUM_SPHERES = 3;                      // Number of spheres in the scene
+const double SPHERE_RADIUS = 0.007;             // Radius of each sphere
+const double SPHERES_RADIUS = 0.007;            // Consistent radius for calculations
+const double SPHERE_STIFFNESS = 1000.0;         // Stiffness for sphere collisions
+const double SPHERE_MASS = 0.04;                // Mass of each sphere
+const double K_DAMPING = 0.996;                 // Damping factor for sphere velocity
+const double K_MAGNET = 500.0;                  // Magnetic force constant
+const double HAPTIC_STIFFNESS = 500.0;          // Stiffness for haptic interaction
+
+// General Settings
+cStereoMode stereoMode = C_STEREO_DISABLED;     // Stereo mode
+bool fullscreen = false;                        // Fullscreen mode
+bool mirroredDisplay = false;                    // Mirrored display
+string resourceRoot = "../../../bin/";          // Root resource path
+
+// New Control Variables
+bool sendPacketsEnabled = true;                  // Enable/disable packet sending
+bool receiveFeedbackEnabled = true;              // Enable/disable feedback receiving
+bool applyHapticFeedback = true;                // Enable/disable haptic feedback application
+int networkThreadPriority = THREAD_PRIORITY_TIME_CRITICAL; // Network thread priority
+int hapticThreadPriority = THREAD_PRIORITY_TIME_CRITICAL;  // Haptic thread priority
+double packetDelayMin = 0.0;                    // Min delay for packet sending (ms)
+double packetDelayMax = 0.0;                    // Max delay for packet sending (ms)
+int maxPacketsToSend = 0;                       // 0 means unlimited
+double packetIntervalMs = 1000.0 / HAPTIC_RATE_HZ; // Interval between packets (ms)
+bool rawModeEnabled = false;                     // Raw mode (bypass controls, max rate)
+mutex controlMutex;                              // Mutex for control variables
+
+// Graph Data
+const int GRAPH_WINDOW = 60;                    // Number of samples for graphs
+vector<int> sentPacketCounts(GRAPH_WINDOW, 0);   // Sent packet counts
+vector<int> receivedPacketCounts(GRAPH_WINDOW, 0); // Received packet counts
+vector<double> sendDelays(GRAPH_WINDOW, 0.0);    // Send delays
+vector<double> receiveDelays(GRAPH_WINDOW, 0.0); // Receive delays
+mutex graphMutex;                                // Mutex for graph data
+chrono::steady_clock::time_point graphStartTime; // Start time for graph data
+
+//------------------------------------------------------------------------------
+// GLOBAL VARIABLES
+//------------------------------------------------------------------------------
+mutex forceFeedbackMutex;                        // Mutex for force feedback data
+cVector3d forceFeedback(0.0, 0.0, 0.0);          // Force vector to be applied
+bool newForceFeedback = false;                   // Flag for new force data
+int packetCount = 0;                            // Total packets sent
+int successfulSends = 0;                        // Successful packet sends
+int successfulReceives = 0;                     // Successful packet receives
+int failedSends = 0;                            // Failed packet sends
+int failedReceives = 0;                         // Failed packet receives
+int timeoutReceives = 0;                        // Timeout receive failures
+double lastStiffness = 0.0;                      // Last received stiffness (K)
+double lastDamping = 0.0;                       // Last received damping (B)
+double adaptiveStiffness = 0.0;                 // Adaptive stiffness
+double adaptiveDamping = 0.0;                   // Adaptive damping
+cVector3d lastError(0.0, 0.0, 0.0);             // Last received position error
+double lastPacketTime = 0.0;                    // Timestamp of last sent packet (ms)
+double avgLatency = 0.0;                        // Average round-trip latency (ms)
+int latencyCount = 0;                           // Number of latency measurements
+volatile bool running = true;                    // Program running flag
+volatile bool hapticRunning = true;              // Haptic thread running flag
+bool useVirtualEnvironment = false;             // Flag to toggle VE mode
+bool simulationRunning = false;                 // Haptic simulation running
+bool simulationFinished = true;                 // Haptic simulation finished
+
+// Force Feedback Buffer
+vector<cVector3d> forceBuffer;                  // Buffer for force smoothing
+vector<double> stiffnessBuffer;                 // Buffer for stiffness
+vector<double> dampingBuffer;                   // Buffer for damping
+vector<cVector3d> errorBuffer;                  // Buffer for position errors
+mutex bufferMutex;                              // Mutex for buffer access
+
+// Network Variables
+SOCKET sock = INVALID_SOCKET;
+SOCKET fallbackSock = INVALID_SOCKET;
+
+// Haptic Device Variables
+cHapticDeviceHandler* handler = nullptr;
+cGenericHapticDevicePtr hapticDevice = nullptr;
+cFrequencyCounter freqCounterHaptics;
+double hapticDeviceMaxStiffness = 0.0;
+
+// Virtual Environment Variables
+cWorld* world = nullptr;
+cCamera* camera = nullptr;
+cSpotLight* light = nullptr;
+cShapeSphere* spheres[NUM_SPHERES];
+cMesh* plane = nullptr;
+cVector3d sphereVel[NUM_SPHERES];
+cBackground* background = nullptr;
+cFontPtr font = nullptr;
+cLabel* labelRates = nullptr;
+cLabel* labelMessage = nullptr;
+cLabel* labelForce = nullptr;
+cLabel* labelLatency = nullptr;
+cLabel* labelMode = nullptr;
+cLabel* labelPackets = nullptr;
+cLabel* labelStiffness = nullptr;
+cLabel* labelDamping = nullptr;
+cLabel* labelError = nullptr;
+cLabel* labelPosition = nullptr;
+GLFWwindow* window = nullptr;
+int width = 0;
+int height = 0;
+int swapInterval = 1;
+cFrequencyCounter freqCounterGraphics;
+
+// Control GUI Variables
+GLFWwindow* controlWindow = nullptr;
+cWorld* controlWorld = nullptr;
+cCamera* controlCamera = nullptr;
+cFontPtr controlFont = nullptr;
+vector<cLabel*> controlLabels;                  // Labels for controls and stats
+vector<cShapeBox*> sentPacketBars;              // Bars for sent packets
+vector<cShapeBox*> receivedPacketBars;          // Bars for received packets
+vector<cShapeLine*> delayLines;                 // Lines for delays
+int controlWidth = 800;
+int controlHeight = 600;
+volatile bool controlRunning = true;
+cFrequencyCounter freqCounterControlGraphics;
+
+// Logging
+ofstream logFile("AppVE.log");                  // Log file for debugging
+
+// Packet Structures
+struct OutgoingPacket {
+    int packetNumber;
+    float x, y, z;
+    float delay;
+    char timestamp[64];
+    char srcIP[INET_ADDRSTRLEN];
+    char dstIP[INET_ADDRSTRLEN];
+    int srcPort;
+    int dstPort;
+};
+
+struct IncomingPacket {
+    int packetNumber;        // 4 bytes
+    double force[3];        // 24 bytes (3 * 8)
+    double position[3];     // 24 bytes (3 * 8)
+    double error[3];        // 24 bytes (3 * 8)
+    double stiffness;       // 8 bytes
+    double damping;         // 8 bytes
+    bool isActive;          // 1 byte (padded to 4 bytes)
+    char timestamp[64];     // 64 bytes
+}; // Total: 176 bytes
+
+//------------------------------------------------------------------------------
+// FUNCTION PROTOTYPES
+//------------------------------------------------------------------------------
+void initializeWinsock();
+void setupSocket(SOCKET& s, int port, int maxRetries = 3);
+void networkCommunication();
+void hapticLoop();
+void controlGUI();
+void cleanupSocket();
+void getCurrentTimestamp(char* buffer, size_t size);
+void handleError(const string& message);
+void logRawPacket(const char* buffer, int size);
+void updateAdaptiveParameters();
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
+void controlWindowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
+void errorCallback(int a_error, const char* a_description);
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
+void controlKeyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
+void controlMouseButtonCallback(GLFWwindow* a_window, int a_button, int a_action, int a_mods);
+void updateGraphics();
+void updateControlGraphics();
+void close();
+void logMessage(const string& message);
+#define RESOURCE_PATH(p) (char*)((resourceRoot+string(p)).c_str())
+
+//------------------------------------------------------------------------------
+// FUNCTION IMPLEMENTATIONS
+//------------------------------------------------------------------------------
+void logMessage(const string& message) {
+    auto now = chrono::system_clock::now();
+    auto time = chrono::system_clock::to_time_t(now);
+    struct tm tstruct;
+    localtime_s(&tstruct, &time);
+    char timeStr[64];
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &tstruct);
+    string logEntry = "[" + string(timeStr) + "] " + message + "\n";
+    cout << logEntry;
+    if (logFile.is_open()) {
+        logFile << logEntry;
+        logFile.flush();
+    }
+}
+
+void handleError(const string& message) {
+    logMessage("Error: " + message);
+}
+
+int main() {
+    timeBeginPeriod(1);
+    logMessage("===== Haptic Teleoperation Client with Virtual Environment =====");
+    logMessage("Client IP: " + string(CLIENT_IP));
+    logMessage("Server IP: " + string(SERVER_IP));
+    logMessage("Send Port: " + to_string(SEND_PORT));
+    logMessage("Receive Port: " + to_string(RECV_PORT) + " (Fallback: " + to_string(FALLBACK_PORT) + ")");
+    logMessage("Haptic Rate: " + to_string(HAPTIC_RATE_HZ) + " Hz");
+    logMessage("Expected IncomingPacket size: " + to_string(sizeof(IncomingPacket)) + " bytes");
+    logMessage("Force Packet Window: " + to_string(FORCE_PACKET_WINDOW) + " packets");
+    logMessage("Adaptive Update Interval: " + to_string(ADAPTIVE_UPDATE_MS) + " ms");
+    logMessage("Adaptive Damping: " + string(USE_ADAPTIVE_DAMPING ? "Enabled" : "Disabled"));
+    logMessage("Press Ctrl+C or close console to exit");
+    logMessage("Keyboard Options (Main Window):");
+    logMessage("[f] - Toggle full screen mode");
+    logMessage("[m] - Toggle vertical mirroring");
+    logMessage("[q] - Exit application");
+    logMessage("Gripper Button: Toggle between Network and Virtual Environment mode");
+    logMessage("===============================================================");
+
+    // Initialize GLFW
+    logMessage("Initializing GLFW...");
+    if (!glfwInit()) {
+        handleError("Failed to initialize GLFW");
+        return 1;
+    }
+    logMessage("GLFW initialized successfully");
+    glfwSetErrorCallback(errorCallback);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_STEREO, stereoMode == C_STEREO_ACTIVE ? GL_TRUE : GL_FALSE);
+    const GLFWvidmode* mode = glfwGetPrimaryMonitor() ? glfwGetVideoMode(glfwGetPrimaryMonitor()) : nullptr;
+    if (!mode) {
+        handleError("Failed to get video mode");
+        glfwTerminate();
+        return 1;
+    }
+    int w = 0.8 * mode->height;
+    int h = 0.5 * mode->height;
+    int x = 0.5 * (mode->width - w);
+    int y = 0.5 * (mode->height - h);
+    logMessage("Creating main GLFW window...");
+    window = glfwCreateWindow(w, h, "Haptic Teleoperation with Virtual Environment", nullptr, nullptr);
+    if (!window) {
+        handleError("Failed to create main GLFW window");
+        glfwTerminate();
+        return 1;
+    }
+    logMessage("Main GLFW window created successfully");
+    glfwGetWindowSize(window, &width, &height);
+    glfwSetWindowPos(window, x, y);
+    glfwSetKeyCallback(window, keyCallback);
+    glfwSetWindowSizeCallback(window, windowSizeCallback);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(swapInterval);
+
+    // Initialize GLEW
+    logMessage("Initializing GLEW...");
+    GLenum glewErr = glewInit();
+    if (glewErr != GLEW_OK) {
+        logMessage("GLEW initialization failed: " + string((const char*)glewGetErrorString(glewErr)));
+        logMessage("Continuing without GLEW extensions");
+    }
+    else {
+        logMessage("GLEW initialized successfully");
+    }
+
+    // Create control window
+    logMessage("Creating control GLFW window...");
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    controlWindow = glfwCreateWindow(controlWidth, controlHeight, "Control and Stats GUI", nullptr, window);
+    if (!controlWindow) {
+        handleError("Failed to create control GLFW window");
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
+    }
+    logMessage("Control GLFW window created successfully");
+    glfwSetWindowPos(controlWindow, x + w + 10, y);
+    glfwSetKeyCallback(controlWindow, controlKeyCallback);
+    glfwSetMouseButtonCallback(controlWindow, controlMouseButtonCallback);
+    glfwSetWindowSizeCallback(controlWindow, controlWindowSizeCallback);
+
+    // Initialize Winsock
+    logMessage("Initializing Winsock...");
+    initializeWinsock();
+
+    // Set up sockets
+    logMessage("Setting up sockets...");
+    setupSocket(sock, RECV_PORT, 3);
+    setupSocket(fallbackSock, FALLBACK_PORT, 3);
+
+    // Initialize haptic device
+    logMessage("Initializing haptic device...");
+    handler = new cHapticDeviceHandler();
+    if (!handler) {
+        logMessage("Failed to create haptic device handler. Running in VE mode only.");
+        useVirtualEnvironment = true;
+    }
+    else {
+        handler->getDevice(hapticDevice, 0);
+        if (!hapticDevice) {
+            logMessage("No haptic device found. Running in VE mode only.");
+            useVirtualEnvironment = true;
+        }
+        else {
+            if (!hapticDevice->open()) {
+                logMessage("Failed to open haptic device. Running in VE mode only.");
+                hapticDevice = nullptr;
+                useVirtualEnvironment = true;
+            }
+            else {
+                cHapticDeviceInfo info = hapticDevice->getSpecifications();
+                logMessage("Haptic device opened: " + info.m_modelName);
+                if (!hapticDevice->calibrate()) {
+                    logMessage("Haptic device calibration failed");
+                }
+                hapticDeviceMaxStiffness = info.m_maxLinearStiffness;
+            }
+        }
+    }
+    logMessage("Haptic device initialization completed");
+
+    // Initialize virtual environment
+    logMessage("Initializing virtual environment...");
+    world = new cWorld();
+    if (!world) {
+        handleError("Failed to create world");
+        close();
+        return 1;
+    }
+    world->m_backgroundColor.setWhite();
+    camera = new cCamera(world);
+    if (!camera) {
+        handleError("Failed to create camera");
+        close();
+        return 1;
+    }
+    world->addChild(camera);
+    camera->set(cVector3d(0.20, 0.00, 0.10), cVector3d(0.00, 0.00, 0.05), cVector3d(0.00, 0.00, 1.00));
+    camera->setClippingPlanes(0.01, 10.0);
+    camera->setStereoMode(stereoMode);
+    camera->setStereoEyeSeparation(0.03);
+    camera->setStereoFocalLength(1.8);
+    camera->setMirrorVertical(mirroredDisplay);
+    light = new cSpotLight(world);
+    if (!light) {
+        handleError("Failed to create light");
+        close();
+        return 1;
+    }
+    world->addChild(light);
+    light->setEnabled(true);
+    light->setLocalPos(0.0, 0.3, 0.4);
+    light->setDir(0.0, -0.25, -0.4);
+    light->setShadowMapEnabled(true);
+    light->m_shadowMap->setQualityHigh();
+    world->setShadowIntensity(0.3);
+    light->setCutOffAngleDeg(30);
+
+    // Create plane
+    plane = new cMesh();
+    if (!plane) {
+        handleError("Failed to create plane mesh");
+        close();
+        return 1;
+    }
+    world->addChild(plane);
+    cCreateMap(plane, 0.2, 1.0, 20, 20);
+    plane->setUseDisplayList(true);
+    plane->m_material->setWhite();
+
+    // Create spheres
+    for (int i = 0; i < NUM_SPHERES; i++) {
+        spheres[i] = new cShapeSphere(SPHERE_RADIUS);
+        if (!spheres[i]) {
+            handleError("Failed to create sphere " + to_string(i));
+            close();
+            return 1;
+        }
+        world->addChild(spheres[i]);
+        spheres[i]->setLocalPos(0.8 * SPHERE_RADIUS * (double)(i + 2) * cos(1.0 * (double)(i)),
+            0.8 * SPHERE_RADIUS * (double)(i + 2) * sin(1.0 * (double)(i)),
+            SPHERE_RADIUS);
+        spheres[i]->m_material->setWhite();
+        sphereVel[i].zero();
+    }
+    logMessage("Spheres created successfully");
+
+    // Create font and labels
+    font = NEW_CFONTCALIBRI20();
+    if (!font) {
+        handleError("Failed to create font");
+        close();
+        return 1;
+    }
+    labelRates = new cLabel(font);
+    if (!labelRates) {
+        handleError("Failed to create labelRates");
+        close();
+        return 1;
+    }
+    labelRates->m_fontColor.setBlack();
+    camera->m_frontLayer->addChild(labelRates);
+
+    labelMessage = new cLabel(font);
+    if (!labelMessage) {
+        handleError("Failed to create labelMessage");
+        close();
+        return 1;
+    }
+    labelMessage->m_fontColor.setBlack();
+    labelMessage->setText("Press gripper to toggle between Network and Virtual Environment mode");
+    camera->m_frontLayer->addChild(labelMessage);
+
+    // Create GUI labels
+    labelForce = new cLabel(font);
+    labelLatency = new cLabel(font);
+    labelMode = new cLabel(font);
+    labelPackets = new cLabel(font);
+    labelStiffness = new cLabel(font);
+    labelDamping = new cLabel(font);
+    labelError = new cLabel(font);
+    labelPosition = new cLabel(font);
+    if (!labelForce || !labelLatency || !labelMode || !labelPackets ||
+        !labelStiffness || !labelDamping || !labelError || !labelPosition) {
+        handleError("Failed to create GUI labels");
+        close();
+        return 1;
+    }
+    labelForce->m_fontColor.setBlack();
+    labelLatency->m_fontColor.setBlack();
+    labelMode->m_fontColor.setBlack();
+    labelPackets->m_fontColor.setBlack();
+    labelStiffness->m_fontColor.setBlack();
+    labelDamping->m_fontColor.setBlack();
+    labelError->m_fontColor.setBlack();
+    labelPosition->m_fontColor.setBlack();
+    camera->m_frontLayer->addChild(labelForce);
+    camera->m_frontLayer->addChild(labelLatency);
+    camera->m_frontLayer->addChild(labelMode);
+    camera->m_frontLayer->addChild(labelPackets);
+    camera->m_frontLayer->addChild(labelStiffness);
+    camera->m_frontLayer->addChild(labelDamping);
+    camera->m_frontLayer->addChild(labelError);
+    camera->m_frontLayer->addChild(labelPosition);
+
+    // Create background
+    background = new cBackground();
+    if (!background) {
+        handleError("Failed to create background");
+        close();
+        return 1;
+    }
+    camera->m_backLayer->addChild(background);
+    background->setFixedAspectRatio(true);
+    string bgPath = RESOURCE_PATH("resources/images/HHRCM background.png");
+    bool fileload = background->loadFromFile(bgPath);
+    if (!fileload) {
+        bgPath = "../../../bin/resources/images/HHRCM background.png";
+        fileload = background->loadFromFile(bgPath);
+    }
+    if (!fileload) {
+        logMessage("Background image failed to load at " + bgPath + ". Continuing without background.");
+        camera->m_backLayer->removeChild(background);
+        background = nullptr;
+    }
+    logMessage("Virtual environment initialized successfully");
+
+    // Initialize force buffer
+    forceBuffer.reserve(FORCE_PACKET_WINDOW);
+    stiffnessBuffer.reserve(FORCE_PACKET_WINDOW);
+    dampingBuffer.reserve(FORCE_PACKET_WINDOW);
+    errorBuffer.reserve(FORCE_PACKET_WINDOW);
+
+    // Initialize graph data
+    graphStartTime = chrono::steady_clock::now();
+
+    // Start threads
+    logMessage("Starting threads...");
+    thread networkThread(networkCommunication);
+    thread hapticThread(hapticLoop);
+    thread controlThread(controlGUI);
+
+    // Setup atexit
+    atexit(close);
+
+    // Main graphic loop
+    windowSizeCallback(window, width, height);
+    while (running && !glfwWindowShouldClose(window) && !glfwWindowShouldClose(controlWindow)) {
+        glfwMakeContextCurrent(window);
+        glfwGetWindowSize(window, &width, &height);
+        updateGraphics();
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+        freqCounterGraphics.signal(1);
+    }
+
+    // Clean up
+    logMessage("Cleaning up...");
+    running = false;
+    hapticRunning = false;
+    controlRunning = false;
+    simulationRunning = false;
+    while (!simulationFinished) { cSleepMs(100); }
+    networkThread.join();
+    hapticThread.join();
+    controlThread.join();
+    if (hapticDevice) {
+        hapticDevice->close();
+    }
+    delete handler;
+    delete world;
+    delete controlWorld;
+    cleanupSocket();
+    glfwDestroyWindow(window);
+    glfwDestroyWindow(controlWindow);
+    glfwTerminate();
+    timeEndPeriod(1);
+    logFile.close();
+
+    return 0;
+}
+
+void initializeWinsock() {
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        handleError("WSAStartup failed with error: " + to_string(result));
+        return;
+    }
+    logMessage("Winsock initialized successfully");
+}
+
+void setupSocket(SOCKET& s, int port, int maxRetries) {
+    for (int attempt = 1; attempt <= maxRetries; ++attempt) {
+        s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == INVALID_SOCKET) {
+            logMessage("Attempt " + to_string(attempt) + ": Socket creation failed with error: " + to_string(WSAGetLastError()));
+            if (attempt == maxRetries) {
+                handleError("Socket creation failed after " + to_string(maxRetries) + " attempts");
+                return;
+            }
+            continue;
+        }
+        sockaddr_in clientAddr;
+        memset(&clientAddr, 0, sizeof(clientAddr));
+        clientAddr.sin_family = AF_INET;
+        clientAddr.sin_port = htons(port);
+        if (inet_pton(AF_INET, CLIENT_IP, &clientAddr.sin_addr) <= 0) {
+            closesocket(s);
+            logMessage("Attempt " + to_string(attempt) + ": Invalid client IP address: " + string(CLIENT_IP));
+            if (attempt == maxRetries) {
+                handleError("Invalid client IP address: " + string(CLIENT_IP));
+                return;
+            }
+            continue;
+        }
+        int bindResult = ::bind(s, (sockaddr*)&clientAddr, sizeof(clientAddr));
+        if (bindResult == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            closesocket(s);
+            logMessage("Attempt " + to_string(attempt) + ": Bind failed on port " + to_string(port) + " with error: " + to_string(error));
+            if (attempt == maxRetries) {
+                handleError("Bind failed on port " + to_string(port) + " after " + to_string(maxRetries) + " attempts");
+                return;
+            }
+            continue;
+        }
+        int rcvbuf = SOCKET_RCVBUF_SIZE;
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, sizeof(rcvbuf));
+        logMessage("Socket bound to " + string(CLIENT_IP) + ":" + to_string(port));
+        return;
+    }
+}
+
+void logRawPacket(const char* buffer, int size) {
+    stringstream ss;
+    ss << "Raw packet data (" << size << " bytes): ";
+    for (int i = 0; i < min(size, 32); i++) {
+        ss << hex << setfill('0') << setw(2) << (unsigned char)buffer[i] << " ";
+    }
+    if (size > 32) ss << "...";
+    logMessage(ss.str());
+}
+
+void updateAdaptiveParameters() {
+    lock_guard<mutex> lock(bufferMutex);
+    if (errorBuffer.empty()) {
+        adaptiveDamping = 0.0;
+        adaptiveStiffness = 0.0;
+        logMessage("No error data for adaptive parameters");
+        return;
+    }
+    cVector3d meanError(0.0, 0.0, 0.0);
+    for (const auto& err : errorBuffer) {
+        meanError += err;
+    }
+    meanError /= static_cast<double>(errorBuffer.size());
+    cVector3d variance(0.0, 0.0, 0.0);
+    for (const auto& err : errorBuffer) {
+        cVector3d diff = err - meanError;
+        //variance += diff * diff;
+    }
+    variance /= static_cast<double>(errorBuffer.size());
+    double totalVariance = variance.length();
+    double avgDamping = dampingBuffer.empty() ? 0.0 :
+        accumulate(dampingBuffer.begin(), dampingBuffer.end(), 0.0) / dampingBuffer.size();
+    double avgStiffness = stiffnessBuffer.empty() ? 0.0 :
+        accumulate(stiffnessBuffer.begin(), dampingBuffer.end(), 0.0) / dampingBuffer.size();
+    adaptiveDamping = avgDamping * (1.0 - ERROR_VARIANCE_SCALE * totalVariance);
+    adaptiveStiffness = avgStiffness * (1.0 - ERROR_VARIANCE_SCALE * totalVariance);
+    adaptiveDamping = max(0.0, min(adaptiveDamping, MAX_DAMPING));
+    adaptiveStiffness = max(0.0, min(adaptiveStiffness, MAX_STIFFNESS));
+    logMessage("Updated adaptive parameters: Damping=" + to_string(adaptiveDamping) +
+        " N·s/m, Stiffness=" + to_string(adaptiveStiffness) + " N/m");
+}
+
+void networkCommunication() {
+    logMessage("Network thread started");
+    sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(SEND_PORT);
+    if (inet_pton(AF_INET, SERVER_IP, &serverAddr.sin_addr) <= 0) {
+        handleError("Invalid server IP address: " + string(SERVER_IP));
+        running = false;
+        return;
+    }
+    char recvBuffer[BUFFER_SIZE];
+    sockaddr_in senderAddr;
+    int senderAddrSize = sizeof(senderAddr);
+    SetThreadPriority(GetCurrentThread(), networkThreadPriority);
+    fd_set readSet;
+    timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = SOCKET_TIMEOUT_MS * 1000;
+    auto lastAdaptiveUpdate = chrono::steady_clock::now();
+    auto lastSendTime = chrono::steady_clock::now();
+    random_device rd;
+    mt19937 gen(rd());
+    while (running) {
+        auto loopStart = chrono::steady_clock::now();
+        bool shouldSend = false;
+        double currentInterval = packetIntervalMs;
+        int currentMaxPackets = maxPacketsToSend;
+        bool currentRawMode = false;
+        {
+            lock_guard<mutex> lock(controlMutex);
+            shouldSend = sendPacketsEnabled && (maxPacketsToSend == 0 || packetCount < maxPacketsToSend);
+            currentInterval = rawModeEnabled ? 0.0 : packetIntervalMs;
+            currentMaxPackets = maxPacketsToSend;
+            currentRawMode = rawModeEnabled;
+        }
+        if (shouldSend || currentRawMode) {
+            auto now = chrono::steady_clock::now();
+            auto elapsedMs = chrono::duration_cast<chrono::milliseconds>(now - lastSendTime).count();
+            if (elapsedMs >= currentInterval) {
+                auto sendTime = chrono::duration_cast<chrono::milliseconds>(
+                    chrono::system_clock::now().time_since_epoch()).count();
+                cVector3d position;
+                bool validPosition = hapticDevice ? hapticDevice->getPosition(position) : false;
+                if (validPosition) {
+                    OutgoingPacket packet;
+                    memset(&packet, 0, sizeof(packet));
+                    packet.packetNumber = ++packetCount;
+                    packet.x = static_cast<float>(position.x());
+                    packet.y = static_cast<float>(position.y());
+                    packet.z = static_cast<float>(position.z());
+                    packet.delay = currentRawMode ? 0.0f : 1000.0f / HAPTIC_RATE_HZ;
+                    getCurrentTimestamp(packet.timestamp, sizeof(packet.timestamp));
+                    strcpy_s(packet.srcIP, CLIENT_IP);
+                    strcpy_s(packet.dstIP, SERVER_IP);
+                    packet.srcPort = SEND_PORT;
+                    packet.dstPort = SEND_PORT;
+                    int sendResult = sendto(sock, (char*)&packet, sizeof(packet), 0,
+                        (sockaddr*)&serverAddr, sizeof(serverAddr));
+                    if (sendResult == SOCKET_ERROR) {
+                        failedSends++;
+                        logMessage("Send failed: " + to_string(WSAGetLastError()));
+                    }
+                    else {
+                        successfulSends++;
+                        lastPacketTime = sendTime;
+                        logMessage("SENT #" + to_string(packet.packetNumber) + " | Position: (" +
+                            to_string(packet.x) + ", " + to_string(packet.y) + ", " + to_string(packet.z) +
+                            ") | " + packet.timestamp);
+                        // Update graph data
+                        lock_guard<mutex> lock(graphMutex);
+                        auto elapsedSec = chrono::duration_cast<chrono::seconds>(now - graphStartTime).count();
+                        int index = elapsedSec % GRAPH_WINDOW;
+                        sentPacketCounts[index]++;
+                        sendDelays[index] = elapsedMs;
+                    }
+                    lastSendTime = now;
+                    // Apply random/uniform delay
+                    if (!currentRawMode && packetDelayMax > packetDelayMin) {
+                        uniform_real_distribution<double> dist(packetDelayMin, packetDelayMax);
+                        double delay = dist(gen);
+                        this_thread::sleep_for(chrono::microseconds(static_cast<int>(delay * 1000)));
+                    }
+                }
+                else {
+                    failedSends++;
+                    logMessage("Failed to read haptic position");
+                }
+            }
+        }
+        bool shouldReceive = false;
+        {
+            lock_guard<mutex> lock(controlMutex);
+            shouldReceive = receiveFeedbackEnabled || rawModeEnabled;
+        }
+        if (shouldReceive) {
+            FD_ZERO(&readSet);
+            FD_SET(sock, &readSet);
+            int selectResult = select(0, &readSet, nullptr, nullptr, &timeout);
+            if (selectResult > 0 && FD_ISSET(sock, &readSet)) {
+                int recvResult = recvfrom(sock, recvBuffer, BUFFER_SIZE, 0,
+                    (sockaddr*)&senderAddr, &senderAddrSize);
+                if (recvResult > 0) {
+                    logMessage("Received " + to_string(recvResult) + " bytes from " +
+                        string(inet_ntoa(senderAddr.sin_addr)) + ":" + to_string(ntohs(senderAddr.sin_port)) +
+                        " on port " + to_string(RECV_PORT));
+                    logRawPacket(recvBuffer, recvResult);
+                    if (recvResult >= sizeof(IncomingPacket)) {
+                        IncomingPacket* packet = reinterpret_cast<IncomingPacket*>(recvBuffer);
+                        logMessage("Packet contents: packetNumber=" + to_string(packet->packetNumber) +
+                            ", isActive=" + to_string(packet->isActive) +
+                            ", force=[" + to_string(packet->force[0]) + ", " +
+                            to_string(packet->force[1]) + ", " + to_string(packet->force[2]) + "]" +
+                            ", timestamp=" + string(packet->timestamp));
+                        if (packet->isActive) {
+                            lock_guard<mutex> lock(forceFeedbackMutex);
+                            cVector3d force(packet->force[0], packet->force[1], packet->force[2]);
+                            if (force.length() > MAX_FORCE) {
+                                force = force * (MAX_FORCE / force.length());
+                            }
+                            {
+                                lock_guard<mutex> bufferLock(bufferMutex);
+                                forceBuffer.push_back(force);
+                                stiffnessBuffer.push_back(packet->stiffness);
+                                dampingBuffer.push_back(packet->damping);
+                                errorBuffer.push_back(cVector3d(packet->error[0], packet->error[1], packet->error[2]));
+                                if (forceBuffer.size() > FORCE_PACKET_WINDOW) {
+                                    forceBuffer.erase(forceBuffer.begin());
+                                    stiffnessBuffer.erase(stiffnessBuffer.begin());
+                                    dampingBuffer.erase(dampingBuffer.begin());
+                                    errorBuffer.erase(errorBuffer.begin());
+                                }
+                                cVector3d avgForce(0, 0, 0);
+                                for (const auto& f : forceBuffer) {
+                                    avgForce += f;
+                                }
+                                avgForce /= static_cast<double>(forceBuffer.size());
+                                forceFeedback = avgForce;
+                            }
+                            lastStiffness = packet->stiffness;
+                            lastDamping = packet->damping;
+                            lastError.set(packet->error[0], packet->error[1], packet->error[2]);
+                            auto recvTime = chrono::duration_cast<chrono::milliseconds>(
+                                chrono::system_clock::now().time_since_epoch()).count();
+                            if (packet->packetNumber == packetCount) {
+                                double latency = recvTime - lastPacketTime;
+                                if (latencyCount == 0) {
+                                    avgLatency = latency;
+                                }
+                                else {
+                                    avgLatency = (avgLatency * latencyCount + latency) / (latencyCount + 1);
+                                }
+                                latencyCount++;
+                                // Update graph data
+                                lock_guard<mutex> lock(graphMutex);
+                                auto elapsedSec = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - graphStartTime).count();
+                                int index = elapsedSec % GRAPH_WINDOW;
+                                receivedPacketCounts[index]++;
+                                receiveDelays[index] = latency;
+                            }
+                            successfulReceives++;
+                            newForceFeedback = true;
+                            logMessage("RECEIVED #" + to_string(packet->packetNumber) + " | Force: (" +
+                                to_string(forceFeedback.x()) + ", " + to_string(forceFeedback.y()) + ", " +
+                                to_string(forceFeedback.z()) + ") | Stiffness: " + to_string(packet->stiffness) +
+                                " | Damping: " + to_string(packet->damping) + " | Timestamp: " + packet->timestamp);
+                        }
+                        else {
+                            logMessage("Received inactive packet, ignoring");
+                            lock_guard<mutex> lock(forceFeedbackMutex);
+                            newForceFeedback = false;
+                        }
+                    }
+                    else {
+                        failedReceives++;
+                        logMessage("Received packet too small: " + to_string(recvResult) + " bytes (expected >= " +
+                            to_string(sizeof(IncomingPacket)) + ")");
+                    }
+                }
+                else {
+                    failedReceives++;
+                    logMessage("Receive failed on port " + to_string(RECV_PORT) + ": " + to_string(WSAGetLastError()));
+                }
+            }
+            else {
+                timeoutReceives++;
+                logMessage("Receive timeout on port " + to_string(RECV_PORT) + " (" + to_string(timeoutReceives) + " total)");
+                lock_guard<mutex> lock(forceFeedbackMutex);
+                newForceFeedback = false;
+            }
+            // Fallback port handling
+            FD_ZERO(&readSet);
+            FD_SET(fallbackSock, &readSet);
+            int fallbackSelectResult = select(0, &readSet, nullptr, nullptr, &timeout);
+            if (fallbackSelectResult > 0 && FD_ISSET(fallbackSock, &readSet)) {
+                int recvResult = recvfrom(fallbackSock, recvBuffer, BUFFER_SIZE, 0,
+                    (sockaddr*)&senderAddr, &senderAddrSize);
+                if (recvResult > 0) {
+                    logMessage("Received " + to_string(recvResult) + " bytes from " +
+                        string(inet_ntoa(senderAddr.sin_addr)) + ":" + to_string(ntohs(senderAddr.sin_port)) +
+                        " on port " + to_string(FALLBACK_PORT));
+                    logRawPacket(recvBuffer, recvResult);
+                    if (recvResult >= sizeof(IncomingPacket)) {
+                        IncomingPacket* packet = reinterpret_cast<IncomingPacket*>(recvBuffer);
+                        logMessage("Packet contents: packetNumber=" + to_string(packet->packetNumber) +
+                            ", isActive=" + to_string(packet->isActive) +
+                            ", force=[" + to_string(packet->force[0]) + ", " +
+                            to_string(packet->force[1]) + ", " + to_string(packet->force[2]) + "]" +
+                            ", timestamp=" + string(packet->timestamp));
+                        if (packet->isActive) {
+                            lock_guard<mutex> lock(forceFeedbackMutex);
+                            cVector3d force(packet->force[0], packet->force[1], packet->force[2]);
+                            if (force.length() > MAX_FORCE) {
+                                force = force * (MAX_FORCE / force.length());
+                            }
+                            {
+                                lock_guard<mutex> bufferLock(bufferMutex);
+                                forceBuffer.push_back(force);
+                                stiffnessBuffer.push_back(packet->stiffness);
+                                dampingBuffer.push_back(packet->damping);
+                                errorBuffer.push_back(cVector3d(packet->error[0], packet->error[1], packet->error[2]));
+                                if (forceBuffer.size() > FORCE_PACKET_WINDOW) {
+                                    forceBuffer.erase(forceBuffer.begin());
+                                    stiffnessBuffer.erase(stiffnessBuffer.begin());
+                                    dampingBuffer.erase(dampingBuffer.begin());
+                                    errorBuffer.erase(errorBuffer.begin());
+                                }
+                                cVector3d avgForce(0, 0, 0);
+                                for (const auto& f : forceBuffer) {
+                                    avgForce += f;
+                                }
+                                avgForce /= static_cast<double>(forceBuffer.size());
+                                forceFeedback = avgForce;
+                            }
+                            lastStiffness = packet->stiffness;
+                            lastDamping = packet->damping;
+                            lastError.set(packet->error[0], packet->error[1], packet->error[2]);
+                            auto recvTime = chrono::duration_cast<chrono::milliseconds>(
+                                chrono::system_clock::now().time_since_epoch()).count();
+                            if (packet->packetNumber == packetCount) {
+                                double latency = recvTime - lastPacketTime;
+                                if (latencyCount == 0) {
+                                    avgLatency = latency;
+                                }
+                                else {
+                                    avgLatency = (avgLatency * latencyCount + latency) / (latencyCount + 1);
+                                }
+                                latencyCount++;
+                                // Update graph data
+                                lock_guard<mutex> lock(graphMutex);
+                                auto elapsedSec = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - graphStartTime).count();
+                                int index = elapsedSec % GRAPH_WINDOW;
+                                receivedPacketCounts[index]++;
+                                receiveDelays[index] = latency;
+                            }
+                            successfulReceives++;
+                            newForceFeedback = true;
+                            logMessage("RECEIVED #" + to_string(packet->packetNumber) + " | Force: (" +
+                                to_string(forceFeedback.x()) + ", " + to_string(forceFeedback.y()) + ", " +
+                                to_string(forceFeedback.z()) + ") | Stiffness: " + to_string(packet->stiffness) +
+                                " | Damping: " + to_string(packet->damping) + " | Timestamp: " + packet->timestamp);
+                        }
+                        else {
+                            logMessage("Received inactive packet on fallback port, ignoring");
+                            lock_guard<mutex> lock(forceFeedbackMutex);
+                            newForceFeedback = false;
+                        }
+                    }
+                    else {
+                        failedReceives++;
+                        logMessage("Received packet too small on fallback port: " + to_string(recvResult) + " bytes (expected >= " +
+                            to_string(sizeof(IncomingPacket)) + ")");
+                    }
+                }
+                else {
+                    failedReceives++;
+                    logMessage("Receive failed on port " + to_string(FALLBACK_PORT) + ": " + to_string(WSAGetLastError()));
+                }
+            }
+        }
+        auto now = chrono::steady_clock::now();
+        auto elapsedMs = chrono::duration_cast<chrono::milliseconds>(now - lastAdaptiveUpdate).count();
+        if (elapsedMs >= ADAPTIVE_UPDATE_MS && USE_ADAPTIVE_DAMPING && !currentRawMode) {
+            updateAdaptiveParameters();
+            lastAdaptiveUpdate = now;
+        }
+        auto loopEnd = chrono::high_resolution_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::microseconds>(loopEnd - loopStart);
+        auto sleepTime = chrono::microseconds(1000000 / HAPTIC_RATE_HZ) - elapsed;
+        if (sleepTime.count() > 0 && !currentRawMode) {
+            this_thread::sleep_for(sleepTime);
+        }
+    }
+    logMessage("Network thread exiting");
+}
+
+void hapticLoop() {
+    logMessage("Haptic thread started");
+    SetThreadPriority(GetCurrentThread(), hapticThreadPriority);
+    cVector3d lastVelocity(0.0, 0.0, 0.0);
+    bool flagHapticsEnabled = false;
+    cPrecisionClock clock;
+    clock.reset();
+    simulationRunning = true;
+    simulationFinished = false;
+    if (hapticDevice) {
+        if (!hapticDevice->open()) {
+            logMessage("Failed to open haptic device in hapticLoop");
+            hapticDevice = nullptr;
+            useVirtualEnvironment = true;
+        }
+        if (!hapticDevice->calibrate()) {
+            logMessage("Haptic device calibration failed in hapticLoop");
+        }
+    }
+    while (hapticRunning) {
+        auto loopStart = chrono::high_resolution_clock::now();
+        clock.stop();
+        double timeInterval = cMin(0.001, clock.getCurrentTimeSeconds());
+        clock.reset();
+        clock.start();
+        cVector3d force(0.0, 0.0, 0.0);
+        double damping = 0.0;
+        bool button = false;
+        if (hapticDevice) {
+            if (!hapticDevice->getUserSwitch(0, button)) {
+                logMessage("Failed to read user switch");
+            }
+        }
+        if (button) {
+            useVirtualEnvironment = !useVirtualEnvironment;
+            logMessage("Switched to " + string(useVirtualEnvironment ? "Virtual Environment" : "Network") + " mode");
+            while (hapticDevice && hapticDevice->getUserSwitch(0, button) && button) {
+                cSleepMs(10);
+            }
+        }
+        if (useVirtualEnvironment) {
+            cVector3d position;
+            bool validPosition = hapticDevice ? hapticDevice->getPosition(position) : false;
+            if (validPosition) {
+                const double WALL_GROUND = 0.0 + SPHERE_RADIUS;
+                const double WALL_LEFT = -0.1;
+                const double WALL_RIGHT = 0.2;
+                const double WALL_FRONT = 0.08;
+                const double WALL_BACK = -0.08;
+                cVector3d sphereFce[NUM_SPHERES];
+                for (int i = 0; i < NUM_SPHERES; i++) {
+                    sphereFce[i].zero();
+                }
+                for (int i = 0; i < NUM_SPHERES; i++) {
+                    cVector3d force;
+                    cVector3d pos0 = spheres[i]->getLocalPos();
+                    for (int j = i + 1; j < NUM_SPHERES; j++) {
+                        force.zero();
+                        cVector3d pos1 = spheres[j]->getLocalPos();
+                        cVector3d dir01 = pos1 - pos0;
+                        double distance = dir01.length();
+                        if (distance > 1e-8) {
+                            dir01 /= distance;
+                        }
+                        else {
+                            dir01.zero();
+                        }
+                        if (!button) {
+                            if ((distance < 2.5 * SPHERE_RADIUS) && (distance > 2.0 * SPHERE_RADIUS)) {
+                                force += (-K_MAGNET * (distance - 2.5 * SPHERE_RADIUS) * dir01);
+                            }
+                        }
+                        if (distance < 2.0 * SPHERES_RADIUS) {
+                            force += (SPHERE_STIFFNESS * (distance - 2.0 * SPHERE_RADIUS) * dir01);
+                        }
+                        sphereFce[i] += force;
+                        sphereFce[j] += (-force);
+                    }
+                    if (pos0.z() < WALL_GROUND) {
+                        sphereFce[i] += cVector3d(0.0, 0.0, SPHERE_STIFFNESS * (WALL_GROUND - pos0.z()));
+                    }
+                    if (pos0.y() < WALL_LEFT) {
+                        sphereFce[i] += cVector3d(0.0, SPHERE_STIFFNESS * (WALL_LEFT - pos0.y()), 0.0);
+                    }
+                    if (pos0.y() > WALL_RIGHT) {
+                        sphereFce[i] += cVector3d(0.0, SPHERE_STIFFNESS * (WALL_RIGHT - pos0.y()), 0.0);
+                    }
+                    if (pos0.x() < WALL_BACK) {
+                        sphereFce[i] += cVector3d(SPHERE_STIFFNESS * (WALL_BACK - pos0.x()), 0.0, 0.0);
+                    }
+                    if (pos0.x() > WALL_FRONT) {
+                        sphereFce[i] += cVector3d(SPHERE_STIFFNESS * (WALL_FRONT - pos0.x()), 0.0, 0.0);
+                    }
+                }
+                cVector3d dirHapticSphere = spheres[0]->getLocalPos() - position;
+                cVector3d forceSphere = -SPHERE_STIFFNESS * dirHapticSphere;
+                force = HAPTIC_STIFFNESS * dirHapticSphere;
+                sphereFce[0] += forceSphere;
+                for (int i = 0; i < NUM_SPHERES; i++) {
+                    cVector3d sphereAcc = (sphereFce[i] / SPHERE_MASS) + cVector3d(0.0, 0.0, -9.81);
+                    sphereVel[i] = K_DAMPING * (sphereVel[i] + timeInterval * sphereAcc);
+                    cVector3d spherePos = spheres[i]->getLocalPos() + timeInterval * sphereVel[i] + (timeInterval * timeInterval) * sphereAcc;
+                    spheres[i]->setLocalPos(spherePos);
+                }
+                if (!flagHapticsEnabled) {
+                    if (force.length() < 1.0) {
+                        flagHapticsEnabled = true;
+                    }
+                    else {
+                        force.zero();
+                    }
+                }
+                double stiffnessRatio = 1.0;
+                if (hapticDeviceMaxStiffness < HAPTIC_STIFFNESS) {
+                    stiffnessRatio = hapticDeviceMaxStiffness / HAPTIC_STIFFNESS;
+                }
+                force *= stiffnessRatio;
+            }
+        }
+        else {
+            bool shouldApplyFeedback = false;
+            {
+                lock_guard<mutex> lock(controlMutex);
+                shouldApplyFeedback = applyHapticFeedback || rawModeEnabled;
+            }
+            if (shouldApplyFeedback) {
+                lock_guard<mutex> lock(forceFeedbackMutex);
+                logMessage("Acquired forceFeedbackMutex in hapticLoop");
+                if (newForceFeedback) {
+                    force = forceFeedback;
+                    damping = USE_ADAPTIVE_DAMPING ? adaptiveDamping : lastDamping;
+                }
+            }
+        }
+        if (hapticDevice) {
+            cVector3d velocity;
+            if (hapticDevice->getLinearVelocity(velocity)) {
+                if (!useVirtualEnvironment && newForceFeedback && (applyHapticFeedback || rawModeEnabled)) {
+                    force -= damping * velocity;
+                }
+                lastVelocity = velocity;
+            }
+            if (force.length() > 0.0) {
+                if (!hapticDevice->setForce(force)) {
+                    logMessage("Failed to set force on haptic device");
+                }
+            }
+            else {
+                if (!hapticDevice->setForce(cVector3d(0, 0, 0))) {
+                    logMessage("Failed to set zero force on haptic device");
+                }
+            }
+        }
+        freqCounterHaptics.signal(1);
+        auto loopEnd = chrono::high_resolution_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::microseconds>(loopEnd - loopStart);
+        auto sleepTime = chrono::microseconds(1000000 / HAPTIC_RATE_HZ) - elapsed;
+        if (sleepTime.count() > 0 && !rawModeEnabled) {
+            this_thread::sleep_for(sleepTime);
+        }
+    }
+    if (hapticDevice) {
+        hapticDevice->close();
+    }
+    simulationFinished = true;
+    logMessage("Haptic thread exiting");
+}
+
+void controlGUI() {
+    logMessage("Control GUI thread started");
+    glfwMakeContextCurrent(controlWindow);
+    controlWorld = new cWorld();
+    if (!controlWorld) {
+        handleError("Failed to create control world");
+        controlRunning = false;
+        return;
+    }
+    controlWorld->m_backgroundColor.setGrayLevel(0.9);
+    controlCamera = new cCamera(controlWorld);
+    if (!controlCamera) {
+        handleError("Failed to create control camera");
+        controlRunning = false;
+        return;
+    }
+    controlWorld->addChild(controlCamera);
+    // Set orthographic view with single width parameter
+    double aspect = (double)controlWidth / controlHeight;
+    controlCamera->setOrthographicView(200.0 * aspect); // Width scaled by aspect ratio
+    controlCamera->set(cVector3d(0, 0, 10), cVector3d(0, 0, 0), cVector3d(0, 1, 0));
+    controlFont = NEW_CFONTCALIBRI20();
+    if (!controlFont) {
+        handleError("Failed to create control font");
+        controlRunning = false;
+        return;
+    }
+
+    // Initialize graphs
+    for (int i = 0; i < GRAPH_WINDOW; i++) {
+        cShapeBox* sentBar = new cShapeBox(1, 1, 0.1);
+        cShapeBox* receivedBar = new cShapeBox(1, 1, 0.1);
+        cShapeLine* delayLine = new cShapeLine(cVector3d(0, 0, 0), cVector3d(0, 0, 0));
+        if (!sentBar || !receivedBar || !delayLine) {
+            handleError("Failed to create graph elements");
+            controlRunning = false;
+            return;
+        }
+        sentBar->m_material->setBlue();
+        receivedBar->m_material->setRed();
+        delayLine->m_material->setGreen();
+        controlWorld->addChild(sentBar);
+        controlWorld->addChild(receivedBar);
+        controlWorld->addChild(delayLine);
+        sentPacketBars.push_back(sentBar);
+        receivedPacketBars.push_back(receivedBar);
+        delayLines.push_back(delayLine);
+    }
+
+    // Initialize control labels
+    vector<string> controlNames = {
+        "Send Packets: ON", "Receive Feedback: ON", "Apply Haptic: ON", "Raw Mode: OFF",
+        "Net Priority: TIME_CRITICAL", "Hap Priority: TIME_CRITICAL",
+        "Delay Min: 0.0 ms", "Delay Max: 0.0 ms", "Max Packets: 0",
+        "Packet Interval: 1.0 ms", "Feedback Window: 5"
+    };
+    for (int i = 0; i < controlNames.size(); i++) {
+        cLabel* label = new cLabel(controlFont);
+        if (!label) {
+            handleError("Failed to create control label");
+            controlRunning = false;
+            return;
+        }
+        label->m_fontColor.setBlack();
+        label->setText(controlNames[i]);
+        controlCamera->m_frontLayer->addChild(label);
+        controlLabels.push_back(label);
+    }
+
+    controlWindowSizeCallback(controlWindow, controlWidth, controlHeight);
+
+    while (controlRunning && !glfwWindowShouldClose(controlWindow)) {
+        glfwMakeContextCurrent(controlWindow);
+        updateControlGraphics();
+        glfwSwapBuffers(controlWindow);
+        glfwPollEvents();
+        freqCounterControlGraphics.signal(1);
+    }
+
+    logMessage("Control GUI thread exiting");
+}
+
+void controlWindowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
+    controlWidth = a_width;
+    controlHeight = a_height;
+    if (controlCamera) {
+        double aspect = (double)controlWidth / controlHeight;
+        controlCamera->setOrthographicView(200.0 * aspect); // Width scaled by aspect ratio
+    }
+    // Position control labels
+    for (size_t i = 0; i < controlLabels.size(); i++) {
+        controlLabels[i]->setLocalPos(10, controlHeight - 20 - i * 30);
+    }
+    // Position graphs
+    double barWidth = controlWidth / (double)GRAPH_WINDOW;
+    double maxHeight = controlHeight * 0.3;
+    for (int i = 0; i < GRAPH_WINDOW; i++) {
+        sentPacketBars[i]->setLocalPos(i * barWidth + barWidth / 2, maxHeight / 2, 0);
+        receivedPacketBars[i]->setLocalPos(i * barWidth + barWidth / 2, maxHeight * 1.5, 0);
+        delayLines[i]->setLocalPos(i * barWidth, maxHeight * 2.5, 0);
+    }
+}
+
+void controlKeyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
+    if (a_action != GLFW_PRESS) return;
+    if (a_key == GLFW_KEY_ESCAPE || a_key == GLFW_KEY_Q) {
+        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+    }
+}
+
+void controlMouseButtonCallback(GLFWwindow* a_window, int a_button, int a_action, int a_mods) {
+    if (a_button == GLFW_MOUSE_BUTTON_LEFT && a_action == GLFW_PRESS) {
+        double x, y;
+        glfwGetCursorPos(a_window, &x, &y);
+        y = controlHeight - y; // Invert y-coordinate
+        lock_guard<mutex> lock(controlMutex);
+        for (size_t i = 0; i < controlLabels.size(); i++) {
+            cLabel* label = controlLabels[i];
+            int lx = label->getLocalPos().x();
+            int ly = label->getLocalPos().y();
+            int lw = label->getWidth();
+            int lh = label->getHeight();
+            if (x >= lx && x <= lx + lw && y >= ly && y <= ly + lh) {
+                if (i == 0) {
+                    sendPacketsEnabled = !sendPacketsEnabled;
+                    label->setText("Send Packets: " + string(sendPacketsEnabled ? "ON" : "OFF"));
+                }
+                else if (i == 1) {
+                    receiveFeedbackEnabled = !receiveFeedbackEnabled;
+                    label->setText("Receive Feedback: " + string(receiveFeedbackEnabled ? "ON" : "OFF"));
+                }
+                else if (i == 2) {
+                    applyHapticFeedback = !applyHapticFeedback;
+                    label->setText("Apply Haptic: " + string(applyHapticFeedback ? "ON" : "OFF"));
+                }
+                else if (i == 3) {
+                    rawModeEnabled = !rawModeEnabled;
+                    label->setText("Raw Mode: " + string(rawModeEnabled ? "ON" : "OFF"));
+                }
+                else if (i == 4) {
+                    networkThreadPriority = (networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL) ?
+                        THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_TIME_CRITICAL;
+                    label->setText("Net Priority: " + string(networkThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
+                    SetThreadPriority(GetCurrentThread(), networkThreadPriority);
+                }
+                else if (i == 5) {
+                    hapticThreadPriority = (hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL) ?
+                        THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_TIME_CRITICAL;
+                    label->setText("Hap Priority: " + string(hapticThreadPriority == THREAD_PRIORITY_TIME_CRITICAL ? "TIME_CRITICAL" : "NORMAL"));
+                }
+                else if (i == 6) {
+                    packetDelayMin += 1.0;
+                    if (packetDelayMin > packetDelayMax) packetDelayMin = packetDelayMax;
+                    label->setText("Delay Min: " + to_string_with_precision(packetDelayMin, 1) + " ms");
+                }
+                else if (i == 7) {
+                    packetDelayMax += 1.0;
+                    label->setText("Delay Max: " + to_string_with_precision(packetDelayMax, 1) + " ms");
+                }
+                else if (i == 8) {
+                    maxPacketsToSend += 100;
+                    label->setText("Max Packets: " + to_string(maxPacketsToSend));
+                }
+                else if (i == 9) {
+                    packetIntervalMs += 0.1;
+                    label->setText("Packet Interval: " + to_string_with_precision(packetIntervalMs, 1) + " ms");
+                }
+                else if (i == 10) {
+                    FORCE_PACKET_WINDOW++;
+                    label->setText("Feedback Window: " + to_string(FORCE_PACKET_WINDOW));
+                }
+                break;
+            }
+        }
+    }
+}
+
+void updateControlGraphics() {
+    // Update graphs
+    lock_guard<mutex> lock(graphMutex);
+    double maxHeight = controlHeight * 0.3;
+    double barWidth = controlWidth / (double)GRAPH_WINDOW;
+    int maxPackets = *max_element(sentPacketCounts.begin(), sentPacketCounts.end());
+    maxPackets = max(maxPackets, *max_element(receivedPacketCounts.begin(), receivedPacketCounts.end()));
+    maxPackets = max(maxPackets, 1);
+    double maxDelay = *max_element(sendDelays.begin(), sendDelays.end());
+    maxDelay = max(maxDelay, *max_element(receiveDelays.begin(), receiveDelays.end()));
+    maxDelay = max(maxDelay, 1.0);
+    for (int i = 0; i < GRAPH_WINDOW; i++) {
+        double sentHeight = (sentPacketCounts[i] / (double)maxPackets) * maxHeight;
+        double receivedHeight = (receivedPacketCounts[i] / (double)maxPackets) * maxHeight;
+        // Remove old bars
+        controlWorld->removeChild(sentPacketBars[i]);
+        controlWorld->removeChild(receivedPacketBars[i]);
+        // Create new bars with updated sizes
+        sentPacketBars[i] = new cShapeBox(barWidth - 2, sentHeight, 0.1);
+        receivedPacketBars[i] = new cShapeBox(barWidth - 2, receivedHeight, 0.1);
+        sentPacketBars[i]->m_material->setBlue();
+        receivedPacketBars[i]->m_material->setRed();
+        sentPacketBars[i]->setLocalPos(i * barWidth + barWidth / 2, maxHeight / 2, 0);
+        receivedPacketBars[i]->setLocalPos(i * barWidth + barWidth / 2, maxHeight * 1.5, 0);
+        controlWorld->addChild(sentPacketBars[i]);
+        controlWorld->addChild(receivedPacketBars[i]);
+        // Update line endpoints
+        double delayY = (sendDelays[i] / maxDelay) * maxHeight;
+        delayLines[i]->m_pointA = cVector3d(i * barWidth, maxHeight * 2.5, 0);
+        delayLines[i]->m_pointB = cVector3d(i * barWidth, maxHeight * 2.5 + delayY, 0);
+    }
+
+    if (controlWorld) {
+        controlWorld->updateShadowMaps(false, false);
+    }
+    if (controlCamera) {
+        controlCamera->renderView(controlWidth, controlHeight);
+    }
+    glFinish();
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        logMessage("Control OpenGL Error: " + to_string(err));
+    }
+}
+
+void cleanupSocket() {
+    if (sock != INVALID_SOCKET) {
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+    if (fallbackSock != INVALID_SOCKET) {
+        closesocket(fallbackSock);
+        fallbackSock = INVALID_SOCKET;
+    }
+    WSACleanup();
+    logMessage("Sockets closed and Winsock cleaned up");
+}
+
+void getCurrentTimestamp(char* buffer, size_t size) {
+    auto now = chrono::system_clock::now();
+    auto time = chrono::system_clock::to_time_t(now);
+    auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    struct tm tstruct;
+    localtime_s(&tstruct, &time);
+    char temp[64];
+    strftime(temp, sizeof(temp), "%Y-%m-%d %H:%M:%S", &tstruct);
+    snprintf(buffer, size, "%s.%03lld", temp, (long long)ms.count());
+}
+
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
+    width = a_width;
+    height = a_height;
+    if (labelMessage) {
+        labelMessage->setLocalPos((int)(0.5 * (width - labelMessage->getWidth())), 50);
+    }
+    // Position GUI labels in the top-left corner
+    if (labelRates) {
+        labelRates->setLocalPos(10, height - 20);
+    }
+    if (labelForce) {
+        labelForce->setLocalPos(10, height - 40);
+    }
+    if (labelLatency) {
+        labelLatency->setLocalPos(10, height - 60);
+    }
+    if (labelMode) {
+        labelMode->setLocalPos(10, height - 80);
+    }
+    if (labelPackets) {
+        labelPackets->setLocalPos(10, height - 100);
+    }
+    if (labelStiffness) {
+        labelStiffness->setLocalPos(10, height - 120);
+    }
+    if (labelDamping) {
+        labelDamping->setLocalPos(10, height - 140);
+    }
+    if (labelError) {
+        labelError->setLocalPos(10, height - 160);
+    }
+    if (labelPosition) {
+        labelPosition->setLocalPos(10, height - 180);
+    }
+}
+
+void errorCallback(int a_error, const char* a_description) {
+    logMessage("GLFW Error: " + string(a_description));
+}
+
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
+    if ((a_action != GLFW_PRESS) && (a_action != GLFW_REPEAT)) {
+        return;
+    }
+    if (a_key == GLFW_KEY_ESCAPE || a_key == GLFW_KEY_Q) {
+        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+    }
+    else if (a_key == GLFW_KEY_F) {
+        fullscreen = !fullscreen;
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        if (fullscreen) {
+            glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+            glfwSwapInterval(swapInterval);
+        }
+        else {
+            int w = 0.8 * mode->height;
+            int h = 0.5 * mode->height;
+            int x = 0.5 * (mode->width - w);
+            int y = 0.5 * (mode->height - h);
+            glfwSetWindowMonitor(window, nullptr, x, y, w, h, mode->refreshRate);
+            glfwSwapInterval(swapInterval);
+        }
+    }
+    else if (a_key == GLFW_KEY_M) {
+        mirroredDisplay = !mirroredDisplay;
+        if (camera) {
+            camera->setMirrorVertical(mirroredDisplay);
+        }
+    }
+}
+
+void updateGraphics() {
+    // Update label texts
+    if (labelRates) {
+        labelRates->setText("Haptic: " + cStr(freqCounterHaptics.getFrequency(), 0) + " Hz | Graphic: " +
+            cStr(freqCounterGraphics.getFrequency(), 0) + " Hz");
+    }
+    {
+        lock_guard<mutex> lock(forceFeedbackMutex);
+        if (labelForce) {
+            labelForce->setText("Force: [" + to_string_with_precision(forceFeedback.x(), 4) + ", " +
+                to_string_with_precision(forceFeedback.y(), 4) + ", " +
+                to_string_with_precision(forceFeedback.z(), 4) + "] N");
+        }
+        if (labelLatency) {
+            labelLatency->setText("Latency: " + to_string_with_precision(avgLatency, 2) + " ms");
+        }
+        if (labelMode) {
+            labelMode->setText("Mode: " + string(useVirtualEnvironment ? "VE" : "Network"));
+        }
+        if (labelPackets) {
+            labelPackets->setText("Packets: Sent=" + to_string(packetCount) + " (OK=" + to_string(successfulSends) +
+                ", Fail=" + to_string(failedSends) + ") | Recv=" + to_string(successfulReceives) +
+                " (Fail=" + to_string(failedReceives) + ", TO=" + to_string(timeoutReceives) + ")");
+        }
+        double stiffness = USE_ADAPTIVE_DAMPING ? adaptiveStiffness : lastStiffness;
+        double damping = USE_ADAPTIVE_DAMPING ? adaptiveDamping : lastDamping;
+        if (labelStiffness) {
+            labelStiffness->setText("Stiffness: " + to_string_with_precision(stiffness, 2) + " N/m");
+        }
+        if (labelDamping) {
+            labelDamping->setText("Damping: " + to_string_with_precision(damping, 2) + " N·s/m");
+        }
+        if (labelError) {
+            labelError->setText("Error: [" + to_string_with_precision(lastError.x(), 4) + ", " +
+                to_string_with_precision(lastError.y(), 4) + ", " +
+                to_string_with_precision(lastError.z(), 4) + "] m");
+        }
+        if (labelPosition) {
+            cVector3d position;
+            if (hapticDevice && hapticDevice->getPosition(position)) {
+                labelPosition->setText("Position: [" + to_string_with_precision(position.x(), 4) + ", " +
+                    to_string_with_precision(position.y(), 4) + ", " +
+                    to_string_with_precision(position.z(), 4) + "] m");
+            }
+            else {
+                labelPosition->setText("Position: [N/A, N/A, N/A] m");
+            }
+        }
+    }
+
+    if (world) {
+        world->updateShadowMaps(false, mirroredDisplay);
+    }
+    if (camera) {
+        camera->renderView(width, height);
+    }
+    glFinish();
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        logMessage("OpenGL Error: " + to_string(err));
+    }
+}
+
+void close() {
+    simulationRunning = false;
+    running = false;
+    hapticRunning = false;
+    controlRunning = false;
+    if (logFile.is_open()) {
+        logFile.close();
+    }
+}
