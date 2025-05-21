@@ -1,0 +1,567 @@
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <stdio.h>
+#include <chrono>
+#include <winsock2.h>
+#include "chai3d.h"
+#include <GLFW/glfw3.h>
+#include "widgets/CScope.h"
+#pragma comment(lib, "ws2_32.lib")
+
+using namespace chai3d;
+using namespace std;
+
+#define DOF 3
+double pos_curr[DOF] = { 0, 0, 0 };
+double pos_prev[DOF] = { 0, 0, 0 };
+double pos_recv[DOF] = { 0, 0, 0 };
+double Fd[DOF] = { 0, 0, 0 };
+double dFe[DOF] = { 0, 0, 0 };
+double Xd[DOF], DXd[DOF], XdP[DOF];
+double ProjFOR[3], UnitV[3];
+double InnerProduct;
+double c1 = 150;
+double c2 = 100;
+bool EnableEBA = true;
+bool nProjection = true;
+bool fullscreen = false; // Reintroduced fullscreen variable
+bool mirroredDisplay = false;
+
+#define BUFSIZE 2048
+#define SERVER_IP "169.254.213.206"
+#define UDP_PORT 4000
+#define SENDDATA_NUM 3
+#define READDATA_NUM 6
+#define MAX_BUFFER_SIZE 100
+#define MIN_BUFFER_SIZE 10
+string Server = SERVER_IP;
+SOCKET sock;
+WSADATA wsa;
+SOCKADDR_IN serveraddr, clientaddr;
+int addrlen, retval;
+float SendData[SENDDATA_NUM], ReadData[READDATA_NUM];
+double delay = 0, avg_delay = 0;
+int timeUDPS, timeUDPR;
+int adaptiveBufferSize = MIN_BUFFER_SIZE;
+vector<double> delayBuffer;
+char sbuf[BUFSIZE + 1], rbuf[BUFSIZE + 1];
+
+struct Timer {
+    chrono::time_point<chrono::steady_clock> start, end;
+    Timer() { start = chrono::high_resolution_clock::now(); }
+    ~Timer() {
+        end = chrono::high_resolution_clock::now();
+        timeUDPR = chrono::duration<float>(end - start).count() * 1000.0f;
+    }
+};
+
+struct Timer2 {
+    chrono::time_point<chrono::steady_clock> start, end;
+    Timer2() { start = chrono::high_resolution_clock::now(); }
+    ~Timer2() {
+        end = chrono::high_resolution_clock::now();
+        timeUDPS = chrono::duration<float>(end - start).count() * 1000.0f;
+    }
+};
+
+cWorld* world;
+cCamera* camera;
+cDirectionalLight* light;
+cHapticDeviceHandler* handler;
+cGenericHapticDevicePtr hapticDevice;
+cLabel* labelHapticDeviceModel;
+cLabel* labelHapticDevicePosition;
+cVector3d hapticDevicePosition, hapticDeviceVelocity;
+cFontPtr font;
+cLabel* labelRates, * labelMax, * labelXd, * labelX_Recv, * labelFd, * labelSlave_force, * labeldFe, * labelProjFOR, * labelDelay, * labelc1, * labelc2;
+cShapeTorus* cursor;
+cShapeLine* velocity;
+cScope* scope0, * scope1, * scope2, * scope3, * scope4, * scope5;
+cLevel* leveldelay;
+bool useForceField = true;
+bool simulationRunning = false, simulationFinished = true;
+cFrequencyCounter freqCounterGraphics, freqCounterHaptics;
+cThread* hapticsThread;
+GLFWwindow* window = NULL;
+int width = 0, height = 0, swapInterval = 1;
+
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
+void errorCallback(int error, const char* a_description);
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
+void updateGraphics(void);
+void updateHaptics(void);
+void close(void);
+void InitUDP(void);
+void UDPSendData(float sData[SENDDATA_NUM]);
+void UDPReadData();
+void CloseUDP(void); // Ensure forward declaration
+void err_quit(const char* msg);
+void err_display(const char* msg);
+void adjustBufferSize();
+
+int main(int argc, char* argv[]) {
+    InitUDP();
+    cout << "-------------------------------------" << endl;
+    cout << "HHRCM-Teleopreation-Server" << endl;
+    cout << "-------------------------------------" << endl;
+    cout << "Keyboard Options:" << endl;
+    cout << "[1] - Enable/Disable force field" << endl;
+    cout << "[f] - Toggle fullscreen" << endl;
+    cout << "[M] - Mirrored Display" << endl;
+    cout << "[q] - Exit application" << endl;
+    cout << "Haptic Device Controls:" << endl;
+    cout << "[button3] - Increase Delay" << endl;
+    cout << "[button2] - Increase damping" << endl;
+    cout << "[button1] - Decrease damping" << endl;
+    cout << "[button0] - Reset damping and delay" << endl;
+
+    if (!glfwInit()) {
+        cout << "failed initialization" << endl;
+        cSleepMs(1000);
+        return 1;
+    }
+
+    glfwSetErrorCallback(errorCallback);
+    const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
+    int w = 0.8 * mode->height, h = 0.5 * mode->height;
+    int x = 0.5 * (mode->width - w), y = 0.5 * (mode->height - h);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    window = glfwCreateWindow(w, h, "HHRCM-Teleoperation-Server", NULL, NULL);
+    if (!window) {
+        cout << "failed to create window" << endl;
+        glfwTerminate();
+        return 1;
+    }
+
+    glfwGetWindowSize(window, &width, &height);
+    glfwSetWindowPos(window, x, y);
+    glfwSetKeyCallback(window, keyCallback);
+    glfwSetWindowSizeCallback(window, windowSizeCallback);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(swapInterval);
+
+#ifdef GLEW_VERSION
+    if (glewInit() != GLEW_OK) {
+        cout << "failed to initialize GLEW library" << endl;
+        glfwTerminate();
+        return 1;
+    }
+#endif
+
+    world = new cWorld();
+    world->m_backgroundColor.setBlack();
+    camera = new cCamera(world);
+    world->addChild(camera);
+    camera->set(cVector3d(0.5, 0.0, 0.0), cVector3d(0.0, 0.0, 0.0), cVector3d(0.0, 0.0, 1.0));
+    camera->setClippingPlanes(0.02, 10.0);
+    light = new cDirectionalLight(world);
+    world->addChild(light);
+    light->setEnabled(true);
+    light->setDir(-1.0, 0.0, 0.0);
+    cursor = new cShapeTorus(0.02, 0.03);
+    world->addChild(cursor);
+    velocity = new cShapeLine(cVector3d(0, 0, 0), cVector3d(0, 0, 0));
+    world->addChild(velocity);
+
+    handler = new cHapticDeviceHandler();
+    handler->getDevice(hapticDevice, 0);
+    hapticDevice->open();
+    hapticDevice->setEnableGripperUserSwitch(true);
+
+    font = NEW_CFONTCALIBRI28();
+    labelHapticDeviceModel = new cLabel(font);
+    camera->m_frontLayer->addChild(labelHapticDeviceModel);
+    labelHapticDeviceModel->setText(hapticDevice->getSpecifications().m_modelName);
+    labelHapticDeviceModel->m_fontColor.setBlue();
+    labelHapticDevicePosition = new cLabel(font);
+    camera->m_frontLayer->addChild(labelHapticDevicePosition);
+    labelRates = new cLabel(font);
+    camera->m_frontLayer->addChild(labelRates);
+
+    scope0 = new cScope();
+    camera->m_frontLayer->addChild(scope0);
+    scope0->setLocalPos(800, 60);
+    scope0->setRange(-0.1, 0.1);
+    scope0->setSignalEnabled(true);
+    scope0->setTransparencyLevel(0.3);
+    scope0->setSize(300, 350);
+    scope0->m_colorSignal0.setRed();
+
+    scope1 = new cScope();
+    camera->m_frontLayer->addChild(scope1);
+    scope1->setLocalPos(1177, 60);
+    scope1->setRange(-0.1, 0.1);
+    scope1->setSignalEnabled(true, true);
+    scope1->setTransparencyLevel(0.3);
+    scope1->setSize(300, 350);
+    scope1->m_colorSignal2.setGreen();
+    scope1->m_colorSignal0.setRed();
+
+    scope2 = new cScope();
+    camera->m_frontLayer->addChild(scope2);
+    scope2->setLocalPos(1550, 60);
+    scope2->setRange(-0.1, 0.1);
+    scope2->setSignalEnabled(true, true);
+    scope2->setTransparencyLevel(0.3);
+    scope2->setSize(300, 350);
+    scope2->m_colorSignal2.setGreen();
+    scope2->m_colorSignal0.setRed();
+
+    scope3 = new cScope();
+    camera->m_frontLayer->addChild(scope3);
+    scope3->setLocalPos(800, 450);
+    scope3->setRange(-10, 10);
+    scope3->setSignalEnabled(true, true);
+    scope3->setTransparencyLevel(0.3);
+    scope3->setSize(300, 350);
+    scope3->m_colorSignal2.setGreen();
+    scope3->m_colorSignal0.setRed();
+
+    scope4 = new cScope();
+    camera->m_frontLayer->addChild(scope4);
+    scope4->setLocalPos(1177, 450);
+    scope4->setRange(-10, 10);
+    scope4->setSignalEnabled(true, true);
+    scope4->setTransparencyLevel(0.3);
+    scope4->setSize(300, 350);
+    scope4->m_colorSignal2.setGreen();
+    scope4->m_colorSignal0.setRed();
+
+    scope5 = new cScope();
+    camera->m_frontLayer->addChild(scope5);
+    scope5->setLocalPos(1550, 450);
+    scope5->setRange(-10, 10);
+    scope5->setSignalEnabled(true, true);
+    scope5->setTransparencyLevel(0.3);
+    scope5->setSize(300, 350);
+    scope5->m_colorSignal2.setGreen();
+    scope5->m_colorSignal0.setRed();
+
+    leveldelay = new cLevel();
+    camera->m_frontLayer->addChild(leveldelay);
+    leveldelay->setLocalPos(60, 60);
+    leveldelay->setRange(0.0, 200);
+    leveldelay->setWidth(40);
+    leveldelay->setNumIncrements(50);
+    leveldelay->setTransparencyLevel(0.7);
+
+    string Server2 = Server.substr(0, 14);
+    labelMax = new cLabel(font);
+    camera->m_frontLayer->addChild(labelMax);
+    labelMax->setText(Server2 == "192.168.4.3" ? "Teleoperation running over WAN" : "Teleoperation running over LAN");
+    labelMax->setLocalPos(20, height - 220);
+    labelMax->m_fontColor.setWhite();
+
+    labelXd = new cLabel(font);
+    labelX_Recv = new cLabel(font);
+    labelFd = new cLabel(font);
+    labelSlave_force = new cLabel(font);
+    labeldFe = new cLabel(font);
+    labelProjFOR = new cLabel(font);
+    labelDelay = new cLabel(font);
+    labelc1 = new cLabel(font);
+    labelc2 = new cLabel(font);
+    camera->m_frontLayer->addChild(labelXd);
+    camera->m_frontLayer->addChild(labelX_Recv);
+    camera->m_frontLayer->addChild(labelFd);
+    camera->m_frontLayer->addChild(labelSlave_force);
+    camera->m_frontLayer->addChild(labeldFe);
+    camera->m_frontLayer->addChild(labelProjFOR);
+    camera->m_frontLayer->addChild(labelDelay);
+    camera->m_frontLayer->addChild(labelc1);
+    camera->m_frontLayer->addChild(labelc2);
+
+    labelXd->setText("Master Pos: ");
+    labelXd->setLocalPos(20, height - 100);
+    labelXd->m_fontColor.setOrange();
+    labelX_Recv->setText("Slave Pos: ");
+    labelX_Recv->setLocalPos(20, height - 120);
+    labelX_Recv->m_fontColor.setGreen();
+    labelFd->setText("Master Force: ");
+    labelFd->setLocalPos(20, height - 140);
+    labelFd->m_fontColor.setRed();
+    labelSlave_force->setText("Slave Force: ");
+    labelSlave_force->setLocalPos(20, height - 160);
+    labelSlave_force->m_fontColor.setBlueLight();
+    labeldFe->setText("EBA Force: ");
+    labeldFe->setLocalPos(20, height - 180);
+    labeldFe->m_fontColor.setWhite();
+    labelProjFOR->setText("ProjFOR: ");
+    labelProjFOR->setLocalPos(20, height - 200);
+    labelProjFOR->m_fontColor.setPink();
+    labelDelay->setText("Delay: ");
+    labelDelay->setLocalPos(width - 845, height - 220);
+    labelDelay->m_fontColor.setGray();
+    labelc1->setText("c1: ");
+    labelc1->setLocalPos(width - 845, height - 240);
+    labelc1->m_fontColor.setGray();
+    labelc2->setText("c2: ");
+    labelc2->setLocalPos(width - 845, height - 260);
+    labelc2->m_fontColor.setGray();
+
+    hapticsThread = new cThread();
+    hapticsThread->start(updateHaptics, CTHREAD_PRIORITY_HAPTICS);
+    atexit(close);
+    windowSizeCallback(window, width, height);
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwGetWindowSize(window, &width, &height);
+        updateGraphics();
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+        freqCounterGraphics.signal(1);
+    }
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
+
+void updateGraphics(void) {
+    labelHapticDevicePosition->setText(hapticDevicePosition.str(3));
+    labelRates->setText(cStr(freqCounterGraphics.getFrequency(), 0) + " Hz / " + cStr(freqCounterHaptics.getFrequency(), 0) + " Hz");
+    labelRates->setLocalPos((int)(0.5 * (width - labelRates->getWidth())), 15);
+    scope0->setSignalValues(hapticDevicePosition.x(), ReadData[3]);
+    scope1->setSignalValues(hapticDevicePosition.y(), ReadData[4]);
+    scope2->setSignalValues(hapticDevicePosition.z(), ReadData[5]);
+    scope3->setSignalValues(ProjFOR[0], -ReadData[0]);
+    scope4->setSignalValues(ProjFOR[1], -ReadData[1]);
+    scope5->setSignalValues(ProjFOR[2], -ReadData[2]);
+    labelXd->setText("Master Pos: " + cStr(pos_curr[0], 3U) + " " + cStr(pos_curr[1], 3U) + " " + cStr(pos_curr[2], 3U));
+    labelX_Recv->setText("Slave Pos: " + cStr(pos_recv[0], 3U) + " " + cStr(pos_recv[1], 3U) + " " + cStr(pos_recv[2], 3U));
+    labelFd->setText("Master Force: " + cStr(Fd[0], 3U) + " " + cStr(Fd[1], 3U) + " " + cStr(Fd[2], 3U));
+    labelSlave_force->setText("Slave Force: " + cStr(-ReadData[0], 3U) + " " + cStr(-ReadData[1], 3U) + " " + cStr(-ReadData[2], 3U));
+    labeldFe->setText("EBA Force: " + cStr(dFe[0], 3U) + " " + cStr(dFe[1], 3U) + " " + cStr(dFe[2], 3U));
+    labelProjFOR->setText("Projected Force: " + cStr(ProjFOR[0], 3U) + " " + cStr(ProjFOR[1], 3U) + " " + cStr(ProjFOR[2], 3U));
+    labelDelay->setText("Delay: " + cStr(abs(delay), 3U) + "ms");
+    labelc1->setText("c1: " + cStr(abs(c1), 3U));
+    labelc2->setText("c2: " + cStr(abs(c2), 3U));
+    world->updateShadowMaps(false, mirroredDisplay);
+    camera->renderView(width, height);
+    glFinish();
+}
+
+void updateHaptics(void) {
+    simulationRunning = true;
+    simulationFinished = false;
+    int TAP = 0;
+
+    while (simulationRunning) {
+        cVector3d position, linearVelocity;
+        hapticDevice->getPosition(position);
+        hapticDevice->getLinearVelocity(linearVelocity);
+        bool button0, button1, button2, button3;
+        hapticDevice->getUserSwitch(0, button0);
+        hapticDevice->getUserSwitch(1, button1);
+        hapticDevice->getUserSwitch(2, button2);
+        hapticDevice->getUserSwitch(3, button3);
+
+        velocity->m_pointA = position;
+        velocity->m_pointB = cAdd(position, linearVelocity);
+        cursor->setLocalPos(position);
+
+        if (button0) {
+            cursor->m_material->setGreenMediumAquamarine();
+            TAP = 0;
+            c1 = 150;
+        }
+        else if (button1) {
+            cursor->m_material->setYellowGold();
+            TAP = max(TAP - 1, 0);
+        }
+        else if (button2) {
+            cursor->m_material->setOrangeCoral();
+            c1 += 0.1;
+        }
+        else if (button3) {
+            cursor->m_material->setPurpleLavender();
+            TAP++;
+        }
+        else {
+            cursor->m_material->setBlueRoyal();
+        }
+
+        hapticDevicePosition = position;
+        hapticDeviceVelocity = linearVelocity;
+
+        for (int i = 0; i < DOF; i++) {
+            pos_curr[i] = hapticDevicePosition(i);
+        }
+
+        adjustBufferSize();
+        UDPReadData();
+        Fd[0] = -ReadData[0];
+        Fd[1] = -ReadData[1];
+        Fd[2] = -ReadData[2];
+        pos_recv[0] = ReadData[3];
+        pos_recv[1] = ReadData[4];
+        pos_recv[2] = ReadData[5];
+
+        SendData[0] = pos_curr[0];
+        SendData[1] = pos_curr[1];
+        SendData[2] = pos_curr[2];
+        UDPSendData(SendData);
+
+        cVector3d force(0, 0, 0);
+        if (useForceField) {
+            cVector3d forceField = -c2 * position;
+            force.add(forceField);
+
+            for (int i = 0; i < 3; i++) {
+                pos_prev[i] = pos_curr[i];
+                XdP[i] = Xd[i];
+                Xd[i] = pos_curr[i];
+                DXd[i] = Xd[i] - XdP[i];
+
+                if (EnableEBA && DXd[i] != 0) {
+                    double uBETA = (Fd[i] - dFe[i]) / DXd[i];
+                    double Bmax = c2 - dFe[i] / DXd[i] + sqrt(dFe[i] * dFe[i] / DXd[i] / DXd[i] + c2 * c2);
+                    double Bmin = c2 - dFe[i] / DXd[i] - sqrt(dFe[i] * dFe[i] / DXd[i] / DXd[i] + c2 * c2);
+                    Bmax = min(c1, Bmax);
+                    double BETA = max(min(uBETA, Bmax), Bmin);
+                    dFe[i] += BETA * DXd[i];
+
+                    if (nProjection) {
+                        double FOR_Mag = sqrt(Fd[0] * Fd[0] + Fd[1] * Fd[1] + Fd[2] * Fd[2]);
+                        UnitV[i] = (FOR_Mag > 0.0) ? Fd[i] / FOR_Mag : 0.0;
+                        InnerProduct = dFe[0] * UnitV[0] + dFe[1] * UnitV[1] + dFe[2] * UnitV[2];
+                        ProjFOR[i] = InnerProduct * UnitV[i];
+                        force(i) = -ProjFOR[i];
+                    }
+                }
+                else {
+                    dFe[i] = Fd[i];
+                    force(i) = dFe[i];
+                }
+            }
+        }
+
+        hapticDevice->setForce(force);
+        freqCounterHaptics.signal(1);
+    }
+
+    simulationFinished = true;
+}
+
+void adjustBufferSize() {
+    delay = timeUDPS - timeUDPR;
+    delayBuffer.push_back(abs(delay));
+    if (delayBuffer.size() > 100) delayBuffer.erase(delayBuffer.begin());
+
+    double sum = 0;
+    for (double d : delayBuffer) sum += d;
+    avg_delay = sum / delayBuffer.size();
+
+    adaptiveBufferSize = MIN_BUFFER_SIZE + (int)(avg_delay / 10.0);
+    adaptiveBufferSize = min(max(adaptiveBufferSize, MIN_BUFFER_SIZE), MAX_BUFFER_SIZE);
+}
+
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
+    width = a_width;
+    height = a_height;
+    labelHapticDevicePosition->setLocalPos(20, height - 60, 0);
+    labelHapticDeviceModel->setLocalPos(20, height - 40, 0);
+    labelXd->setLocalPos(20, height - 100);
+    labelX_Recv->setLocalPos(20, height - 120);
+    labelFd->setLocalPos(20, height - 140);
+    labelSlave_force->setLocalPos(20, height - 160);
+    labeldFe->setLocalPos(20, height - 180);
+    labelProjFOR->setLocalPos(20, height - 200);
+}
+
+void errorCallback(int a_error, const char* a_description) {
+    cout << "Error: " << a_description << endl;
+}
+
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
+    if ((a_action != GLFW_PRESS) && (a_action != GLFW_REPEAT)) return;
+    if (a_key == GLFW_KEY_ESCAPE || a_key == GLFW_KEY_Q) {
+        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+    }
+    else if (a_key == GLFW_KEY_1) {
+        useForceField = !useForceField;
+        cout << (useForceField ? "> Enable force field     \r" : "> Disable force field    \r");
+    }
+    else if (a_key == GLFW_KEY_M) {
+        mirroredDisplay = !mirroredDisplay;
+        camera->setMirrorVertical(mirroredDisplay);
+    }
+    else if (a_key == GLFW_KEY_F) {
+        fullscreen = !fullscreen;
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        if (fullscreen) {
+            glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+        }
+        else {
+            int w = 0.8 * mode->height, h = 0.5 * mode->height;
+            int x = 0.5 * (mode->width - w), y = 0.5 * (mode->height - h);
+            glfwSetWindowMonitor(window, NULL, x, y, w, h, mode->refreshRate);
+        }
+        glfwSwapInterval(swapInterval);
+    }
+}
+
+void close(void) {
+    CloseUDP();
+    simulationRunning = false;
+    while (!simulationFinished) cSleepMs(100);
+    hapticDevice->close();
+    delete hapticsThread;
+    delete world;
+    delete handler;
+}
+
+void InitUDP() {
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        MessageBox(NULL, "Socket Open Error!!", "UDP", MB_OK);
+    }
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == INVALID_SOCKET) err_quit("socket()");
+    ZeroMemory(&serveraddr, sizeof(serveraddr));
+    serveraddr.sin_family = AF_INET;
+    serveraddr.sin_port = htons(UDP_PORT);
+    serveraddr.sin_addr.s_addr = inet_addr(SERVER_IP);
+    retval = ::bind(sock, (SOCKADDR*)&serveraddr, sizeof(serveraddr));
+}
+
+void UDPSendData(float sData[SENDDATA_NUM]) {
+    Timer time;
+    sprintf(sbuf, "%f %f %f", sData[0], sData[1], sData[2]);
+    if ((int)strlen(sbuf) < adaptiveBufferSize * sizeof(float)) {
+        retval = sendto(sock, sbuf, strlen(sbuf), 0, (SOCKADDR*)&clientaddr, sizeof(clientaddr));
+        if (retval == SOCKET_ERROR) err_display("sendto()");
+    }
+}
+
+void UDPReadData() {
+    Timer2 time;
+    addrlen = sizeof(clientaddr);
+    if (adaptiveBufferSize * sizeof(float) <= BUFSIZE) {
+        retval = recvfrom(sock, rbuf, adaptiveBufferSize * sizeof(float), 0, (SOCKADDR*)&clientaddr, &addrlen);
+        if (retval == SOCKET_ERROR) err_display("recvfrom()");
+        sscanf(rbuf, "%f %f %f %f %f %f", &ReadData[0], &ReadData[1], &ReadData[2], &ReadData[3], &ReadData[4], &ReadData[5]);
+    }
+}
+
+void CloseUDP() {
+    closesocket(sock);
+    WSACleanup();
+}
+
+void err_quit(const char* msg) {
+    LPVOID lpMsgBuf;
+    FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, NULL, WSAGetLastError(),
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&lpMsgBuf, 0, NULL);
+    MessageBox(NULL, (LPCTSTR)lpMsgBuf, msg, MB_ICONERROR);
+    LocalFree(lpMsgBuf);
+    exit(-1);
+}
+
+void err_display(const char* msg) {
+    LPVOID lpMsgBuf;
+    FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, NULL, WSAGetLastError(),
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&lpMsgBuf, 0, NULL);
+    printf("[%s] %s", msg, (LPCTSTR)lpMsgBuf);
+    LocalFree(lpMsgBuf);
+}
