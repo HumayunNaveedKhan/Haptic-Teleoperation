@@ -103,6 +103,9 @@ const int THREAD_PRIORITY_HAPTICS = THREAD_PRIORITY_TIME_CRITICAL;
 const int HAPTIC_THREAD_INTERVAL_US = 500;
 const int FEEDBACK_THREAD_INTERVAL_US = 1000;
 
+// New: Dynamics Update Configuration
+const int DYNAMICS_UPDATE_INTERVAL_MS = 10000; // 10 seconds
+
 // CSV File Configuration
 string CSV_BASE_FILENAME = "haptic_teleoperation_data";
 string CSV_FILENAME;
@@ -183,12 +186,21 @@ struct FeedbackPacket {
     double force[3];
     double position[3];
     double error[3];
-    double stiffness; // Already present, maps to hapticConfig.Kp
-    double damping;   // Already present, maps to hapticConfig.Kd
+    double stiffness;
+    double damping;
     bool isActive;
     char message[64];
     std::chrono::steady_clock::time_point sendTime;
 };
+
+// New: Structure to hold dynamics data
+struct DynamicsData {
+    double stiffness = STIFFNESS_K;
+    double damping = DAMPING_B;
+    std::chrono::steady_clock::time_point lastUpdate;
+};
+DynamicsData dynamicsData;
+std::mutex dynamicsMutex;
 
 SOCKET recvSocket = INVALID_SOCKET;
 std::mutex socketMutex;
@@ -238,6 +250,7 @@ void reshape(int w, int h);
 void keyboard(unsigned char key, int x, int y);
 void specialKeyboard(int key, int x, int y);
 void timerCallback(int value);
+void updateDynamicsThread(); // New: Thread to update dynamics
 
 // Adaptive Packet Buffer Class
 class AdaptivePacketBuffer {
@@ -254,7 +267,6 @@ private:
 public:
     AdaptivePacketBuffer() : lastReleaseTime(std::chrono::steady_clock::now()) {}
 
-    // New method to add a packet to processedPackets safely
     void addProcessedPacket(const Packet& packet) {
         std::lock_guard<std::mutex> lock(processedMutex);
         processedPackets.push_back(packet);
@@ -284,6 +296,7 @@ public:
             calculateDelayStatistics();
         }
     }
+
     void calculateDelayStatistics() {
         if (slidingWindow.size() < 2) return;
         double sumDelay = 0.0;
@@ -603,7 +616,6 @@ std::string formatTimestampForDisplay(const char* timestamp) {
 
 void sendFeedback(const sockaddr_in& clientAddr, int packetNumber, const double force[3],
     const double position[3], const double error[3], double stiffness, double damping, bool isActive) {
-    // Existing code already sets feedback.stiffness and feedback.damping
     if (!FEEDBACK_ENABLED) return;
     std::lock_guard<std::mutex> lock(socketMutex);
     FeedbackPacket feedback;
@@ -611,6 +623,7 @@ void sendFeedback(const sockaddr_in& clientAddr, int packetNumber, const double 
     memcpy(feedback.force, force, sizeof(double) * 3);
     memcpy(feedback.position, position, sizeof(double) * 3);
     memcpy(feedback.error, error, sizeof(double) * 3);
+    // Use provided stiffness and damping (from DynamicsData)
     feedback.stiffness = stiffness;
     feedback.damping = damping;
     feedback.isActive = isActive;
@@ -680,10 +693,11 @@ void continuousFeedbackThread() {
                     posError[i] = targetPos[i] - currentPos[i];
                 }
             }
+            // Get dynamics from DynamicsData
             {
-                std::lock_guard<std::mutex> hapticLock(hapticMutex);
-                Kp = hapticConfig.Kp; // Environmental stiffness
-                Kd = hapticConfig.Kd; // Environmental damping
+                std::lock_guard<std::mutex> lock(dynamicsMutex);
+                Kp = dynamicsData.stiffness; // Use sampled stiffness
+                Kd = dynamicsData.damping;   // Use sampled damping
             }
             feedbackPacketCounter++;
             bool isActive = false;
@@ -703,6 +717,28 @@ void continuousFeedbackThread() {
             sendFeedback(client.addr, packetNumber, currentForce, currentPos, posError, Kp, Kd, isActive);
         }
         std::this_thread::sleep_for(std::chrono::microseconds(PACKET_SEND_INTERVAL_US));
+    }
+}
+
+// New: Thread to update dynamics every 10 seconds
+void updateDynamicsThread() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    std::cout << "Dynamics update thread started" << std::endl;
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(dynamicsMutex);
+            // Compute dynamics by sampling from environment (hapticConfig)
+            std::lock_guard<std::mutex> hapticLock(hapticMutex);
+            dynamicsData.stiffness = hapticConfig.Kp;
+            dynamicsData.damping = hapticConfig.Kd;
+            dynamicsData.lastUpdate = std::chrono::steady_clock::now();
+            if (LOG_TO_CONSOLE) {
+                std::cout << "Computed environment dynamics: Stiffness=" << dynamicsData.stiffness
+                    << " N/m, Damping=" << dynamicsData.damping << " Ns/m at "
+                    << getCurrentTimestamp() << std::endl;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(DYNAMICS_UPDATE_INTERVAL_MS));
     }
 }
 
@@ -787,18 +823,15 @@ void receivePackets() {
             }
             memcpy(&packet, buffer, copySize);
             packet.receiveTime = std::chrono::steady_clock::now();
-
             bool useAdaptive;
             {
                 std::lock_guard<std::mutex> lock(adaptiveBufferMutex);
                 useAdaptive = USE_ADAPTIVE_BUFFER;
             }
-
             if (useAdaptive) {
                 adaptiveBuffer.addPacket(packet);
             }
             else {
-                // Direct execution
                 int delayAmount = 0;
                 if (UNIFORM_DELAY_ENABLED) {
                     delayAmount = UNIFORM_DELAY_MS;
@@ -832,7 +865,6 @@ void receivePackets() {
                     }
                     globalPacketStats.totalPacketsProcessed++;
                 }
-                // Use new method to add to processed packets
                 adaptiveBuffer.addProcessedPacket(packet);
                 if (LOG_TO_CONSOLE) {
                     std::cout << "Directly processed packet #" << packet.packetNumber
@@ -1393,6 +1425,7 @@ void draw3DVector(float x, float y, float scale, const float vec[3], const char*
     snprintf(compStr, sizeof(compStr), "[%.2f, %.2f, %.2f]", vec[0], vec[1], vec[2]);
     renderSmallText(x - 0.04f, y - 0.10f, FONT_SMALL, compStr);
 }
+
 void drawHapticStatus(float x, float y) {
     bool deviceConnected, hapticEnabled, wallsEnabled;
     double Kp, Kd, maxForce, forceScale;
@@ -1452,9 +1485,9 @@ void drawHapticStatus(float x, float y) {
     }
     float fPos[3], fForce[3], fTarget[3];
     for (int i = 0; i < 3; i++) {
-        fPos[i] = static_cast<float>(currentPos[i]);   // Explicit cast
-        fForce[i] = static_cast<float>(currentForce[i]); // Explicit cast
-        fTarget[i] = static_cast<float>(targetPos[i]); // Explicit cast
+        fPos[i] = static_cast<float>(currentPos[i]);
+        fForce[i] = static_cast<float>(currentForce[i]);
+        fTarget[i] = static_cast<float>(targetPos[i]);
     }
     if (showVectorVis) {
         float vecScale = 5.0f;
@@ -1909,6 +1942,7 @@ int main(int argc, char** argv) {
     std::cout << "Adaptive Buffering: Window Size = " << SLIDING_WINDOW_SIZE << " packets (Toggle with T)" << std::endl;
     std::cout << "Packet Utilization: Marking every " << FEEDBACK_ACTIVE_PKTS
         << " packets after " << PACKET_UTILIZATION_INTERVAL << " as active" << std::endl;
+    std::cout << "Dynamics Computation: Computing stiffness and damping every " << DYNAMICS_UPDATE_INTERVAL_MS / 1000 << " seconds" << std::endl;
     std::cout << "Press F1 for help, Esc to exit" << std::endl;
     std::cout << "------------------------------------------------------" << std::endl;
     std::thread networkRecvThread(receivePackets);
@@ -1919,6 +1953,8 @@ int main(int argc, char** argv) {
     hapticThread.detach();
     std::thread feedbackThread(continuousFeedbackThread);
     feedbackThread.detach();
+    std::thread dynamicsThread(updateDynamicsThread);
+    dynamicsThread.detach();
     glutMainLoop();
     return 0;
 }
