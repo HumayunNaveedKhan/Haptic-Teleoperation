@@ -1072,6 +1072,9 @@ void hapticLoop() {
             logMessage("Haptic device calibration failed in hapticLoop");
         }
     }
+    // Variables for server-provided dynamics
+    double envStiffness = SPHERE_STIFFNESS; // Default stiffness
+    double envDamping = K_DAMPING;         // Default damping
     while (hapticRunning) {
         auto loopStart = chrono::high_resolution_clock::now();
         clock.stop();
@@ -1098,6 +1101,16 @@ void hapticLoop() {
             cVector3d position;
             bool validPosition = hapticDevice ? hapticDevice->getPosition(position) : false;
             if (validPosition) {
+                // Update environment dynamics from server
+                {
+                    lock_guard<mutex> lock(forceFeedbackMutex);
+                    if (newForceFeedback) {
+                        envStiffness = lastStiffness;
+                        envDamping = lastDamping;
+                        logMessage("Updated virtual environment dynamics: Stiffness=" + to_string(envStiffness) +
+                            " N/m, Damping=" + to_string(envDamping) + " Ns/m");
+                    }
+                }
                 const double WALL_GROUND = 0.0 + SPHERE_RADIUS;
                 const double WALL_LEFT = -0.1;
                 const double WALL_RIGHT = 0.2;
@@ -1127,34 +1140,34 @@ void hapticLoop() {
                             }
                         }
                         if (distance < 2.0 * SPHERES_RADIUS) {
-                            force += (SPHERE_STIFFNESS * (distance - 2.0 * SPHERE_RADIUS) * dir01);
+                            force += (envStiffness * (distance - 2.0 * SPHERE_RADIUS) * dir01); // Use server stiffness
                         }
                         sphereFce[i] += force;
                         sphereFce[j] += (-force);
                     }
                     if (pos0.z() < WALL_GROUND) {
-                        sphereFce[i] += cVector3d(0.0, 0.0, SPHERE_STIFFNESS * (WALL_GROUND - pos0.z()));
+                        sphereFce[i] += cVector3d(0.0, 0.0, envStiffness * (WALL_GROUND - pos0.z())); // Use server stiffness
                     }
                     if (pos0.y() < WALL_LEFT) {
-                        sphereFce[i] += cVector3d(0.0, SPHERE_STIFFNESS * (WALL_LEFT - pos0.y()), 0.0);
+                        sphereFce[i] += cVector3d(0.0, envStiffness * (WALL_LEFT - pos0.y()), 0.0); // Use server stiffness
                     }
                     if (pos0.y() > WALL_RIGHT) {
-                        sphereFce[i] += cVector3d(0.0, SPHERE_STIFFNESS * (WALL_RIGHT - pos0.y()), 0.0);
+                        sphereFce[i] += cVector3d(0.0, envStiffness * (WALL_RIGHT - pos0.y()), 0.0); // Use server stiffness
                     }
                     if (pos0.x() < WALL_BACK) {
-                        sphereFce[i] += cVector3d(SPHERE_STIFFNESS * (WALL_BACK - pos0.x()), 0.0, 0.0);
+                        sphereFce[i] += cVector3d(envStiffness * (WALL_BACK - pos0.x()), 0.0, 0.0); // Use server stiffness
                     }
                     if (pos0.x() > WALL_FRONT) {
-                        sphereFce[i] += cVector3d(SPHERE_STIFFNESS * (WALL_FRONT - pos0.x()), 0.0, 0.0);
+                        sphereFce[i] += cVector3d(envStiffness * (WALL_FRONT - pos0.x()), 0.0, 0.0); // Use server stiffness
                     }
                 }
                 cVector3d dirHapticSphere = spheres[0]->getLocalPos() - position;
-                cVector3d forceSphere = -SPHERE_STIFFNESS * dirHapticSphere;
-                force = HAPTIC_STIFFNESS * dirHapticSphere;
+                cVector3d forceSphere = -envStiffness * dirHapticSphere; // Use server stiffness
+                force = HAPTIC_STIFFNESS * dirHapticSphere; // Keep HAPTIC_STIFFNESS for haptic interaction
                 sphereFce[0] += forceSphere;
                 for (int i = 0; i < NUM_SPHERES; i++) {
                     cVector3d sphereAcc = (sphereFce[i] / SPHERE_MASS) + cVector3d(0.0, 0.0, -9.81);
-                    sphereVel[i] = K_DAMPING * (sphereVel[i] + timeInterval * sphereAcc);
+                    sphereVel[i] = envDamping * (sphereVel[i] + timeInterval * sphereAcc); // Use server damping
                     cVector3d spherePos = spheres[i]->getLocalPos() + timeInterval * sphereVel[i] + (timeInterval * timeInterval) * sphereAcc;
                     spheres[i]->setLocalPos(spherePos);
                 }
@@ -1176,7 +1189,7 @@ void hapticLoop() {
         else {
             bool shouldApplyFeedback = false;
             cVector3d tempForce(0.0, 0.0, 0.0);
-            bool newFeedback = false; // Changed from tempNewFeedback
+            bool newFeedback = false;
             {
                 lock_guard<mutex> lock(controlMutex);
                 shouldApplyFeedback = applyHapticFeedback || rawModeEnabled;
