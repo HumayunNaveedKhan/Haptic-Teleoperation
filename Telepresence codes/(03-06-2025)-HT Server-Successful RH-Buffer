@@ -130,6 +130,7 @@ cLabel* labelHapticDevicePosition;
 cVector3d hapticDevicePosition;
 cVector3d hapticDeviceVelocity;
 cFontPtr font;
+cFontPtr font_small; // Smaller font for axis labels
 cLabel* labelRates;
 cLabel* labelMax;
 cLabel* labelMin;
@@ -284,6 +285,7 @@ int main(int argc, char* argv[]) {
     hapticDevice->setEnableGripperUserSwitch(true);
 
     font = NEW_CFONTCALIBRI20();
+    font_small = NEW_CFONTCALIBRI16(); // Smaller font for axis labels
 
     labelHapticDeviceModel = new cLabel(font);
     camera->m_frontLayer->addChild(labelHapticDeviceModel);
@@ -296,86 +298,86 @@ int main(int argc, char* argv[]) {
     labelRates = new cLabel(font);
     camera->m_frontLayer->addChild(labelRates);
 
-    // Packet scopes in vertical column
+    // Packet scopes in vertical column on the right
     scope6 = new cScope();
     camera->m_frontLayer->addChild(scope6);
-    scope6->setLocalPos(800, 60);
+    scope6->setLocalPos(1390, 60);
     scope6->setRange(0.0, 10.0); // Force: 0 to 10 N
     scope6->setSignalEnabled(true);
     scope6->setTransparencyLevel(0.3);
-    scope6->setSize(500, 350); // Increased height for 10 N range
+    scope6->setSize(500, 350);
 
     scope7 = new cScope();
     camera->m_frontLayer->addChild(scope7);
-    scope7->setLocalPos(800, 460); // Below scope6
+    scope7->setLocalPos(1390, 460);
     scope7->setRange(0.0, 0.1); // Position: 0 to 0.1 m
     scope7->setSignalEnabled(true);
     scope7->setTransparencyLevel(0.3);
     scope7->setSize(500, 300);
 
-    // Other scopes in vertical column to the right
+    // Smaller scopes in 2x3 grid
     scope0 = new cScope();
     camera->m_frontLayer->addChild(scope0);
-    scope0->setLocalPos(1100, 60);
+    scope0->setLocalPos(800, 400);
     scope0->setRange(-0.1, 0.1);
     scope0->setSignalEnabled(true);
     scope0->setTransparencyLevel(0.3);
-    scope0->setSize(200, 150);
+    scope0->setSize(180, 120);
     scope0->m_colorSignal0.setRed();
 
     scope1 = new cScope();
     camera->m_frontLayer->addChild(scope1);
-    scope1->setLocalPos(1100, 260);
+    scope1->setLocalPos(1000, 400);
     scope1->setRange(-0.1, 0.1);
     scope1->setSignalEnabled(true, true);
     scope1->setTransparencyLevel(0.3);
-    scope1->setSize(200, 150);
+    scope1->setSize(180, 120);
     scope1->m_colorSignal2.setGreen();
     scope1->m_colorSignal0.setRed();
 
     scope2 = new cScope();
     camera->m_frontLayer->addChild(scope2);
-    scope2->setLocalPos(1100, 460);
+    scope2->setLocalPos(1200, 400);
     scope2->setRange(-0.1, 0.1);
     scope2->setSignalEnabled(true, true);
     scope2->setTransparencyLevel(0.3);
-    scope2->setSize(200, 150);
+    scope2->setSize(180, 120);
     scope2->m_colorSignal2.setGreen();
     scope2->m_colorSignal0.setRed();
 
     scope3 = new cScope();
     camera->m_frontLayer->addChild(scope3);
-    scope3->setLocalPos(1100, 660);
+    scope3->setLocalPos(800, 560);
     scope3->setRange(-10, 10);
     scope3->setSignalEnabled(true, true);
     scope3->setTransparencyLevel(0.3);
-    scope3->setSize(200, 150);
+    scope3->setSize(180, 120);
     scope3->m_colorSignal2.setGreen();
     scope3->m_colorSignal0.setRed();
 
     scope4 = new cScope();
     camera->m_frontLayer->addChild(scope4);
-    scope4->setLocalPos(1100, 860);
+    scope4->setLocalPos(1000, 560);
     scope4->setRange(-10, 10);
     scope4->setSignalEnabled(true, true);
     scope4->setTransparencyLevel(0.3);
-    scope4->setSize(200, 150);
+    scope4->setSize(180, 120);
     scope4->m_colorSignal2.setGreen();
     scope4->m_colorSignal0.setRed();
 
     scope5 = new cScope();
     camera->m_frontLayer->addChild(scope5);
-    scope5->setLocalPos(1100, 1060);
+    scope5->setLocalPos(1200, 560);
     scope5->setRange(-10, 10);
     scope5->setSignalEnabled(true, true);
     scope5->setTransparencyLevel(0.3);
-    scope5->setSize(200, 150);
+    scope5->setSize(180, 120);
     scope5->m_colorSignal2.setGreen();
     scope5->m_colorSignal0.setRed();
 
     leveldelay = new cLevel();
     camera->m_frontLayer->addChild(leveldelay);
-    leveldelay->setLocalPos(60, 460); // Moved down
+    leveldelay->setLocalPos(60, 60);
     leveldelay->setRange(0.0, 200);
     leveldelay->setWidth(40);
     leveldelay->setNumIncrements(50);
@@ -408,72 +410,82 @@ int main(int argc, char* argv[]) {
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Incoming Packets (Force)");
-    scopename->setLocalPos(800, 430); // Below scope6
+    scopename->setLocalPos(1100, 430);
+    scopename->m_fontColor.setWhite();
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Outgoing Packets (Position)");
-    scopename->setLocalPos(800, 830); // Below scope7
+    scopename->setLocalPos(1100, 830);
+    scopename->m_fontColor.setWhite();
 
     // Y-axis scales for scope6 (force, 0 to 10 N)
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0 N");
-    scopename->setLocalPos(770, 60);
+    scopename->setLocalPos(1070, 60);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("5 N");
-    scopename->setLocalPos(770, 235);
+    scopename->setLocalPos(1070, 235);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("10 N");
-    scopename->setLocalPos(770, 410);
+    scopename->setLocalPos(1070, 410);
+    scopename->m_fontColor.setGrayLight();
 
     // Y-axis scales for scope7 (position, 0 to 0.1 m)
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0 m");
-    scopename->setLocalPos(770, 460);
+    scopename->setLocalPos(1070, 460);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0.05 m");
-    scopename->setLocalPos(770, 610);
+    scopename->setLocalPos(1070, 610);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0.1 m");
-    scopename->setLocalPos(770, 760);
+    scopename->setLocalPos(1070, 760);
+    scopename->m_fontColor.setGrayLight();
 
     // X-axis scales for scope6 (time, 0 to 5 s)
     for (int i = 0; i <= 5; i++) {
-        scopename = new cLabel(font);
+        scopename = new cLabel(font_small);
         camera->m_frontLayer->addChild(scopename);
         scopename->setText(cStr(i) + " s");
-        scopename->setLocalPos(800 + i * 100, 40);
+        scopename->setLocalPos(1390 + i * 100, 40);
+        scopename->m_fontColor.setGrayLight();
     }
     for (float i = 0.5; i < 5; i += 1.0) {
-        scopename = new cLabel(font);
+        scopename = new cLabel(font_small);
         camera->m_frontLayer->addChild(scopename);
         scopename->setText(cStr(i));
-        scopename->setLocalPos(800 + i * 100, 20);
+        scopename->setLocalPos(1390 + i * 100, 20);
         scopename->m_fontColor.setGray();
     }
 
     // X-axis scales for scope7 (time, 0 to 5 s)
     for (int i = 0; i <= 5; i++) {
-        scopename = new cLabel(font);
+        scopename = new cLabel(font_small);
         camera->m_frontLayer->addChild(scopename);
         scopename->setText(cStr(i) + " s");
-        scopename->setLocalPos(800 + i * 100, 440);
+        scopename->setLocalPos(1390 + i * 100, 440);
+        scopename->m_fontColor.setGrayLight();
     }
     for (float i = 0.5; i < 5; i += 1.0) {
-        scopename = new cLabel(font);
+        scopename = new cLabel(font_small);
         camera->m_frontLayer->addChild(scopename);
         scopename->setText(cStr(i));
-        scopename->setLocalPos(800 + i * 100, 420);
+        scopename->setLocalPos(1390 + i * 100, 420);
         scopename->m_fontColor.setGray();
     }
 
@@ -481,99 +493,117 @@ int main(int argc, char* argv[]) {
     labelCycleState = new cLabel(font);
     camera->m_frontLayer->addChild(labelCycleState);
     labelCycleState->setText("Cycle: Sending");
-    labelCycleState->setLocalPos(800, 860); // Below scope7
+    labelCycleState->setLocalPos(1100, 860);
     labelCycleState->m_fontColor.setYellow();
 
-    // Labels for other scopes
+    // Labels for smaller scopes
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Xm(x)");
-    scopename->setLocalPos(1100, 230);
+    scopename->setLocalPos(800, 550);
+    scopename->m_fontColor.setWhite();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-0.1");
-    scopename->setLocalPos(1070, 210);
+    scopename->setLocalPos(770, 520);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0.1");
-    scopename->setLocalPos(1070, 60);
+    scopename->setLocalPos(770, 400);
+    scopename->m_fontColor.setGrayLight();
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Xm(y)");
-    scopename->setLocalPos(1100, 430);
+    scopename->setLocalPos(1000, 550);
+    scopename->m_fontColor.setWhite();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-0.1");
-    scopename->setLocalPos(1070, 410);
+    scopename->setLocalPos(970, 520);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0.1");
-    scopename->setLocalPos(1070, 260);
+    scopename->setLocalPos(970, 400);
+    scopename->m_fontColor.setGrayLight();
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Xm(z)");
-    scopename->setLocalPos(1100, 630);
+    scopename->setLocalPos(1200, 550);
+    scopename->m_fontColor.setWhite();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-0.1");
-    scopename->setLocalPos(1070, 610);
+    scopename->setLocalPos(1170, 520);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0.1");
-    scopename->setLocalPos(1070, 460);
+    scopename->setLocalPos(1170, 400);
+    scopename->m_fontColor.setGrayLight();
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Forces(x)");
-    scopename->setLocalPos(1100, 830);
+    scopename->setLocalPos(800, 710);
+    scopename->m_fontColor.setWhite();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-10");
-    scopename->setLocalPos(1070, 810);
+    scopename->setLocalPos(770, 680);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("10");
-    scopename->setLocalPos(1070, 660);
+    scopename->setLocalPos(770, 560);
+    scopename->m_fontColor.setGrayLight();
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Forces(y)");
-    scopename->setLocalPos(1100, 1030);
+    scopename->setLocalPos(1000, 710);
+    scopename->m_fontColor.setWhite();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-10");
-    scopename->setLocalPos(1070, 1010);
+    scopename->setLocalPos(970, 680);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("10");
-    scopename->setLocalPos(1070, 860);
+    scopename->setLocalPos(970, 560);
+    scopename->m_fontColor.setGrayLight();
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Forces(z)");
-    scopename->setLocalPos(1100, 1230);
+    scopename->setLocalPos(1200, 710);
+    scopename->m_fontColor.setWhite();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-10");
-    scopename->setLocalPos(1070, 1210);
+    scopename->setLocalPos(1170, 680);
+    scopename->m_fontColor.setGrayLight();
 
-    scopename = new cLabel(font);
+    scopename = new cLabel(font_small);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("10");
-    scopename->setLocalPos(1070, 1060);
+    scopename->setLocalPos(1170, 560);
+    scopename->m_fontColor.setGrayLight();
 
     labelXd_Prev = new cLabel(font);
     labelXd = new cLabel(font);
@@ -891,7 +921,7 @@ void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
     labelDelay->setLocalPos(20, height - 220);
     labelc1->setLocalPos(20, height - 240);
     labelc2->setLocalPos(20, height - 260);
-    labelCycleState->setLocalPos(800, 860);
+    labelCycleState->setLocalPos(1100, 860);
 }
 
 void errorCallback(int a_error, const char* a_description) {
