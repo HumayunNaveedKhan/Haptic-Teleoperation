@@ -138,8 +138,8 @@ cScope* scope2;
 cScope* scope3;
 cScope* scope4;
 cScope* scope5;
-cScope* scope6; // Incoming packets (green)
-cScope* scope7; // Outgoing packets (blue)
+cScope* scope6; // Incoming packets (force, green)
+cScope* scope7; // Outgoing packets (position, blue)
 cLevel* leveldelay;
 bool useForceField = true;
 bool simulationRunning = false;
@@ -264,7 +264,7 @@ int main(int argc, char* argv[]) {
     cHapticDeviceInfo info = hapticDevice->getSpecifications();
     hapticDevice->setEnableGripperUserSwitch(true);
 
-    font = NEW_CFONTCALIBRI28();
+    font = NEW_CFONTCALIBRI20(); // Smaller font for scale labels
 
     labelHapticDeviceModel = new cLabel(font);
     camera->m_frontLayer->addChild(labelHapticDeviceModel);
@@ -277,11 +277,30 @@ int main(int argc, char* argv[]) {
     labelRates = new cLabel(font);
     camera->m_frontLayer->addChild(labelRates);
 
-    // Minimized scopes
+    // Packet scopes at top
+    scope6 = new cScope();
+    camera->m_frontLayer->addChild(scope6);
+    scope6->setLocalPos(800, 60);
+    scope6->setRange(0.0, 5.0); // Force: 0 to 5N
+    scope6->setSignalEnabled(true);
+    scope6->setTransparencyLevel(0.3);
+    scope6->setSize(500, 300);
+    scope6->m_colorSignal0.setGreen(); // Incoming packets (force)
+
+    scope7 = new cScope();
+    camera->m_frontLayer->addChild(scope7);
+    scope7->setLocalPos(1320, 60);
+    scope7->setRange(0.0, 0.1); // Position: 0 to 0.1m
+    scope7->setSignalEnabled(true);
+    scope7->setTransparencyLevel(0.3);
+    scope7->setSize(500, 300);
+    scope7->m_colorSignal0.setBlue(); // Outgoing packets (position)
+
+    // Minimized scopes moved down
     scope0 = new cScope();
     camera->m_frontLayer->addChild(scope0);
-    scope0->setLocalPos(800, 60);
-    scope0->setRange(-.1, .1);
+    scope0->setLocalPos(800, 400);
+    scope0->setRange(-0.1, 0.1);
     scope0->setSignalEnabled(true);
     scope0->setTransparencyLevel(0.3);
     scope0->setSize(200, 150);
@@ -289,7 +308,7 @@ int main(int argc, char* argv[]) {
 
     scope1 = new cScope();
     camera->m_frontLayer->addChild(scope1);
-    scope1->setLocalPos(1020, 60);
+    scope1->setLocalPos(1020, 400);
     scope1->setRange(-0.1, 0.1);
     scope1->setSignalEnabled(true, true);
     scope1->setTransparencyLevel(0.3);
@@ -299,7 +318,7 @@ int main(int argc, char* argv[]) {
 
     scope2 = new cScope();
     camera->m_frontLayer->addChild(scope2);
-    scope2->setLocalPos(1240, 60);
+    scope2->setLocalPos(1240, 400);
     scope2->setRange(-0.1, 0.1);
     scope2->setSignalEnabled(true, true);
     scope2->setTransparencyLevel(0.3);
@@ -309,7 +328,7 @@ int main(int argc, char* argv[]) {
 
     scope3 = new cScope();
     camera->m_frontLayer->addChild(scope3);
-    scope3->setLocalPos(800, 220);
+    scope3->setLocalPos(800, 560);
     scope3->setRange(-10, 10);
     scope3->setSignalEnabled(true, true);
     scope3->setTransparencyLevel(0.3);
@@ -319,7 +338,7 @@ int main(int argc, char* argv[]) {
 
     scope4 = new cScope();
     camera->m_frontLayer->addChild(scope4);
-    scope4->setLocalPos(1020, 220);
+    scope4->setLocalPos(1020, 560);
     scope4->setRange(-10, 10);
     scope4->setSignalEnabled(true, true);
     scope4->setTransparencyLevel(0.3);
@@ -329,32 +348,13 @@ int main(int argc, char* argv[]) {
 
     scope5 = new cScope();
     camera->m_frontLayer->addChild(scope5);
-    scope5->setLocalPos(1240, 220);
+    scope5->setLocalPos(1240, 560);
     scope5->setRange(-10, 10);
     scope5->setSignalEnabled(true, true);
     scope5->setTransparencyLevel(0.3);
     scope5->setSize(200, 150);
     scope5->m_colorSignal2.setGreen();
     scope5->m_colorSignal0.setRed();
-
-    // Large packet scopes
-    scope6 = new cScope();
-    camera->m_frontLayer->addChild(scope6);
-    scope6->setLocalPos(800, 400);
-    scope6->setRange(0.0, 10.0); // Adjust range based on expected magnitude
-    scope6->setSignalEnabled(true);
-    scope6->setTransparencyLevel(0.3);
-    scope6->setSize(500, 300);
-    scope6->m_colorSignal0.setGreen(); // Incoming packets in green
-
-    scope7 = new cScope();
-    camera->m_frontLayer->addChild(scope7);
-    scope7->setLocalPos(1320, 400);
-    scope7->setRange(0.0, 10.0);
-    scope7->setSignalEnabled(true);
-    scope7->setTransparencyLevel(0.3);
-    scope7->setSize(500, 300);
-    scope7->m_colorSignal0.setBlue(); // Outgoing packets in blue
 
     leveldelay = new cLevel();
     camera->m_frontLayer->addChild(leveldelay);
@@ -390,104 +390,148 @@ int main(int argc, char* argv[]) {
     // Labels for packet scopes
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
-    scopename->setText("Incoming Packets (Magnitude)");
-    scopename->setLocalPos(800, 720);
-
-    scopename = new cLabel(font);
-    camera->m_frontLayer->addChild(scopename);
-    scopename->setText("Outgoing Packets (Magnitude)");
-    scopename->setLocalPos(1320, 720);
-
-    // Labels for existing scopes (adjusted positions)
-    scopename = new cLabel(font);
-    camera->m_frontLayer->addChild(scopename);
-    scopename->setText("Forces(z)");
-    scopename->setLocalPos(1240, 380);
-
-    scopename = new cLabel(font);
-    camera->m_frontLayer->addChild(scopename);
-    scopename->setText("-10");
-    scopename->setLocalPos(1210, 360);
-
-    scopename = new cLabel(font);
-    camera->m_frontLayer->addChild(scopename);
-    scopename->setText("10");
-    scopename->setLocalPos(1210, 220);
-
-    scopename = new cLabel(font);
-    camera->m_frontLayer->addChild(scopename);
-    scopename->setText("Forces(y)");
-    scopename->setLocalPos(1020, 380);
-
-    scopename = new cLabel(font);
-    camera->m_frontLayer->addChild(scopename);
-    scopename->setText("-10");
-    scopename->setLocalPos(990, 360);
-
-    scopename = new cLabel(font);
-    camera->m_frontLayer->addChild(scopename);
-    scopename->setText("10");
-    scopename->setLocalPos(990, 220);
-
-    scopename = new cLabel(font);
-    camera->m_frontLayer->addChild(scopename);
-    scopename->setText("Forces(x)");
+    scopename->setText("Incoming Packets (Force)");
     scopename->setLocalPos(800, 380);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
-    scopename->setText("-10");
+    scopename->setText("Outgoing Packets (Position)");
+    scopename->setLocalPos(1320, 380);
+
+    // Y-axis scales for scope6 (force, 0 to 5N)
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0 N");
+    scopename->setLocalPos(770, 60);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("5 N");
     scopename->setLocalPos(770, 360);
+
+    // Y-axis scales for scope7 (position, 0 to 0.1m)
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0 m");
+    scopename->setLocalPos(1290, 60);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0.1 m");
+    scopename->setLocalPos(1290, 360);
+
+    // X-axis scales for scope6 (time, 0 to 5s)
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0 s");
+    scopename->setLocalPos(800, 40);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("5 s");
+    scopename->setLocalPos(1250, 40);
+
+    // X-axis scales for scope7 (time, 0 to 5s)
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0 s");
+    scopename->setLocalPos(1320, 40);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("5 s");
+    scopename->setLocalPos(1770, 40);
+
+    // Labels for minimized scopes
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Forces(z)");
+    scopename->setLocalPos(1240, 720);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-10");
+    scopename->setLocalPos(1210, 700);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("10");
-    scopename->setLocalPos(770, 220);
+    scopename->setLocalPos(1210, 560);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Forces(y)");
+    scopename->setLocalPos(1020, 720);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-10");
+    scopename->setLocalPos(990, 700);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("10");
+    scopename->setLocalPos(990, 560);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Forces(x)");
+    scopename->setLocalPos(800, 720);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-10");
+    scopename->setLocalPos(770, 700);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("10");
+    scopename->setLocalPos(770, 560);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Xm(z)");
-    scopename->setLocalPos(1240, 220);
+    scopename->setLocalPos(1240, 560);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-0.1");
-    scopename->setLocalPos(1210, 200);
+    scopename->setLocalPos(1210, 540);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0.1");
-    scopename->setLocalPos(1210, 60);
+    scopename->setLocalPos(1210, 400);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Xm(y)");
-    scopename->setLocalPos(1020, 220);
+    scopename->setLocalPos(1020, 560);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-0.1");
-    scopename->setLocalPos(990, 200);
+    scopename->setLocalPos(990, 540);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0.1");
-    scopename->setLocalPos(990, 60);
+    scopename->setLocalPos(990, 400);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("Xm(x)");
-    scopename->setLocalPos(800, 220);
+    scopename->setLocalPos(800, 560);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("-0.1");
-    scopename->setLocalPos(770, 200);
+    scopename->setLocalPos(770, 540);
 
     scopename = new cLabel(font);
     camera->m_frontLayer->addChild(scopename);
     scopename->setText("0.1");
-    scopename->setLocalPos(770, 60);
+    scopename->setLocalPos(770, 400);
 
     labelXd_Prev = new cLabel(font);
     labelXd = new cLabel(font);
@@ -588,8 +632,8 @@ void updateGraphics(void) {
     auto now = chrono::high_resolution_clock::now();
     double time_since_last_in = chrono::duration<float>(now - last_packet_in_time).count();
     double time_since_last_out = chrono::duration<float>(now - last_packet_out_time).count();
-    packet_in_magnitude = (time_since_last_in < pulse_duration) ? packet_in_magnitude : 0.0;
-    packet_out_magnitude = (time_since_last_out < pulse_duration) ? packet_out_magnitude : 0.0;
+    double in_signal = (time_since_last_in < pulse_duration) ? packet_in_magnitude : 0.0;
+    double out_signal = (time_since_last_out < pulse_duration) ? packet_out_magnitude : 0.0;
 
     scope0->setSignalValues(hapticDevicePosition.x(), ReadData[3]);
     scope1->setSignalValues(hapticDevicePosition.y(), ReadData[4]);
@@ -597,8 +641,8 @@ void updateGraphics(void) {
     scope3->setSignalValues(ProjFOR[0], -ReadData[0]);
     scope4->setSignalValues(ProjFOR[1], -ReadData[1]);
     scope5->setSignalValues(ProjFOR[2], -ReadData[2]);
-    scope6->setSignalValues(packet_in_magnitude);
-    scope7->setSignalValues(packet_out_magnitude);
+    scope6->setSignalValues(in_signal);
+    scope7->setSignalValues(out_signal);
     leveldelay->setValue(TAP);
 
     labelIP->setText("Client IP: " + string(inet_ntoa(clientaddr.sin_addr)) + ":" + cStr(ntohs(clientaddr.sin_port)));
@@ -825,6 +869,7 @@ void UDPSendData(float sData[SENDDATA_NUM]) {
     // Calculate magnitude for outgoing packet
     packet_out_magnitude = sqrt(sData[0] * sData[0] + sData[1] * sData[1] + sData[2] * sData[2]);
     last_packet_out_time = chrono::high_resolution_clock::now();
+    cout << "Sent packet, magnitude: " << packet_out_magnitude << endl; // Debug output
 }
 
 void UDPReadData() {
@@ -839,6 +884,7 @@ void UDPReadData() {
     sscanf(rbuf, "%f %f %f", &ReadData[0], &ReadData[1], &ReadData[2]);
     packet_in_magnitude = sqrt(ReadData[0] * ReadData[0] + ReadData[1] * ReadData[1] + ReadData[2] * ReadData[2]);
     last_packet_in_time = chrono::high_resolution_clock::now();
+    cout << "Received packet, magnitude: " << packet_in_magnitude << endl; // Debug output
     delay = timeUDPS - timeUDPR;
     countd++;
     cSleepMs(TAP);
