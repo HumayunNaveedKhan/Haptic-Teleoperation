@@ -1,0 +1,1033 @@
+#include <stdio.h>
+#include <chrono>
+#include <winsock2.h>
+#include "chai3d.h"
+#include <GLFW/glfw3.h>
+#include "widgets/CScope.h"
+#include "graphics/CPrimitives.h"
+#include <deque>
+#pragma comment(lib, "ws2_32.lib")
+
+using namespace chai3d;
+using namespace std;
+
+// Device Param.
+#define DOF 3
+double pos_curr[DOF] = { 0, 0, 0 };
+double pos_prev[DOF] = { 0, 0, 0 };
+double pos_recv[DOF] = { 0, 0, 0 };
+double Fd[DOF] = { 0, 0, 0 };
+double dFe[DOF] = { 0, 0, 0 };
+double Xd[DOF];
+double DXd[DOF];
+double XdP[DOF];
+double timeUDPRr;
+bool nProjection = true;
+double FOR_Mag;
+double ProjFOR[3], UnitV[3];
+double InnerProduct;
+time_t timestamp2;
+time_t timestamp1;
+double uBETA[3], BETA[3], Bmax[3], Bmin[3];
+double c1 = 50;
+double c2 = 100;
+double Th, Tc;
+bool EnableEBA = true;
+
+// UDP Param.
+#define BUFSIZE 2048
+#define Buffer 2048
+#define SERVER_IP "169.254.213.206"
+#define UDP_PORT 40000
+#define SENDDATA_NUM 3
+#define READDATA_NUM 6
+string Server = SERVER_IP;
+string Server2;
+int retval;
+WSADATA wsa;
+int TAP;
+double avg_delay;
+SOCKET sock;
+SOCKADDR_IN serveraddr;
+SOCKADDR_IN clientaddr;
+int addrlen;
+char sbuff[Buffer], rbuff[Buffer];
+char sbuf[BUFSIZE + 1], rbuf[BUFSIZE + 1];
+float SendData[SENDDATA_NUM], ReadData[READDATA_NUM];
+bool isFirstRecv = false;
+int timeUDPR;
+int timeUDPS;
+double delay = 0;
+double delaym = 0;
+int countd = 0;
+
+// Packet tracking for scopes
+double packet_in_magnitude = 0.0;
+double packet_out_magnitude = 0.0;
+chrono::time_point<chrono::steady_clock> last_packet_in_time;
+chrono::time_point<chrono::steady_clock> last_packet_out_time;
+const double pulse_duration = 0.005; // 5ms for distinct pulses
+
+// Buffer for force packets
+struct ForcePacket {
+    double force[3]; // Force data (x, y, z)
+    chrono::time_point<chrono::steady_clock> timestamp;
+};
+std::deque<ForcePacket> force_buffer; // Buffer to hold force packets
+double delayed_force_magnitude = 0.0; // Magnitude of delayed force for scope6
+chrono::time_point<chrono::steady_clock> last_delayed_force_time; // Time of last delayed force application
+
+// Packet cycle state
+enum CycleState { SENDING, BUFFERING, APPLYING };
+CycleState cycleState = SENDING; // Start in sending state
+uint64_t send_count = 0; // Position packets sent
+uint64_t receive_count = 0; // Feedback packets received
+const uint64_t PACKET_BATCH_SIZE = 5000; // 5000 packets per cycle
+const size_t MAX_BUFFER_SIZE = 5000; // Max 5000 feedback packets
+
+struct Timer {
+    chrono::time_point<chrono::steady_clock> start, end;
+    chrono::duration<float> duration;
+    Timer() { start = chrono::high_resolution_clock::now(); }
+    ~Timer() {
+        end = chrono::high_resolution_clock::now();
+        duration = end - start;
+        timeUDPR = duration.count() * 1000.0f;
+    }
+};
+
+struct Timer2 {
+    chrono::time_point<chrono::steady_clock> start, end;
+    chrono::duration<float> duration;
+    Timer2() { start = chrono::high_resolution_clock::now(); }
+    ~Timer2() {
+        end = chrono::high_resolution_clock::now();
+        duration = end - start;
+        timeUDPS = duration.count() * 1000.0f;
+    }
+};
+
+// Delay Param.
+#define DELAY 1
+#define DELAYDATA_NUM 3
+double ClientData[DELAYDATA_NUM];
+double DelayDataBuf[DELAYDATA_NUM][DELAY];
+double DelayData[DELAYDATA_NUM];
+
+// GUI - GENERAL SETTINGS
+cStereoMode stereoMode = C_STEREO_DISABLED;
+bool fullscreen = false;
+bool mirroredDisplay = false;
+
+// GUI - DECLARED VARIABLES
+cWorld* world;
+cCamera* camera;
+cDirectionalLight* light;
+cHapticDeviceHandler* handler;
+cGenericHapticDevicePtr hapticDevice;
+cLabel* labelHapticDeviceModel;
+cLabel* labelHapticDevicePosition;
+cVector3d hapticDevicePosition;
+cVector3d hapticDeviceVelocity;
+cFontPtr font;
+cLabel* labelRates;
+cLabel* labelMax;
+cLabel* labelMin;
+cLabel* labelXd;
+cLabel* labelXd_Prev;
+cLabel* labelX_Recv;
+cLabel* labelFd;
+cLabel* labeldFe;
+cLabel* labelIP;
+cLabel* labelDelay;
+cLabel* labelc1;
+cLabel* labelc2;
+cLabel* labelbuff;
+cLabel* scopename;
+cLabel* labeldelay2;
+cLabel* labeldelay3;
+cLabel* labelProjFOR;
+cLabel* labelSlave_force;
+cLabel* labelCycleState; // Label for cycle state
+cShapeTorus* cursor;
+cShapeLine* velocity;
+cScope* scope0;
+cScope* scope1;
+cScope* scope2;
+cScope* scope3;
+cScope* scope4;
+cScope* scope5;
+cScope* scope6; // Incoming packets (force, red)
+cScope* scope7; // Outgoing packets (position, green)
+cLevel* leveldelay;
+bool useForceField = true;
+bool simulationRunning = false;
+bool simulationFinished = true;
+cFrequencyCounter freqCounterGraphics;
+cFrequencyCounter freqCounterHaptics;
+cThread* hapticsThread;
+GLFWwindow* window = NULL;
+int width = 0;
+int height = 0;
+int swapInterval = 1;
+
+// GUI - DECLARED FUNCTIONS
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height);
+void errorCallback(int error, const char* a_description);
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods);
+void updateGraphics(void);
+void updateHaptics(void);
+void close(void);
+void InitUDP(void);
+void CloseUDP();
+void UDPSendData(float sData[SENDDATA_NUM]);
+void UDPReadData();
+void err_quit(const char* msg);
+void err_display(const char* msg);
+
+int main(int argc, char* argv[]) {
+    InitUDP();
+
+    cout << endl;
+    cout << "-------------------------------------" << endl;
+    cout << "Dr. Riaz Uddin Teleoperation (Master)" << endl;
+    cout << "-------------------------------------" << endl << endl << endl;
+    cout << "Keyboard Options:" << endl << endl;
+    cout << "[1] - Enable/Disable potential field" << endl;
+    cout << "[f] - toggle fullscreen" << endl;
+    cout << "[M] - Mirrored Display" << endl;
+    cout << endl;
+    cout << "Haptic Device Controls:" << endl;
+    cout << "----------------------" << endl;
+    cout << "[button3] - Increase Delay" << endl;
+    cout << "[button2] - Increase damping" << endl;
+    cout << "[button1] - Decrease damping" << endl;
+    cout << "[button0] - Normalize damping and delay" << endl;
+    cout << endl;
+    cout << "[q] - Exit application" << endl;
+    cout << endl;
+
+    if (!glfwInit()) {
+        cout << "failed initialization" << endl;
+        cSleepMs(1000);
+        return 1;
+    }
+
+    glfwSetErrorCallback(errorCallback);
+
+    const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
+    int w = 0.8 * mode->height;
+    int h = 0.5 * mode->height;
+    int x = 0.5 * (mode->width - w);
+    int y = 0.5 * (mode->height - h);
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+
+    if (stereoMode == C_STEREO_ACTIVE) {
+        glfwWindowHint(GLFW_STEREO, GL_TRUE);
+    }
+    else {
+        glfwWindowHint(GLFW_STEREO, GL_FALSE);
+    }
+
+    window = glfwCreateWindow(w, h, "Dr. Riazuddin Teleoperation (SERVER)", NULL, NULL);
+    if (!window) {
+        cout << "failed to create window" << endl;
+        cSleepMs(10);
+        glfwTerminate();
+        return 1;
+    }
+
+    glfwGetWindowSize(window, &width, &height);
+    glfwSetWindowPos(window, x, y);
+    glfwSetKeyCallback(window, keyCallback);
+    glfwSetWindowSizeCallback(window, windowSizeCallback);
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(swapInterval);
+
+#ifdef GLEW_VERSION
+    if (glewInit() != GLEW_OK) {
+        cout << "failed to initialize GLEW library" << endl;
+        glfwTerminate();
+        return 1;
+    }
+#endif
+
+    world = new cWorld();
+    world->m_backgroundColor.setBlack();
+
+    camera = new cCamera(world);
+    world->addChild(camera);
+    camera->set(cVector3d(0.5, 0.0, 0.0), cVector3d(0.0, 0.0, 0.0), cVector3d(0.0, 0.0, 1.0));
+    camera->setClippingPlanes(0.02, 10.0);
+    camera->setStereoMode(stereoMode);
+    camera->setStereoEyeSeparation(0.005);
+    camera->setStereoFocalLength(0.5);
+    camera->setMirrorVertical(mirroredDisplay);
+
+    light = new cDirectionalLight(world);
+    world->addChild(light);
+    light->setEnabled(true);
+    light->setDir(-1.0, 0.0, 0.0);
+
+    cursor = new cShapeTorus(0.02, 0.03);
+    world->addChild(cursor);
+
+    velocity = new cShapeLine(cVector3d(0, 0, 0), cVector3d(0, 0, 0));
+    world->addChild(velocity);
+
+    handler = new cHapticDeviceHandler();
+    handler->getDevice(hapticDevice, 0);
+    hapticDevice->open();
+    cHapticDeviceInfo info = hapticDevice->getSpecifications();
+    hapticDevice->setEnableGripperUserSwitch(true);
+
+    font = NEW_CFONTCALIBRI20();
+
+    labelHapticDeviceModel = new cLabel(font);
+    camera->m_frontLayer->addChild(labelHapticDeviceModel);
+    labelHapticDeviceModel->setText(info.m_modelName);
+    labelHapticDeviceModel->m_fontColor.setBlue();
+
+    labelHapticDevicePosition = new cLabel(font);
+    camera->m_frontLayer->addChild(labelHapticDevicePosition);
+
+    labelRates = new cLabel(font);
+    camera->m_frontLayer->addChild(labelRates);
+
+    // Packet scopes in vertical column
+    scope6 = new cScope();
+    camera->m_frontLayer->addChild(scope6);
+    scope6->setLocalPos(800, 60);
+    scope6->setRange(0.0, 10.0); // Force: 0 to 10 N
+    scope6->setSignalEnabled(true);
+    scope6->setTransparencyLevel(0.3);
+    scope6->setSize(500, 350); // Increased height for 10 N range
+
+    scope7 = new cScope();
+    camera->m_frontLayer->addChild(scope7);
+    scope7->setLocalPos(800, 460); // Below scope6
+    scope7->setRange(0.0, 0.1); // Position: 0 to 0.1 m
+    scope7->setSignalEnabled(true);
+    scope7->setTransparencyLevel(0.3);
+    scope7->setSize(500, 300);
+
+    // Other scopes in vertical column to the right
+    scope0 = new cScope();
+    camera->m_frontLayer->addChild(scope0);
+    scope0->setLocalPos(1100, 60);
+    scope0->setRange(-0.1, 0.1);
+    scope0->setSignalEnabled(true);
+    scope0->setTransparencyLevel(0.3);
+    scope0->setSize(200, 150);
+    scope0->m_colorSignal0.setRed();
+
+    scope1 = new cScope();
+    camera->m_frontLayer->addChild(scope1);
+    scope1->setLocalPos(1100, 260);
+    scope1->setRange(-0.1, 0.1);
+    scope1->setSignalEnabled(true, true);
+    scope1->setTransparencyLevel(0.3);
+    scope1->setSize(200, 150);
+    scope1->m_colorSignal2.setGreen();
+    scope1->m_colorSignal0.setRed();
+
+    scope2 = new cScope();
+    camera->m_frontLayer->addChild(scope2);
+    scope2->setLocalPos(1100, 460);
+    scope2->setRange(-0.1, 0.1);
+    scope2->setSignalEnabled(true, true);
+    scope2->setTransparencyLevel(0.3);
+    scope2->setSize(200, 150);
+    scope2->m_colorSignal2.setGreen();
+    scope2->m_colorSignal0.setRed();
+
+    scope3 = new cScope();
+    camera->m_frontLayer->addChild(scope3);
+    scope3->setLocalPos(1100, 660);
+    scope3->setRange(-10, 10);
+    scope3->setSignalEnabled(true, true);
+    scope3->setTransparencyLevel(0.3);
+    scope3->setSize(200, 150);
+    scope3->m_colorSignal2.setGreen();
+    scope3->m_colorSignal0.setRed();
+
+    scope4 = new cScope();
+    camera->m_frontLayer->addChild(scope4);
+    scope4->setLocalPos(1100, 860);
+    scope4->setRange(-10, 10);
+    scope4->setSignalEnabled(true, true);
+    scope4->setTransparencyLevel(0.3);
+    scope4->setSize(200, 150);
+    scope4->m_colorSignal2.setGreen();
+    scope4->m_colorSignal0.setRed();
+
+    scope5 = new cScope();
+    camera->m_frontLayer->addChild(scope5);
+    scope5->setLocalPos(1100, 1060);
+    scope5->setRange(-10, 10);
+    scope5->setSignalEnabled(true, true);
+    scope5->setTransparencyLevel(0.3);
+    scope5->setSize(200, 150);
+    scope5->m_colorSignal2.setGreen();
+    scope5->m_colorSignal0.setRed();
+
+    leveldelay = new cLevel();
+    camera->m_frontLayer->addChild(leveldelay);
+    leveldelay->setLocalPos(60, 460); // Moved down
+    leveldelay->setRange(0.0, 200);
+    leveldelay->setWidth(40);
+    leveldelay->setNumIncrements(50);
+    leveldelay->setSingleIncrementDisplay(false);
+    leveldelay->setTransparencyLevel(0.7);
+
+    Server2 = Server.substr(0, 14);
+    if (Server2 == "192.168.4.3") {
+        labelMax = new cLabel(font);
+        camera->m_frontLayer->addChild(labelMax);
+        labelMax->setText("Teleoperation running over WAN");
+        labelMax->setLocalPos(20, height - 220);
+        labelMax->m_fontColor.setWhite();
+    }
+    else if (Server2 == "172" || Server2 == "127") {
+        labelMax = new cLabel(font);
+        camera->m_frontLayer->addChild(labelMax);
+        labelMax->setText("Teleoperation running over LAN");
+        labelMax->setLocalPos(20, height - 220);
+        labelMax->m_fontColor.setWhite();
+    }
+    else {
+        labelMax = new cLabel(font);
+        camera->m_frontLayer->addChild(labelMax);
+        labelMax->setText("Teleoperation running over LAN");
+        labelMax->setLocalPos(20, height - 220);
+    }
+
+    // Labels for packet scopes
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Incoming Packets (Force)");
+    scopename->setLocalPos(800, 430); // Below scope6
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Outgoing Packets (Position)");
+    scopename->setLocalPos(800, 830); // Below scope7
+
+    // Y-axis scales for scope6 (force, 0 to 10 N)
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0 N");
+    scopename->setLocalPos(770, 60);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("5 N");
+    scopename->setLocalPos(770, 235);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("10 N");
+    scopename->setLocalPos(770, 410);
+
+    // Y-axis scales for scope7 (position, 0 to 0.1 m)
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0 m");
+    scopename->setLocalPos(770, 460);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0.05 m");
+    scopename->setLocalPos(770, 610);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0.1 m");
+    scopename->setLocalPos(770, 760);
+
+    // X-axis scales for scope6 (time, 0 to 5 s)
+    for (int i = 0; i <= 5; i++) {
+        scopename = new cLabel(font);
+        camera->m_frontLayer->addChild(scopename);
+        scopename->setText(cStr(i) + " s");
+        scopename->setLocalPos(800 + i * 100, 40);
+    }
+    for (float i = 0.5; i < 5; i += 1.0) {
+        scopename = new cLabel(font);
+        camera->m_frontLayer->addChild(scopename);
+        scopename->setText(cStr(i));
+        scopename->setLocalPos(800 + i * 100, 20);
+        scopename->m_fontColor.setGray();
+    }
+
+    // X-axis scales for scope7 (time, 0 to 5 s)
+    for (int i = 0; i <= 5; i++) {
+        scopename = new cLabel(font);
+        camera->m_frontLayer->addChild(scopename);
+        scopename->setText(cStr(i) + " s");
+        scopename->setLocalPos(800 + i * 100, 440);
+    }
+    for (float i = 0.5; i < 5; i += 1.0) {
+        scopename = new cLabel(font);
+        camera->m_frontLayer->addChild(scopename);
+        scopename->setText(cStr(i));
+        scopename->setLocalPos(800 + i * 100, 420);
+        scopename->m_fontColor.setGray();
+    }
+
+    // Cycle state label
+    labelCycleState = new cLabel(font);
+    camera->m_frontLayer->addChild(labelCycleState);
+    labelCycleState->setText("Cycle: Sending");
+    labelCycleState->setLocalPos(800, 860); // Below scope7
+    labelCycleState->m_fontColor.setYellow();
+
+    // Labels for other scopes
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Xm(x)");
+    scopename->setLocalPos(1100, 230);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-0.1");
+    scopename->setLocalPos(1070, 210);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0.1");
+    scopename->setLocalPos(1070, 60);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Xm(y)");
+    scopename->setLocalPos(1100, 430);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-0.1");
+    scopename->setLocalPos(1070, 410);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0.1");
+    scopename->setLocalPos(1070, 260);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Xm(z)");
+    scopename->setLocalPos(1100, 630);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-0.1");
+    scopename->setLocalPos(1070, 610);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("0.1");
+    scopename->setLocalPos(1070, 460);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Forces(x)");
+    scopename->setLocalPos(1100, 830);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-10");
+    scopename->setLocalPos(1070, 810);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("10");
+    scopename->setLocalPos(1070, 660);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Forces(y)");
+    scopename->setLocalPos(1100, 1030);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-10");
+    scopename->setLocalPos(1070, 1010);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("10");
+    scopename->setLocalPos(1070, 860);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("Forces(z)");
+    scopename->setLocalPos(1100, 1230);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("-10");
+    scopename->setLocalPos(1070, 1210);
+
+    scopename = new cLabel(font);
+    camera->m_frontLayer->addChild(scopename);
+    scopename->setText("10");
+    scopename->setLocalPos(1070, 1060);
+
+    labelXd_Prev = new cLabel(font);
+    labelXd = new cLabel(font);
+    labelX_Recv = new cLabel(font);
+    labelFd = new cLabel(font);
+    labelSlave_force = new cLabel(font);
+    labeldFe = new cLabel(font);
+    labelIP = new cLabel(font);
+    labelProjFOR = new cLabel(font);
+    labelDelay = new cLabel(font);
+    labelc1 = new cLabel(font);
+    labelc2 = new cLabel(font);
+    labelbuff = new cLabel(font);
+
+    camera->m_frontLayer->addChild(labelXd_Prev);
+    camera->m_frontLayer->addChild(labelXd);
+    camera->m_frontLayer->addChild(labelX_Recv);
+    camera->m_frontLayer->addChild(labelFd);
+    camera->m_frontLayer->addChild(labelSlave_force);
+    camera->m_frontLayer->addChild(labeldFe);
+    camera->m_frontLayer->addChild(labelIP);
+    camera->m_frontLayer->addChild(labelProjFOR);
+    camera->m_frontLayer->addChild(labelDelay);
+    camera->m_frontLayer->addChild(labelc1);
+    camera->m_frontLayer->addChild(labelc2);
+    camera->m_frontLayer->addChild(labelbuff);
+
+    labelIP->setText("Server IP: ");
+    labelIP->setLocalPos(20, height - 60);
+    labelIP->m_fontColor.setBlueLight();
+
+    labelXd->setText("Master Pos: ");
+    labelXd->setLocalPos(20, height - 100);
+    labelXd->m_fontColor.setOrange();
+
+    labelX_Recv->setText("Slave Pos:   ");
+    labelX_Recv->setLocalPos(20, height - 120);
+    labelX_Recv->m_fontColor.setGreen();
+
+    labelFd->setText("Master Force: ");
+    labelFd->setLocalPos(20, height - 140);
+    labelFd->m_fontColor.setRed();
+
+    labelSlave_force->setText("Slave Force: ");
+    labelSlave_force->setLocalPos(20, height - 160);
+    labelSlave_force->m_fontColor.setBlueLight();
+
+    labeldFe->setText("EBA Force: ");
+    labeldFe->setLocalPos(20, height - 180);
+    labeldFe->m_fontColor.setWhite();
+
+    labelProjFOR->setText("ProjFOR: ");
+    labelProjFOR->setLocalPos(20, height - 200);
+    labelProjFOR->m_fontColor.setPink();
+
+    labelRates->setText("Frequency: ");
+    labelRates->setLocalPos(100, height - 160);
+    labelRates->m_fontColor.setWhite();
+
+    labelDelay->setText("Delay: ");
+    labelDelay->setLocalPos(20, height - 220);
+    labelDelay->m_fontColor.setGray();
+
+    labelc1->setText("c1 : ");
+    labelc1->setLocalPos(20, height - 240);
+    labelc1->m_fontColor.setGray();
+
+    labelc2->setText("c2 : ");
+    labelc2->setLocalPos(20, height - 260);
+    labelc2->m_fontColor.setGray();
+
+    hapticsThread = new cThread();
+    hapticsThread->start(updateHaptics, CTHREAD_PRIORITY_HAPTICS);
+
+    atexit(close);
+
+    windowSizeCallback(window, width, height);
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwGetWindowSize(window, &width, &height);
+        updateGraphics();
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+        freqCounterGraphics.signal(1);
+    }
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
+
+void updateGraphics(void) {
+    labelHapticDevicePosition->setText(hapticDevicePosition.str(3));
+    labelRates->setText(cStr(freqCounterGraphics.getFrequency(), 0) + " Hz / " + cStr(freqCounterHaptics.getFrequency(), 0) + " Hz");
+    labelRates->setLocalPos((int)(0.5 * (width - labelRates->getWidth())), 15);
+
+    // Update packet signals
+    auto now = chrono::high_resolution_clock::now();
+    double time_since_last_delayed = chrono::duration<float>(now - last_delayed_force_time).count();
+    double time_since_last_out = chrono::duration<float>(now - last_packet_out_time).count();
+    double in_signal = (cycleState == APPLYING && time_since_last_delayed < pulse_duration) ? delayed_force_magnitude : 0.0;
+    double out_signal = (cycleState == SENDING && time_since_last_out < pulse_duration) ? packet_out_magnitude : 0.0;
+
+    scope0->setSignalValues(hapticDevicePosition.x(), ReadData[3]);
+    scope1->setSignalValues(hapticDevicePosition.y(), ReadData[4]);
+    scope2->setSignalValues(hapticDevicePosition.z(), ReadData[5]);
+    scope3->setSignalValues(ProjFOR[0], -ReadData[0]);
+    scope4->setSignalValues(ProjFOR[1], -ReadData[1]);
+    scope5->setSignalValues(ProjFOR[2], -ReadData[2]);
+    scope6->setSignalValues(in_signal);
+    scope7->setSignalValues(out_signal);
+    leveldelay->setValue(TAP);
+
+    labelIP->setText("Client IP: " + string(inet_ntoa(clientaddr.sin_addr)) + ":" + cStr(ntohs(clientaddr.sin_port)));
+    labelXd->setText("Master Pos: " + cStr(pos_curr[0], 3U) + "  " + cStr(pos_curr[1], 3U) + "  " + cStr(pos_curr[2], 3U));
+    labelX_Recv->setText("Slave Pos:     " + cStr(pos_recv[0], 3U) + "  " + cStr(pos_recv[1], 3U) + "  " + cStr(pos_recv[2], 3U));
+    labelFd->setText("Master force: " + cStr(Fd[0], 3U) + "  " + cStr(Fd[1], 3U) + "  " + cStr(Fd[2], 3U));
+    labelSlave_force->setText("Slave force:    " + cStr(-ReadData[0], 3U) + "  " + cStr(-ReadData[1], 3U) + "  " + cStr(-ReadData[2], 3U));
+    labeldFe->setText("EBA force: " + cStr(dFe[0], 3U) + "  " + cStr(dFe[1], 3U) + "  " + cStr(dFe[2], 3U));
+    labelProjFOR->setText("Projected force: " + cStr(ProjFOR[0], 3U) + "  " + cStr(ProjFOR[1], 3U) + "  " + cStr(ProjFOR[2], 3U));
+    labelDelay->setText("Delay: " + cStr(abs(delay), 3U) + "ms");
+    labelc1->setText("c1: " + cStr(abs(c1), 3U));
+    labelc2->setText("c2: " + cStr(abs(c2), 3U));
+
+    // Update cycle state label
+    switch (cycleState) {
+    case SENDING:
+        labelCycleState->setText("Cycle: Sending");
+        break;
+    case BUFFERING:
+        labelCycleState->setText("Cycle: Buffering");
+        break;
+    case APPLYING:
+        labelCycleState->setText("Cycle: Applying");
+        break;
+    }
+
+    world->updateShadowMaps(false, mirroredDisplay);
+    camera->renderView(width, height);
+    glFinish();
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) cout << "Error:  %s\n" << gluErrorString(err);
+}
+
+void updateHaptics(void) {
+    simulationRunning = true;
+    simulationFinished = false;
+
+    while (simulationRunning) {
+        cVector3d position;
+        hapticDevice->getPosition(position);
+        cVector3d linearVelocity;
+        hapticDevice->getLinearVelocity(linearVelocity);
+
+        bool button0, button1, button2, button3;
+        button0 = button1 = button2 = button3 = false;
+        hapticDevice->getUserSwitch(0, button0);
+        hapticDevice->getUserSwitch(1, button1);
+        hapticDevice->getUserSwitch(2, button2);
+        hapticDevice->getUserSwitch(3, button3);
+
+        velocity->m_pointA = position;
+        velocity->m_pointB = cAdd(position, linearVelocity);
+        cursor->setLocalPos(position);
+
+        if (button0) {
+            cursor->m_material->setGreenMediumAquamarine();
+            TAP = 0;
+            c1 = 100;
+        }
+        else if (button1) {
+            cursor->m_material->setYellowGold();
+            TAP = max(TAP - 1, 0);
+        }
+        else if (button2) {
+            cursor->m_material->setOrangeCoral();
+            c1 += 0.1;
+        }
+        else if (button3) {
+            cursor->m_material->setPurpleLavender();
+            TAP += 1;
+        }
+        else {
+            cursor->m_material->setBlueRoyal();
+        }
+
+        hapticDevicePosition = position;
+        hapticDeviceVelocity = linearVelocity;
+
+        for (int i = 0; i < DOF; i++) {
+            pos_curr[i] = hapticDevicePosition(i);
+        }
+
+        auto now = chrono::high_resolution_clock::now();
+
+        // State machine for packet cycle
+        switch (cycleState) {
+        case SENDING:
+            if (send_count < PACKET_BATCH_SIZE) {
+                SendData[0] = pos_curr[0];
+                SendData[1] = pos_curr[1];
+                SendData[2] = pos_curr[2];
+                UDPSendData(SendData);
+                send_count++;
+                cout << "Sent packet #" << send_count << ", magnitude: " << packet_out_magnitude << endl;
+            }
+            else {
+                cycleState = BUFFERING;
+            }
+            UDPReadData();
+            break;
+
+        case BUFFERING:
+            UDPReadData();
+            if (receive_count >= PACKET_BATCH_SIZE) {
+                cycleState = APPLYING;
+            }
+            break;
+
+        case APPLYING:
+            if (!force_buffer.empty()) {
+                ForcePacket packet = force_buffer.front();
+                Fd[0] = -packet.force[0];
+                Fd[1] = -packet.force[1];
+                Fd[2] = -packet.force[2];
+                delayed_force_magnitude = sqrt(packet.force[0] * packet.force[0] +
+                    packet.force[1] * packet.force[1] +
+                    packet.force[2] * packet.force[2]);
+                last_delayed_force_time = now;
+                force_buffer.pop_front();
+                cout << "Applied feedback packet, magnitude: " << delayed_force_magnitude << endl;
+            }
+            else {
+                cycleState = SENDING;
+                send_count = 0;
+                receive_count = 0;
+                force_buffer.clear();
+                cout << "Completed feedback application, starting new cycle" << endl;
+            }
+            break;
+        }
+
+        cVector3d force(0, 0, 0);
+        double gripperForce = 0.0;
+
+        if (useForceField) {
+            double Kp = c2;
+            cVector3d forceField = -Kp * position;
+            force.add(forceField);
+
+            for (int i = 0; i < 3; i++) {
+                pos_prev[i] = pos_curr[i];
+                XdP[i] = Xd[i];
+                Xd[i] = pos_curr[i];
+                DXd[i] = Xd[i] - XdP[i];
+            }
+
+            if (EnableEBA) {
+                for (int i = 0; i < 3; i++) {
+                    if (DXd[i] != 0) {
+                        uBETA[i] = BETA[i] = (Fd[i] - dFe[i]) / DXd[i];
+                        Bmax[i] = c2 - dFe[i] / DXd[i] + sqrt(dFe[i] * dFe[i] / DXd[i] / DXd[i] + c2 * c2);
+                        Bmin[i] = c2 - dFe[i] / DXd[i] - sqrt(dFe[i] * dFe[i] / DXd[i] / DXd[i] + c2 * c2);
+                        if (Bmax[i] > c1) Bmax[i] = c1;
+                        if (BETA[i] < Bmin[i]) BETA[i] = Bmin[i];
+                        if (BETA[i] > Bmax[i]) BETA[i] = Bmax[i];
+                    }
+                    else {
+                        uBETA[i] = BETA[i];
+                    }
+                    dFe[i] = dFe[i] + BETA[i] * DXd[i];
+
+                    if (nProjection) {
+                        FOR_Mag = sqrt(Fd[0] * Fd[0] + Fd[1] * Fd[1] + Fd[2] * Fd[2]);
+                        if (fabs(FOR_Mag) > 0.0) {
+                            UnitV[i] = Fd[i] / FOR_Mag;
+                        }
+                        else {
+                            UnitV[i] = 0.0;
+                        }
+                        InnerProduct = dFe[0] * UnitV[0] + dFe[1] * UnitV[1] + dFe[2] * UnitV[2];
+                        ProjFOR[i] = InnerProduct * UnitV[i];
+                        force(i) = -ProjFOR[i];
+                    }
+                }
+            }
+            else {
+                for (int i = 0; i < 3; i++) {
+                    dFe[i] = Fd[i];
+                    force(i) = -dFe[i];
+                }
+            }
+        }
+
+        hapticDevice->setForce(force);
+        freqCounterHaptics.signal(1);
+    }
+
+    simulationFinished = true;
+}
+
+void windowSizeCallback(GLFWwindow* a_window, int a_width, int a_height) {
+    width = a_width;
+    height = a_height;
+    labelHapticDevicePosition->setLocalPos(20, width - 60, 0);
+    labelHapticDeviceModel->setLocalPos(20, height - 40, 0);
+    labelIP->setLocalPos(20, height - 60);
+    labelMax->setLocalPos(20, height - 80);
+    labelXd->setLocalPos(20, height - 100);
+    labelX_Recv->setLocalPos(20, height - 120);
+    labelFd->setLocalPos(20, height - 140);
+    labelSlave_force->setLocalPos(20, height - 160);
+    labeldFe->setLocalPos(20, height - 180);
+    labelProjFOR->setLocalPos(20, height - 200);
+    labelDelay->setLocalPos(20, height - 220);
+    labelc1->setLocalPos(20, height - 240);
+    labelc2->setLocalPos(20, height - 260);
+    labelCycleState->setLocalPos(800, 860);
+}
+
+void errorCallback(int a_error, const char* a_description) {
+    cout << "Error: " << a_description << endl;
+}
+
+void keyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action, int a_mods) {
+    if ((a_action != GLFW_PRESS) && (a_action != GLFW_REPEAT)) return;
+
+    if ((a_key == GLFW_KEY_ESCAPE) || (a_key == GLFW_KEY_Q)) {
+        glfwSetWindowShouldClose(a_window, GLFW_TRUE);
+    }
+
+    if (a_key == GLFW_KEY_1) {
+        useForceField = !useForceField;
+        cout << (useForceField ? "> Enable force field     \r" : "> Disable force field    \r");
+    }
+
+    if (a_key == GLFW_KEY_M) {
+        mirroredDisplay = !mirroredDisplay;
+        camera->setMirrorHorizontal(mirroredDisplay);
+    }
+
+    if (a_key == GLFW_KEY_F) {
+        fullscreen = !fullscreen;
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        if (fullscreen) {
+            glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+        }
+        else {
+            int w = 0.8 * mode->height;
+            int h = 0.5 * mode->height;
+            int x = 0.5 * (mode->width - w);
+            int y = 0.5 * (mode->height - h);
+            glfwSetWindowMonitor(window, NULL, x, y, w, h, mode->refreshRate);
+        }
+        glfwSwapInterval(swapInterval);
+    }
+}
+
+void close(void) {
+    CloseUDP();
+    simulationRunning = false;
+    while (!simulationFinished) cSleepMs(100);
+    hapticDevice->close();
+    delete hapticsThread;
+    delete world;
+    delete handler;
+}
+
+void InitUDP() {
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        MessageBox(NULL, "Socket Open Error!!", "UDP", MB_OK);
+    }
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == INVALID_SOCKET) err_quit("socket()");
+    u_long mode = 1; // Non-blocking
+    ioctlsocket(sock, FIONBIO, &mode);
+    ZeroMemory(&serveraddr, sizeof(serveraddr));
+    serveraddr.sin_family = AF_INET;
+    serveraddr.sin_port = htons(UDP_PORT);
+    serveraddr.sin_addr.s_addr = inet_addr(SERVER_IP);
+    retval = ::bind(sock, (SOCKADDR*)&serveraddr, sizeof(serveraddr));
+    if (retval == SOCKET_ERROR) {
+        err_quit("bind()");
+    }
+    // Initialize client address to same IP and port
+    ZeroMemory(&clientaddr, sizeof(clientaddr));
+    clientaddr.sin_family = AF_INET;
+    clientaddr.sin_port = htons(UDP_PORT);
+    clientaddr.sin_addr.s_addr = inet_addr(SERVER_IP);
+}
+
+void UDPSendData(float sData[SENDDATA_NUM]) {
+    Timer time;
+    sprintf(sbuf, "%f %f %f", sData[0], sData[1], sData[2]);
+    retval = sendto(sock, sbuf, strlen(sbuf), 0, (SOCKADDR*)&clientaddr, sizeof(clientaddr));
+    if (retval == SOCKET_ERROR) {
+        err_display("sendto()");
+        return;
+    }
+    packet_out_magnitude = sqrt(sData[0] * sData[0] + sData[1] * sData[1] + sData[2] * sData[2]);
+    last_packet_out_time = chrono::high_resolution_clock::now();
+    cout << "Sent packet #" << send_count + 1 << ", magnitude: " << packet_out_magnitude << endl;
+}
+
+void UDPReadData() {
+    Timer2 time;
+    addrlen = sizeof(clientaddr);
+    retval = recvfrom(sock, rbuf, BUFSIZE, 0, (SOCKADDR*)&clientaddr, &addrlen);
+    if (retval == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+        if (error == WSAEWOULDBLOCK) {
+            return;
+        }
+        err_display("recvfrom()");
+        return;
+    }
+    sscanf(rbuf, "%f %f %f", &ReadData[0], &ReadData[1], &ReadData[2]);
+    if (force_buffer.size() >= MAX_BUFFER_SIZE) {
+        force_buffer.pop_front();
+    }
+    ForcePacket packet;
+    packet.force[0] = ReadData[0];
+    packet.force[1] = ReadData[1];
+    packet.force[2] = ReadData[2];
+    packet.timestamp = chrono::high_resolution_clock::now();
+    force_buffer.push_back(packet);
+    packet_in_magnitude = sqrt(ReadData[0] * ReadData[0] + ReadData[1] * ReadData[1] + ReadData[2] * ReadData[2]);
+    last_packet_in_time = chrono::high_resolution_clock::now();
+    receive_count++;
+    cout << "Received feedback packet #" << receive_count << ", magnitude: " << packet_in_magnitude << endl;
+    delay = timeUDPS - timeUDPR;
+    countd++;
+    cSleepMs(TAP);
+}
+
+void CloseUDP() {
+    closesocket(sock);
+    WSACleanup();
+}
+
+void err_quit(const char* msg) {
+    LPVOID lpMsgBuf;
+    FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, NULL, WSAGetLastError(),
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&lpMsgBuf, 0, NULL);
+    MessageBox(NULL, (LPCTSTR)lpMsgBuf, msg, MB_ICONERROR);
+    LocalFree(lpMsgBuf);
+    exit(-1);
+}
+
+void err_display(const char* msg) {
+    LPVOID lpMsgBuf;
+    FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, NULL, WSAGetLastError(),
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&lpMsgBuf, 0, NULL);
+    printf("[%s] %s", msg, (LPCTSTR)lpMsgBuf);
+    LocalFree(lpMsgBuf);
+}
