@@ -1,0 +1,936 @@
+/*
+ * HapticServer.cpp
+ * ================
+ * SERVER side – runs on PC-A (has Novint Falcon #1).
+ *
+ * What this does:
+ *   1. Reads position from local Falcon at 1 kHz
+ *   2. Sends HapticPacket UDP to CLIENT_IP:4000 (if TX enabled)
+ *   3. Listens on 0.0.0.0:4000 for HapticPacket from client
+ *   4. Optionally applies received client force to local Falcon
+ *   5. Shows TWO candlestick charts side by side:
+ *        LEFT  = local haptic data  (what THIS Falcon is doing, SENT)
+ *        RIGHT = remote haptic data (what CLIENT Falcon is doing, RECEIVED)
+ *   6. Info panel: local x/y/z/mag, remote x/y/z/mag, net stats
+ *
+ * Controls:
+ *   T       Toggle sending data to client  (TX on/off)
+ *   R       Toggle receiving from client   (RX on/off)
+ *   F       Toggle force feedback to local Falcon from received data
+ *   +/-     Step candle window (1ms–1000ms)
+ *   [       1 ms window  (1000 bars/s max)
+ *   ]       1000 ms window (1 bar/s min)
+ *   N       Toggle network entirely
+ *   ESC     Quit
+ *
+ * Wire protocol (UDP port 4000, same struct both directions):
+ *   double  ts      8 bytes  ms since sender start
+ *   float   x       4 bytes  metres
+ *   float   y       4 bytes  metres
+ *   float   z       4 bytes  metres
+ *   float   mag     4 bytes  metres
+ *   float   fx      4 bytes  force X  N  (0 if no feedback)
+ *   float   fy      4 bytes  force Y  N
+ *   float   fz      4 bytes  force Z  N
+ *   uint8   btn     1 byte   button bitmask
+ *   uint8   flags   1 byte   bit0=hasFeedback
+ *   ── total: 38 bytes ──
+ *
+ * Build: drop into CHAI3D GLFW example folder, replace existing .cpp.
+ * Extra dep: ws2_32.lib  (added via #pragma comment below)
+ *
+ * Set CLIENT_IP at the top of this file before building.
+ * The server's own IP is detected at runtime and shown in the console + HUD.
+ */
+
+ // ─── Windows ──────────────────────────────────────────────────────────────────
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <windows.h>
+#include <mmsystem.h>
+#pragma comment(lib,"winmm.lib")
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib,"ws2_32.lib")
+#include <iphlpapi.h>
+#pragma comment(lib,"iphlpapi.lib")
+
+// ─── CHAI3D ───────────────────────────────────────────────────────────────────
+#include "chai3d.h"
+using namespace chai3d;
+
+// ─── OpenGL / GLFW ────────────────────────────────────────────────────────────
+#include <GLFW/glfw3.h>
+
+// ─── Standard library ─────────────────────────────────────────────────────────
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  *** CONFIGURATION – SET THESE BEFORE BUILDING ***
+// ═════════════════════════════════════════════════════════════════════════════
+namespace cfg
+{
+    // IP of the CLIENT machine (PC-B).  Change to match your LAN.
+    // For direct LAN cable: typically 192.168.x.x
+    static const char* CLIENT_IP = "192.168.0.125";   // <-- SET THIS
+
+    constexpr uint16_t NET_PORT = 4000;    // UDP port both directions
+    constexpr int      WIN_W = 1400;
+    constexpr int      WIN_H = 860;
+    constexpr int      VISIBLE = 50;
+    constexpr int      MAX_CANDLES = 52;
+    constexpr double   CANDLE_MS_DEF = 20.0;
+    constexpr double   CANDLE_MS_MIN = 1.0;
+    constexpr double   CANDLE_MS_MAX = 1000.0;
+    constexpr float    YMIN = 0.000f;
+    constexpr float    YMAX = 0.075f;
+    constexpr float    YMID = (YMIN + YMAX) * 0.5f;
+    constexpr int      Y_DIVS = 6;
+    constexpr double   HAPTIC_HZ = 1000.0;
+    constexpr double   FORCE_MAX = 3.0;
+    constexpr double   FORCE_FB_K = 50.0;   // N/m – spring gain for feedback force
+    constexpr int      RING_SZ = 4096;   // must be power of 2
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  WIRE PACKET  (38 bytes, packed, little-endian)
+// ═════════════════════════════════════════════════════════════════════════════
+#pragma pack(push,1)
+struct HapticPacket
+{
+    double  ts;              // ms since sender start
+    float   x, y, z;      // position  (metres)
+    float   mag;             // sqrt(x²+y²+z²)
+    float   fx, fy, fz;     // force feedback (N)  – zero if unused
+    uint8_t btn;             // button bitmask
+    uint8_t flags;           // bit0 = hasFeedback
+};
+#pragma pack(pop)
+static_assert(sizeof(HapticPacket) == 38, "packet size");
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  LOCAL SAMPLE + CANDLE
+// ═════════════════════════════════════════════════════════════════════════════
+struct Sample { double ts; float x, y, z, mag; uint8_t btn; };
+
+struct Candle
+{
+    double t0, t1;
+    float  open, close, high, low;
+    bool   bull;
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  LOCK-FREE SPSC RING
+// ═════════════════════════════════════════════════════════════════════════════
+template<typename T, int N>
+struct Ring
+{
+    static_assert((N& (N - 1)) == 0, "power of 2");
+    alignas(64) std::atomic<int> head{ 0 };
+    alignas(64) std::atomic<int> tail{ 0 };
+    std::array<T, N> buf{};
+    bool push(const T& v) {
+        int h = head.load(std::memory_order_relaxed);
+        int n = (h + 1) & (N - 1);
+        if (n == tail.load(std::memory_order_acquire)) return false;
+        buf[h] = v; head.store(n, std::memory_order_release); return true;
+    }
+    bool pop(T& o) {
+        int t = tail.load(std::memory_order_relaxed);
+        if (t == head.load(std::memory_order_acquire)) return false;
+        o = buf[t]; tail.store((t + 1) & (N - 1), std::memory_order_release); return true;
+    }
+    int size() const {
+        int h = head.load(std::memory_order_acquire);
+        int t = tail.load(std::memory_order_acquire);
+        return (h - t + N) & (N - 1);
+    }
+};
+
+struct Timer {
+    LARGE_INTEGER freq, start;
+    Timer() { QueryPerformanceFrequency(&freq); reset(); }
+    void reset() { QueryPerformanceCounter(&start); }
+    double ms() const {
+        LARGE_INTEGER n; QueryPerformanceCounter(&n);
+        return double(n.QuadPart - start.QuadPart) * 1000.0 / double(freq.QuadPart);
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  APPLICATION STATE
+// ═════════════════════════════════════════════════════════════════════════════
+struct App
+{
+    std::atomic<bool>     running{ true };
+    Timer                 clock;
+
+    // ── Local (TX) pipeline ──────────────────────────────────────────────
+    Ring<Sample, cfg::RING_SZ> localRing;   // haptic → aggregator
+    Ring<HapticPacket, 512>    txRing;      // haptic → net TX
+
+    std::mutex            localMtx;
+    std::deque<Candle>    localCandles;
+    Candle                localLive{};
+    bool                  localLiveOpen{ false };
+
+    std::atomic<float>    lx{ 0 }, ly{ 0 }, lz{ 0 }, lmag{ 0 };
+    std::atomic<double>   lts{ 0 };
+    std::atomic<uint8_t>  lbtn{ 0 };
+
+    // ── Remote (RX) pipeline ─────────────────────────────────────────────
+    Ring<HapticPacket, cfg::RING_SZ> rxRing; // net RX → aggregator
+    Ring<HapticPacket, 256>          fbRing; // net RX → haptic force
+
+    std::mutex            remoteMtx;
+    std::deque<Candle>    remoteCandles;
+    Candle                remoteLive{};
+    bool                  remoteLiveOpen{ false };
+
+    std::atomic<float>    rx_{ 0 }, ry_{ 0 }, rz_{ 0 }, rmag{ 0 };
+    std::atomic<double>   rts{ 0 };
+
+    // ── Controls ─────────────────────────────────────────────────────────
+    std::atomic<bool>     txEnabled{ true };    // T – send local data to client
+    std::atomic<bool>     rxEnabled{ true };    // R – receive from client
+    std::atomic<bool>     fbEnabled{ false };   // F – apply remote force locally
+    std::atomic<double>   candleMs{ cfg::CANDLE_MS_DEF };
+
+    // ── Stats ─────────────────────────────────────────────────────────────
+    std::atomic<uint64_t> pktsSent{ 0 }, pktsRecv{ 0 };
+    std::atomic<double>   lastRxMs{ 0 };       // timestamp of last received pkt
+
+    bool  demoMode{ false };
+    char  localIP[64]{ "unknown" };
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  IP DETECTION  (first non-loopback IPv4)
+// ═════════════════════════════════════════════════════════════════════════════
+static void detectLocalIP(char* buf, int len)
+{
+    // Use a UDP connect trick – doesn't send anything, just routes
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) { strncpy(buf, "unknown", len); return; }
+    sockaddr_in remote{};
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(80);
+    inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
+    if (connect(s, (sockaddr*)&remote, sizeof(remote)) == 0) {
+        sockaddr_in local{}; int ls = sizeof(local);
+        getsockname(s, (sockaddr*)&local, &ls);
+        inet_ntop(AF_INET, &local.sin_addr, buf, len);
+    }
+    else { strncpy(buf, "unknown", len); }
+    closesocket(s);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  HAPTIC THREAD  (TIME_CRITICAL)
+// ═════════════════════════════════════════════════════════════════════════════
+void hapticThread(App& app)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    timeBeginPeriod(1);
+
+    cHapticDeviceHandler handler;
+    cGenericHapticDevicePtr dev;
+    handler.getDevice(dev, 0);
+
+    bool has = (dev != nullptr);
+    if (has) { dev->open(); dev->calibrate(); }
+    else { app.demoMode = true; printf("[HAPTIC] Demo mode.\n"); }
+
+    const double periodUs = 1000000.0 / cfg::HAPTIC_HZ;
+    cVector3d zeroF(0, 0, 0);
+    double demoPhase = 0.0;
+    int    txCounter = 0;
+
+    while (app.running)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        float x, y, z, mag; uint8_t btn = 0;
+
+        if (has)
+        {
+            cVector3d pos; dev->getPosition(pos);
+            x = (float)pos.x(); y = (float)pos.y(); z = (float)pos.z();
+            mag = (float)pos.length();
+            bool b[4]{}; for (int i = 0; i < 4; ++i) dev->getUserSwitch(i, b[i]);
+            btn = (b[0] ? 1 : 0) | (b[1] ? 2 : 0) | (b[2] ? 4 : 0) | (b[3] ? 8 : 0);
+
+            // Apply feedback force from remote client (if enabled)
+            cVector3d applyF = zeroF;
+            if (app.fbEnabled)
+            {
+                HapticPacket fp{};
+                // drain all, keep most recent
+                HapticPacket tmp{};
+                while (app.fbRing.pop(tmp)) fp = tmp;
+                if (fp.flags & 0x01)
+                {
+                    // Scale remote position delta into a force
+                    cVector3d remPos(fp.x, fp.y, fp.z);
+                    cVector3d locPos(x, y, z);
+                    applyF = (remPos - locPos) * cfg::FORCE_FB_K;
+                    double fl = applyF.length();
+                    if (fl > cfg::FORCE_MAX && fl > 0.0) applyF *= (cfg::FORCE_MAX / fl);
+                }
+            }
+            dev->setForce(applyF);
+        }
+        else
+        {
+            demoPhase += (2.0 * M_PI) / cfg::HAPTIC_HZ;
+            x = 0.035f * (float)sin(demoPhase);
+            y = 0.025f * (float)cos(demoPhase * 1.37);
+            z = 0.018f * (float)sin(demoPhase * 0.73 + 1.0) + 0.010f * (float)sin(demoPhase * 4.1);
+            mag = sqrtf(x * x + y * y + z * z);
+        }
+
+        Sample s{ app.clock.ms(),x,y,z,mag,btn };
+        app.localRing.push(s);
+
+        // Push to TX ring every sample (network thread throttles)
+        if (app.txEnabled)
+        {
+            HapticPacket p{};
+            p.ts = s.ts; p.x = x; p.y = y; p.z = z; p.mag = mag;
+            p.fx = 0; p.fy = 0; p.fz = 0;
+            p.btn = btn; p.flags = 0;
+            app.txRing.push(p);
+        }
+
+        app.lx.store(x, std::memory_order_relaxed);
+        app.ly.store(y, std::memory_order_relaxed);
+        app.lz.store(z, std::memory_order_relaxed);
+        app.lmag.store(mag, std::memory_order_relaxed);
+        app.lbtn.store(btn, std::memory_order_relaxed);
+        app.lts.store(s.ts, std::memory_order_relaxed);
+
+        auto target = t0 + std::chrono::microseconds((long long)periodUs);
+        while (std::chrono::high_resolution_clock::now() < target) _mm_pause();
+    }
+    if (has) dev->close();
+    timeEndPeriod(1);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  AGGREGATOR  (builds candles from both local and remote streams)
+// ═════════════════════════════════════════════════════════════════════════════
+static void aggregateStream(
+    Ring<Sample, cfg::RING_SZ>& ring,
+    std::mutex& mtx,
+    std::deque<Candle>& candles,
+    Candle& live, bool& liveOpen,
+    double& winOpen, float& cO, float& cC, float& cH, float& cL,
+    bool& started,
+    double& jMean, double& jJit, double& jLast,
+    double durMs)
+{
+    Sample s{};
+    bool any = false;
+    while (ring.pop(s)) {
+        any = true; float mag = s.mag;
+        if (jLast > 0.0) {
+            double iv = s.ts - jLast, dv = fabs(iv - jMean);
+            jMean += 0.01 * (iv - jMean); jJit += 0.01 * (dv - jJit);
+        }
+        jLast = s.ts;
+        double adaptDur = durMs * (1.0 + std::min(jJit / 2.0, 2.0));
+        if (!started) { winOpen = s.ts; cO = cC = cH = cL = mag; started = true; }
+        else {
+            cC = mag; if (mag > cH) cH = mag; if (mag < cL) cL = mag;
+            if (s.ts - winOpen >= adaptDur) {
+                Candle c{ winOpen,s.ts,cO,cC,cH,cL,(cC > cO) };
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    candles.push_back(c);
+                    if ((int)candles.size() > cfg::MAX_CANDLES) candles.pop_front();
+                }
+                started = false;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            live = { winOpen,s.ts,cO,cC,cH,cL,(cC > cO) };
+            liveOpen = started;
+        }
+    }
+}
+
+// Remote stream needs a converter from HapticPacket → Sample
+static Ring<Sample, cfg::RING_SZ> g_remoteAssamples;
+
+void aggregatorThread(App& app)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    // Local state
+    double lwO = 0; float lcO = 0, lcC = 0, lcH = 0, lcL = 1e9f; bool lSt = false;
+    double ljM = 1, ljJ = 0, ljL = 0;
+    // Remote state
+    double rwO = 0; float rcO = 0, rcC = 0, rcH = 0, rcL = 1e9f; bool rSt = false;
+    double rjM = 1, rjJ = 0, rjL = 0;
+
+    while (app.running)
+    {
+        double dur = app.candleMs.load();
+
+        // ── local ─────────────────────────────────────────────────────────
+        aggregateStream(app.localRing, app.localMtx, app.localCandles,
+            app.localLive, app.localLiveOpen,
+            lwO, lcO, lcC, lcH, lcL, lSt, ljM, ljJ, ljL, dur);
+
+        // ── remote: drain rxRing → g_remoteAssamples ──────────────────────
+        HapticPacket rp{};
+        while (app.rxRing.pop(rp))
+        {
+            // Also push to fbRing for haptic force
+            app.fbRing.push(rp);
+            // Update remote HUD atomics
+            app.rx_.store(rp.x, std::memory_order_relaxed);
+            app.ry_.store(rp.y, std::memory_order_relaxed);
+            app.rz_.store(rp.z, std::memory_order_relaxed);
+            app.rmag.store(rp.mag, std::memory_order_relaxed);
+            app.rts.store(rp.ts, std::memory_order_relaxed);
+            app.lastRxMs.store(app.clock.ms(), std::memory_order_relaxed);
+
+            Sample rs{ rp.ts,rp.x,rp.y,rp.z,rp.mag,rp.btn };
+            g_remoteAssamples.push(rs);
+        }
+        aggregateStream(g_remoteAssamples, app.remoteMtx, app.remoteCandles,
+            app.remoteLive, app.remoteLiveOpen,
+            rwO, rcO, rcC, rcH, rcL, rSt, rjM, rjJ, rjL, dur);
+
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  NETWORK THREAD  (TX + RX on the same socket, non-blocking)
+// ═════════════════════════════════════════════════════════════════════════════
+void networkThread(App& app)
+{
+    WSADATA wsa{}; WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+    // Bind to listen on port 4000
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(cfg::NET_PORT);
+    local.sin_addr.s_addr = INADDR_ANY;
+    bind(sock, (sockaddr*)&local, sizeof(local));
+
+    // Non-blocking
+    u_long nb = 1; ioctlsocket(sock, FIONBIO, &nb);
+
+    // Destination = client
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(cfg::NET_PORT);
+    inet_pton(AF_INET, cfg::CLIENT_IP, &dst.sin_addr);
+
+    // TX: send every Nth sample to keep bandwidth reasonable
+    // At 1000 Hz → every 1 sample = 38 kB/s  (fine on LAN)
+    // We let the haptic thread control rate via txRing
+    HapticPacket pkt{};
+    int txThrottle = 0;
+
+    while (app.running)
+    {
+        // ── SEND ─────────────────────────────────────────────────────────
+        while (app.txEnabled && app.txRing.pop(pkt))
+        {
+            ++txThrottle;
+            // Send at most every 1ms worth = 1 pkt/ms → match haptic rate
+            // txRing drains naturally; send all
+            sendto(sock, (char*)&pkt, sizeof(pkt), 0, (sockaddr*)&dst, sizeof(dst));
+            app.pktsSent.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // ── RECEIVE ──────────────────────────────────────────────────────
+        if (app.rxEnabled)
+        {
+            HapticPacket rp{};
+            sockaddr_in from{};
+            int fl = sizeof(from);
+            int r = (int)recvfrom(sock, (char*)&rp, sizeof(rp), 0,
+                (sockaddr*)&from, &fl);
+            if (r == (int)sizeof(rp))
+            {
+                app.rxRing.push(rp);
+                app.pktsRecv.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        // Brief sleep to avoid 100% CPU on the network loop
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    closesocket(sock);
+    WSACleanup();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  PIXEL FONT  (5×7, no deps)
+// ═════════════════════════════════════════════════════════════════════════════
+static int g_fbW = 1400, g_fbH = 860;
+
+static const uint8_t GLYPHS[][5] = {
+    {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
+    {0x14,0x7F,0x14,0x7F,0x14},{0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},
+    {0x36,0x49,0x55,0x22,0x50},{0x00,0x05,0x03,0x00,0x00},{0x00,0x1C,0x22,0x41,0x00},
+    {0x00,0x41,0x22,0x1C,0x00},{0x08,0x2A,0x1C,0x2A,0x08},{0x08,0x08,0x3E,0x08,0x08},
+    {0x00,0x50,0x30,0x00,0x00},{0x08,0x08,0x08,0x08,0x08},{0x00,0x60,0x60,0x00,0x00},
+    {0x20,0x10,0x08,0x04,0x02},{0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},
+    {0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},{0x18,0x14,0x12,0x7F,0x10},
+    {0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},{0x00,0x36,0x36,0x00,0x00},
+    {0x00,0x56,0x36,0x00,0x00},{0x00,0x08,0x14,0x22,0x41},{0x14,0x14,0x14,0x14,0x14},
+    {0x41,0x22,0x14,0x08,0x00},{0x02,0x01,0x51,0x09,0x06},{0x30,0x49,0x79,0x41,0x3E},
+    {0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},{0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},
+    {0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},
+    {0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x04,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},
+    {0x1F,0x20,0x40,0x20,0x1F},{0x3F,0x40,0x38,0x40,0x3F},{0x63,0x14,0x08,0x14,0x63},
+    {0x03,0x04,0x78,0x04,0x03},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7F,0x41,0x41,0x00},
+    {0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7F,0x00},{0x04,0x02,0x01,0x02,0x04},
+    {0x40,0x40,0x40,0x40,0x40},{0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},
+    {0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},{0x38,0x44,0x44,0x48,0x7F},
+    {0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x08,0x14,0x54,0x54,0x3C},
+    {0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},
+    {0x00,0x7F,0x10,0x28,0x44},{0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},
+    {0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},{0x7C,0x14,0x14,0x14,0x08},
+    {0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
+    {0x04,0x3F,0x44,0x40,0x20},{0x3C,0x40,0x40,0x40,0x7C},{0x1C,0x20,0x40,0x20,0x1C},
+    {0x3C,0x40,0x30,0x40,0x3C},{0x44,0x28,0x10,0x28,0x44},{0x0C,0x50,0x50,0x50,0x3C},
+    {0x44,0x64,0x54,0x4C,0x44},{0x00,0x08,0x36,0x41,0x00},{0x00,0x00,0x7F,0x00,0x00},
+    {0x00,0x41,0x36,0x08,0x00},{0x08,0x04,0x08,0x10,0x08},
+};
+
+static const int FS = 2; // font scale
+static const int GW = 5 * FS, GH = 7 * FS, GGAP = 1 * FS;
+
+static void drawTextPx(float px, float py, const char* str,
+    float r = 1, float g2 = 1, float b = 1, float a = 1)
+{
+    if (!str || !str[0]) return;
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glOrtho(0, g_fbW, 0, g_fbH, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glColor4f(r, g2, b, a);
+    glBegin(GL_QUADS);
+    float cx = px;
+    for (const char* p = str; *p; ++p) {
+        int c = (unsigned char)*p;
+        if (c < 32 || c>126) { cx += GW + GGAP; continue; }
+        const uint8_t* col = GLYPHS[c - 32];
+        for (int ci = 0; ci < 5; ++ci) {
+            uint8_t bits = col[ci];
+            for (int ri = 0; ri < 7; ++ri) {
+                if (bits & (1 << ri)) {
+                    float x0 = cx + ci * FS, y0 = py + (6 - ri) * FS;
+                    float x1 = x0 + FS, y1 = y0 + FS;
+                    glVertex2f(x0, y0); glVertex2f(x1, y0);
+                    glVertex2f(x1, y1); glVertex2f(x0, y1);
+                }
+            }
+        }
+        cx += GW + GGAP;
+    }
+    glEnd();
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glMatrixMode(GL_MODELVIEW); glPopMatrix();
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  RENDER HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+static void fillRect(float x0, float y0, float x1, float y1,
+    float r, float g2, float b, float a = 1)
+{
+    glColor4f(r, g2, b, a);
+    glBegin(GL_QUADS);
+    glVertex2f(x0, y0); glVertex2f(x1, y0);
+    glVertex2f(x1, y1); glVertex2f(x0, y1);
+    glEnd();
+}
+
+static inline float yOf(float m, float yb, float yt) {
+    float t = (m - cfg::YMIN) / (cfg::YMAX - cfg::YMIN);
+    return yb + t * (yt - yb);
+}
+
+static void drawCandle(float xc, float hw, float oY, float clY,
+    float hY, float lY, bool bull, float alpha)
+{
+    if (bull) glColor4f(0.114f, 0.722f, 0.416f, alpha);
+    else     glColor4f(0.902f, 0.220f, 0.220f, alpha);
+    float top = std::max(oY, clY), bot = std::min(oY, clY);
+    float bh = top - bot; if (bh < 0.0010f) bh = 0.0010f;
+    glBegin(GL_QUADS);
+    glVertex2f(xc - hw, bot); glVertex2f(xc + hw, bot);
+    glVertex2f(xc + hw, bot + bh); glVertex2f(xc - hw, bot + bh);
+    glEnd();
+    glLineWidth(1.4f);
+    glBegin(GL_LINES);
+    glVertex2f(xc, bot + bh); glVertex2f(xc, hY);
+    glVertex2f(xc, bot);   glVertex2f(xc, lY);
+    glEnd();
+}
+
+// Draw one complete chart panel in the given X band [panelL..panelR] normalised
+static void drawChart(
+    const std::deque<Candle>& snap, bool liveOpen,
+    float liveMag,
+    float panelL, float panelR,
+    float MB_n, float MT_n,
+    const char* title, float tr, float tg, float tb)
+{
+    float CW = panelR - panelL, CH = MT_n - MB_n;
+    float slot = CW / (float)cfg::VISIBLE;
+    float hw = slot * 0.34f;
+    int nTotal = (int)snap.size();
+
+    // Background
+    fillRect(panelL, MB_n, panelR, MT_n, 0.09f, 0.11f, 0.15f);
+
+    // Grid
+    glLineWidth(0.5f); glColor4f(0.25f, 0.29f, 0.38f, 0.6f);
+    glBegin(GL_LINES);
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) {
+        float gy = MB_n + CH * ((float)i / cfg::Y_DIVS);
+        glVertex2f(panelL, gy); glVertex2f(panelR, gy);
+    }
+    for (int i = 0; i <= cfg::VISIBLE; i += 5) {
+        float gx = panelL + slot * i;
+        glVertex2f(gx, MB_n); glVertex2f(gx, MT_n);
+    }
+    glEnd();
+
+    // Mid-axis
+    float midY = yOf(cfg::YMID, MB_n, MT_n);
+    glLineWidth(1.2f); glColor4f(0.45f, 0.55f, 0.75f, 0.85f);
+    glEnable(GL_LINE_STIPPLE); glLineStipple(1, 0xF0F0);
+    glBegin(GL_LINES);
+    glVertex2f(panelL, midY); glVertex2f(panelR, midY);
+    glEnd();
+    glDisable(GL_LINE_STIPPLE);
+
+    // Y ticks + labels
+    glLineWidth(1.0f); glColor4f(0.50f, 0.55f, 0.65f, 0.8f);
+    glBegin(GL_LINES);
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) {
+        float gy = MB_n + CH * ((float)i / cfg::Y_DIVS);
+        glVertex2f(panelL, gy); glVertex2f(panelL - 0.012f, gy);
+    }
+    glEnd();
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) {
+        float frac = (float)i / cfg::Y_DIVS;
+        float val = cfg::YMIN + frac * (cfg::YMAX - cfg::YMIN);
+        float gy = MB_n + CH * frac;
+        char lb[12]; snprintf(lb, sizeof(lb), "%.1f", val * 1000.0f);
+        drawTextPx((panelL - 0.065f) * g_fbW, gy * g_fbH - 7, lb, 0.55f, 0.60f, 0.72f);
+    }
+    drawTextPx((panelL - 0.065f) * g_fbW, MT_n * g_fbH + 8, "mm", 0.45f, 0.50f, 0.62f);
+
+    // Candles
+    for (int si = 0; si < cfg::VISIBLE; ++si) {
+        int ci = nTotal - cfg::VISIBLE + si;
+        if (ci < 0) continue;
+        const Candle& c = snap[ci];
+        float xc = panelL + (si + 0.5f) * slot;
+        drawCandle(xc, hw,
+            yOf(c.open, MB_n, MT_n), yOf(c.close, MB_n, MT_n),
+            yOf(c.high, MB_n, MT_n), yOf(c.low, MB_n, MT_n),
+            c.bull, (ci == nTotal - 1 && liveOpen) ? 0.55f : 1.0f);
+    }
+
+    // Live crosshair
+    float cy = yOf(liveMag, MB_n, MT_n);
+    cy = std::max(MB_n + 0.001f, std::min(MT_n - 0.001f, cy));
+    glLineWidth(1.0f); glColor4f(1.0f, 0.85f, 0.20f, 0.80f);
+    glEnable(GL_LINE_STIPPLE); glLineStipple(2, 0xAAAA);
+    glBegin(GL_LINES); glVertex2f(panelL, cy); glVertex2f(panelR, cy); glEnd();
+    glDisable(GL_LINE_STIPPLE);
+
+    // Frame
+    glLineWidth(1.2f); glColor3f(0.40f, 0.44f, 0.54f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(panelL, MB_n); glVertex2f(panelR, MB_n);
+    glVertex2f(panelR, MT_n); glVertex2f(panelL, MT_n);
+    glEnd();
+
+    // X-axis ticks + timestamps
+    glLineWidth(1.0f); glColor3f(0.40f, 0.44f, 0.54f);
+    glBegin(GL_LINES);
+    for (int si = 0; si < cfg::VISIBLE; si += 5) {
+        float gx = panelL + (si + 0.5f) * slot;
+        glVertex2f(gx, MB_n); glVertex2f(gx, MB_n - 0.012f);
+    }
+    glEnd();
+    for (int si = 0; si < cfg::VISIBLE; si += 5) {
+        int ci = nTotal - cfg::VISIBLE + si;
+        float gx = panelL + (si + 0.5f) * slot;
+        char lb[16];
+        if (ci >= 0 && ci < nTotal) snprintf(lb, sizeof(lb), "%.1fs", snap[ci].t0 / 1000.0);
+        else snprintf(lb, sizeof(lb), "---");
+        drawTextPx(gx * g_fbW - 14, (MB_n - 0.058f) * g_fbH, lb, 0.50f, 0.55f, 0.65f);
+    }
+
+    // Panel title
+    drawTextPx((panelL + CW * 0.35f) * g_fbW, (MT_n + 0.010f) * g_fbH,
+        title, tr, tg, tb);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  GLFW CALLBACKS
+// ═════════════════════════════════════════════════════════════════════════════
+static App* g_app = nullptr;
+
+static void onKey(GLFWwindow* w, int key, int, int action, int)
+{
+    if (action != GLFW_PRESS || !g_app) return;
+    switch (key) {
+    case GLFW_KEY_ESCAPE: glfwSetWindowShouldClose(w, GLFW_TRUE); break;
+    case GLFW_KEY_T: {
+        bool v = !g_app->txEnabled; g_app->txEnabled.store(v);
+        printf("[NET] TX (send to client): %s\n", v ? "ON" : "OFF"); break;
+    }
+    case GLFW_KEY_R: {
+        bool v = !g_app->rxEnabled; g_app->rxEnabled.store(v);
+        printf("[NET] RX (receive from client): %s\n", v ? "ON" : "OFF"); break;
+    }
+    case GLFW_KEY_F: {
+        bool v = !g_app->fbEnabled; g_app->fbEnabled.store(v);
+        printf("[FB]  Force feedback to local Falcon: %s\n", v ? "ON" : "OFF"); break;
+    }
+    case GLFW_KEY_EQUAL: case GLFW_KEY_KP_ADD: {
+        double v = std::min(g_app->candleMs.load() * 1.122, cfg::CANDLE_MS_MAX);
+        g_app->candleMs.store(v);
+        printf("[UI] Window: %.1fms (%.1f/s)\n", v, 1000.0 / v); break;
+    }
+    case GLFW_KEY_MINUS: case GLFW_KEY_KP_SUBTRACT: {
+        double v = std::max(g_app->candleMs.load() / 1.122, cfg::CANDLE_MS_MIN);
+        g_app->candleMs.store(v);
+        printf("[UI] Window: %.1fms (%.1f/s)\n", v, 1000.0 / v); break;
+    }
+    case GLFW_KEY_LEFT_BRACKET:
+        g_app->candleMs.store(cfg::CANDLE_MS_MIN);
+        printf("[UI] MAX RATE 1ms\n"); break;
+    case GLFW_KEY_RIGHT_BRACKET:
+        g_app->candleMs.store(cfg::CANDLE_MS_MAX);
+        printf("[UI] MIN RATE 1000ms\n"); break;
+    default: break;
+    }
+}
+static void onFbSize(GLFWwindow*, int w, int h) { glViewport(0, 0, w, h); g_fbW = w; g_fbH = h; }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MAIN
+// ═════════════════════════════════════════════════════════════════════════════
+int main()
+{
+    WSADATA wsa{}; WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    App app; g_app = &app;
+    detectLocalIP(app.localIP, sizeof(app.localIP));
+
+    printf("╔══════════════════════════════════════════════╗\n");
+    printf("║       HapticCandlestick  SERVER              ║\n");
+    printf("╠══════════════════════════════════════════════╣\n");
+    printf("║  Server IP : %-30s  ║\n", app.localIP);
+    printf("║  Client IP : %-30s  ║\n", cfg::CLIENT_IP);
+    printf("║  UDP Port  : %-30d  ║\n", cfg::NET_PORT);
+    printf("╠══════════════════════════════════════════════╣\n");
+    printf("║  T   toggle TX (send to client)              ║\n");
+    printf("║  R   toggle RX (receive from client)         ║\n");
+    printf("║  F   toggle force feedback to local Falcon   ║\n");
+    printf("║  +/- candle window step                      ║\n");
+    printf("║  [   1ms window  (1000 bars/s)               ║\n");
+    printf("║  ]   1000ms window  (1 bar/s)                ║\n");
+    printf("║  ESC quit                                    ║\n");
+    printf("╚══════════════════════════════════════════════╝\n\n");
+
+    WSACleanup();   // main cleanup; network thread does its own WSAStartup
+
+    std::thread tHaptic([&] { hapticThread(app); });
+    std::thread tAgg([&] { aggregatorThread(app); });
+    std::thread tNet([&] { networkThread(app); });
+
+    if (!glfwInit()) {
+        app.running = false;
+        tHaptic.join(); tAgg.join(); tNet.join(); return 1;
+    }
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+
+    char wtitle[128];
+    snprintf(wtitle, sizeof(wtitle),
+        "SERVER  %s  →  CLIENT %s  |  Port %d",
+        app.localIP, cfg::CLIENT_IP, cfg::NET_PORT);
+
+    GLFWwindow* win = glfwCreateWindow(cfg::WIN_W, cfg::WIN_H, wtitle, nullptr, nullptr);
+    if (!win) {
+        glfwTerminate(); app.running = false;
+        tHaptic.join(); tAgg.join(); tNet.join(); return 1;
+    }
+
+    glfwMakeContextCurrent(win);
+    glfwSwapInterval(1);
+    glfwSetKeyCallback(win, onKey);
+    glfwSetFramebufferSizeCallback(win, onFbSize);
+    glfwGetFramebufferSize(win, &g_fbW, &g_fbH);
+
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_LINE_SMOOTH); glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_MULTISAMPLE);
+
+    // Chart layout (side by side)
+    // LEFT  chart: x=[0.01 .. 0.49]  LOCAL  (TX)
+    // RIGHT chart: x=[0.51 .. 0.99]  REMOTE (RX)
+    const float LCL = 0.01f, LCR = 0.49f;  // left chart left/right
+    const float RCL = 0.51f, RCR = 0.99f;  // right chart left/right
+    const float CMB = 0.10f, CMT = 0.82f;  // chart margin bottom/top
+
+    while (!glfwWindowShouldClose(win))
+    {
+        glfwGetFramebufferSize(win, &g_fbW, &g_fbH);
+        glViewport(0, 0, g_fbW, g_fbH);
+        glClearColor(0.05f, 0.07f, 0.10f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+
+        // ── Snapshot ──────────────────────────────────────────────────────
+        std::deque<Candle> localSnap, remoteSnap;
+        Candle localLive{}, remoteLive{};
+        bool localLO = false, remoteLO = false;
+        {
+            std::lock_guard<std::mutex> lk(app.localMtx);
+            localSnap = app.localCandles; localLive = app.localLive; localLO = app.localLiveOpen;
+        }
+        {
+            std::lock_guard<std::mutex> lk(app.remoteMtx);
+            remoteSnap = app.remoteCandles; remoteLive = app.remoteLive; remoteLO = app.remoteLiveOpen;
+        }
+        if (localLO)  localSnap.push_back(localLive);
+        if (remoteLO) remoteSnap.push_back(remoteLive);
+
+        float lMag = app.lmag.load(std::memory_order_relaxed);
+        float rMag = app.rmag.load(std::memory_order_relaxed);
+
+        // ── Draw divider ──────────────────────────────────────────────────
+        glLineWidth(1.5f); glColor3f(0.25f, 0.30f, 0.40f);
+        glBegin(GL_LINES);
+        glVertex2f(0.50f, 0.0f); glVertex2f(0.50f, 1.0f);
+        glEnd();
+
+        // ── Left chart: LOCAL / TX ────────────────────────────────────────
+        drawChart(localSnap, localLO, lMag,
+            LCL, LCR, CMB, CMT,
+            "LOCAL (TX -> CLIENT)",
+            0.35f, 0.88f, 0.45f);   // green title
+
+        // ── Right chart: REMOTE / RX ──────────────────────────────────────
+        drawChart(remoteSnap, remoteLO, rMag,
+            RCL, RCR, CMB, CMT,
+            "REMOTE (RX <- CLIENT)",
+            0.40f, 0.65f, 0.98f);   // blue title
+
+        // ── INFO PANEL ────────────────────────────────────────────────────
+        fillRect(0.0f, 0.83f, 1.0f, 1.0f, 0.06f, 0.08f, 0.12f, 0.95f);
+        glLineWidth(0.8f); glColor3f(0.20f, 0.24f, 0.32f);
+        glBegin(GL_LINES); glVertex2f(0, 0.83f); glVertex2f(1, 0.83f); glEnd();
+        glBegin(GL_LINES); glVertex2f(0.5f, 0.83f); glVertex2f(0.5f, 1.0f); glEnd();
+
+        float row1y = 0.968f * g_fbH, row2y = 0.918f * g_fbH, row3y = 0.862f * g_fbH;
+        char buf[96];
+
+        // LOCAL side (left half of panel)
+        drawTextPx(0.02f * g_fbW, row1y, "LOCAL HAPTIC (TX)", 0.30f, 0.78f, 0.38f);
+        float lx = app.lx.load(), ly_ = app.ly.load(), lz = app.lz.load(), lm = app.lmag.load();
+        snprintf(buf, sizeof(buf), "X:%+.4f", lx); drawTextPx(0.02f * g_fbW, row2y, buf, 0.38f, 0.88f, 0.42f);
+        snprintf(buf, sizeof(buf), "Y:%+.4f", ly_); drawTextPx(0.11f * g_fbW, row2y, buf, 0.38f, 0.62f, 0.95f);
+        snprintf(buf, sizeof(buf), "Z:%+.4f", lz);  drawTextPx(0.20f * g_fbW, row2y, buf, 0.95f, 0.60f, 0.20f);
+        snprintf(buf, sizeof(buf), "Mag:%.4fm (%.2fmm)", lm, lm * 1000);
+        drawTextPx(0.29f * g_fbW, row2y, buf, 1.0f, 0.92f, 0.30f);
+        // TX/FB status
+        snprintf(buf, sizeof(buf), "TX:%s  FB:%s  Sent:%llu",
+            app.txEnabled ? "ON " : "OFF",
+            app.fbEnabled ? "ON " : "OFF",
+            (unsigned long long)app.pktsSent.load());
+        drawTextPx(0.02f * g_fbW, row3y, buf,
+            app.txEnabled ? 0.25f : 0.55f,
+            app.txEnabled ? 0.88f : 0.45f,
+            app.txEnabled ? 0.40f : 0.40f);
+
+        // REMOTE side (right half of panel)
+        drawTextPx(0.52f * g_fbW, row1y, "REMOTE HAPTIC (RX)", 0.35f, 0.60f, 0.95f);
+        float rx = app.rx_.load(), ry = app.ry_.load(), rz = app.rz_.load(), rm = app.rmag.load();
+        // Stale detection: if last rx was >500ms ago, dim it
+        double staleMs = app.clock.ms() - app.lastRxMs.load();
+        float stale = (staleMs > 500.0) ? 0.4f : 1.0f;
+        snprintf(buf, sizeof(buf), "X:%+.4f", rx); drawTextPx(0.52f * g_fbW, row2y, buf, 0.38f * stale, 0.88f * stale, 0.42f * stale);
+        snprintf(buf, sizeof(buf), "Y:%+.4f", ry); drawTextPx(0.61f * g_fbW, row2y, buf, 0.38f * stale, 0.62f * stale, 0.95f * stale);
+        snprintf(buf, sizeof(buf), "Z:%+.4f", rz); drawTextPx(0.70f * g_fbW, row2y, buf, 0.95f * stale, 0.60f * stale, 0.20f * stale);
+        snprintf(buf, sizeof(buf), "Mag:%.4fm (%.2fmm)", rm, rm * 1000);
+        drawTextPx(0.79f * g_fbW, row2y, buf, 1.0f * stale, 0.92f * stale, 0.30f * stale);
+        // RX status
+        snprintf(buf, sizeof(buf), "RX:%s  Recv:%llu  Lag:%.0fms",
+            app.rxEnabled ? "ON " : "OFF",
+            (unsigned long long)app.pktsRecv.load(), staleMs);
+        drawTextPx(0.52f * g_fbW, row3y, buf,
+            app.rxEnabled ? 0.30f : 0.55f,
+            app.rxEnabled ? 0.65f : 0.45f,
+            app.rxEnabled ? 0.95f : 0.40f);
+
+        // IP row at very top of panel
+        snprintf(buf, sizeof(buf), "SERVER: %s   CLIENT: %s   PORT: %d   +/-/[/]= window",
+            app.localIP, cfg::CLIENT_IP, cfg::NET_PORT);
+        drawTextPx(0.02f * g_fbW, (0.985f) * g_fbH, buf, 0.40f, 0.44f, 0.55f);
+
+        // Demo stripe
+        if (app.demoMode) {
+            fillRect(0, 0, 0.004f, 1, 0.95f, 0.65f, 0.10f, 0.8f);
+            drawTextPx(0.006f * g_fbW, 0.5f * g_fbH, "DEMO", 0.95f, 0.65f, 0.10f);
+        }
+
+        glfwSwapBuffers(win);
+        glfwPollEvents();
+    }
+
+    app.running = false;
+    tHaptic.join(); tAgg.join(); tNet.join();
+    glfwDestroyWindow(win); glfwTerminate();
+    printf("Server shutdown. Sent:%llu  Recv:%llu\n",
+        (unsigned long long)app.pktsSent.load(),
+        (unsigned long long)app.pktsRecv.load());
+    return 0;
+}
