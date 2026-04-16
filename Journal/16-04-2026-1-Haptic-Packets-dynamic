@@ -1,0 +1,965 @@
+/*
+ * HapticCandlestick.cpp
+ * =====================
+ * Drop into an existing CHAI3D GLFW example project (replace its .cpp).
+ *
+ * Chart behaviour:
+ *   - Exactly 50 packet slots always visible (static window width)
+ *   - Newest packet at the RIGHT, oldest at the LEFT  (scrolls right→left)
+ *   - Y axis is FIXED: 0 .. cfg::YMAX metres, never zooms or shifts
+ *   - Middle reference line is STATIC at cfg::YMID
+ *   - X axis shows real timestamps (seconds since start) under each slot
+ *   - Instantaneous x, y, z values and magnitude shown in info panel
+ *
+ * Only extra linker dep vs a stock CHAI3D project:
+ *   ws2_32.lib  (Winsock2 – already handled by #pragma comment below)
+ *
+ * Controls:  +/- step window | [ = 1ms max rate | ] = 1000ms min rate | N net | ESC quit
+ */
+
+ // ─── Windows ──────────────────────────────────────────────────────────────────
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <windows.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+
+// ─── CHAI3D ───────────────────────────────────────────────────────────────────
+#include "chai3d.h"
+using namespace chai3d;
+
+// ─── OpenGL / GLFW ────────────────────────────────────────────────────────────
+#include <GLFW/glfw3.h>
+
+// ─── Standard library ─────────────────────────────────────────────────────────
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  CONFIGURATION
+// ═════════════════════════════════════════════════════════════════════════════
+namespace cfg
+{
+    constexpr int    WIN_W = 1400;
+    constexpr int    WIN_H = 860;
+
+    // ── Chart geometry ────────────────────────────────────────────────────
+    constexpr int    VISIBLE = 50;         // exactly 50 slots always shown
+    constexpr int    MAX_CANDLES = 52;         // keep a couple extra as buffer
+
+    // ── Candle / packet window ────────────────────────────────────────────
+    //   1  ms = maximum rate  (1 bar per raw sample, 1000 bars/sec)
+    //   1000 ms = minimum rate (1 bar per second,    1 bar/sec)
+    //   Default 20 ms = 50 bars/sec, comfortable for display at 50 slots
+    constexpr double CANDLE_MS_DEF = 20.0;
+    constexpr double CANDLE_MS_MIN = 1.0;     // 1 ms  → 1000 Hz
+    constexpr double CANDLE_MS_MAX = 1000.0;  // 1000 ms → 1 Hz
+
+    // ── Y axis – FIXED, never moves ───────────────────────────────────────
+    // Falcon workspace radius ≈ 0.04 m  →  max magnitude ≈ 0.069 m
+    constexpr float  YMIN = 0.000f;    // metres
+    constexpr float  YMAX = 0.075f;    // metres  (adjust if needed)
+    constexpr float  YMID = (YMIN + YMAX) * 0.5f;
+    constexpr int    Y_DIVS = 6;          // number of Y grid divisions
+
+    // ── Haptic ────────────────────────────────────────────────────────────
+    constexpr double HAPTIC_HZ = 1000.0;
+    constexpr double FORCE_K = 0.0;
+    constexpr double FORCE_MAX = 3.0;
+
+    // ── Network ───────────────────────────────────────────────────────────
+    constexpr int    NET_PORT = 9000;
+    constexpr int    NET_EVERY = 5;
+
+    // ── Ring buffer (must be power of 2) ──────────────────────────────────
+    constexpr int    RING_SZ = 4096;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  DATA STRUCTURES
+// ═════════════════════════════════════════════════════════════════════════════
+
+#pragma pack(push,1)
+struct Sample
+{
+    double  ts;          // ms since app start
+    float   x, y, z;    // position metres
+    float   mag;         // sqrt(x²+y²+z²)
+    uint8_t btn;
+};
+#pragma pack(pop)
+
+struct Candle
+{
+    double  t0, t1;
+    float   open, close, high, low;
+    bool    bull;
+};
+
+// Lock-free SPSC ring
+template<typename T, int N>
+struct Ring
+{
+    static_assert((N& (N - 1)) == 0, "power of 2 required");
+    alignas(64) std::atomic<int> head{ 0 };
+    alignas(64) std::atomic<int> tail{ 0 };
+    std::array<T, N> buf{};
+
+    bool push(const T& v)
+    {
+        int h = head.load(std::memory_order_relaxed);
+        int n = (h + 1) & (N - 1);
+        if (n == tail.load(std::memory_order_acquire)) return false;
+        buf[h] = v;
+        head.store(n, std::memory_order_release);
+        return true;
+    }
+    bool pop(T& out)
+    {
+        int t = tail.load(std::memory_order_relaxed);
+        if (t == head.load(std::memory_order_acquire)) return false;
+        out = buf[t];
+        tail.store((t + 1) & (N - 1), std::memory_order_release);
+        return true;
+    }
+    int size() const
+    {
+        int h = head.load(std::memory_order_acquire);
+        int t = tail.load(std::memory_order_acquire);
+        return (h - t + N) & (N - 1);
+    }
+};
+
+struct Timer
+{
+    LARGE_INTEGER freq, start;
+    Timer() { QueryPerformanceFrequency(&freq); reset(); }
+    void   reset() { QueryPerformanceCounter(&start); }
+    double ms() const
+    {
+        LARGE_INTEGER n; QueryPerformanceCounter(&n);
+        return double(n.QuadPart - start.QuadPart) * 1000.0 / double(freq.QuadPart);
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  APPLICATION STATE
+// ═════════════════════════════════════════════════════════════════════════════
+struct App
+{
+    std::atomic<bool>     running{ true };
+    Timer                 clock;
+
+    Ring<Sample, cfg::RING_SZ> ring;
+    Ring<Sample, 512>          netRing;
+
+    std::mutex            mtx;
+    std::deque<Candle>    candles;
+    Candle                live{};
+    bool                  liveOpen{ false };
+
+    // Instantaneous values – shown in info panel
+    std::atomic<float>    hx{ 0 }, hy{ 0 }, hz{ 0 }, hmag{ 0 };
+    std::atomic<double>   hts{ 0 };
+    std::atomic<uint8_t>  hbtn{ 0 };
+
+    std::atomic<double>   candleMs{ cfg::CANDLE_MS_DEF };
+
+    std::atomic<bool>     netEnabled{ true };
+    std::atomic<uint64_t> netPkts{ 0 };
+
+    bool demoMode{ false };
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  HAPTIC THREAD
+// ═════════════════════════════════════════════════════════════════════════════
+void hapticThread(App& app)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    timeBeginPeriod(1);
+
+    cHapticDeviceHandler handler;
+    cGenericHapticDevicePtr dev;
+    handler.getDevice(dev, 0);
+
+    bool hasDevice = (dev != nullptr);
+    if (hasDevice) { dev->open(); dev->calibrate(); }
+    else { app.demoMode = true; printf("[HAPTIC] Demo mode.\n"); }
+
+    const double periodUs = 1000000.0 / cfg::HAPTIC_HZ;
+    cVector3d zeroForce(0, 0, 0);
+    double demoPhase = 0.0;
+
+    while (app.running)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        float x, y, z, mag; uint8_t btn = 0;
+
+        if (hasDevice)
+        {
+            cVector3d pos;
+            dev->getPosition(pos);
+            x = (float)pos.x(); y = (float)pos.y(); z = (float)pos.z();
+            mag = (float)pos.length();
+            bool b[4]{}; for (int i = 0; i < 4; ++i) dev->getUserSwitch(i, b[i]);
+            btn = (b[0] ? 1 : 0) | (b[1] ? 2 : 0) | (b[2] ? 4 : 0) | (b[3] ? 8 : 0);
+            if (cfg::FORCE_K > 0.0) {
+                cVector3d f = pos * (-cfg::FORCE_K);
+                double fl = f.length();
+                if (fl > cfg::FORCE_MAX && fl > 0.0) f *= (cfg::FORCE_MAX / fl);
+                dev->setForce(f);
+            }
+            else { dev->setForce(zeroForce); }
+        }
+        else
+        {
+            demoPhase += (2.0 * M_PI) / cfg::HAPTIC_HZ;
+            x = 0.035f * (float)sin(demoPhase);
+            y = 0.025f * (float)cos(demoPhase * 1.37);
+            z = 0.018f * (float)sin(demoPhase * 0.73 + 1.0) + 0.010f * (float)sin(demoPhase * 4.1);
+            mag = sqrtf(x * x + y * y + z * z);
+        }
+
+        Sample s{ app.clock.ms(), x,y,z,mag,btn };
+        app.ring.push(s);
+        app.netRing.push(s);
+        app.hx.store(x, std::memory_order_relaxed);
+        app.hy.store(y, std::memory_order_relaxed);
+        app.hz.store(z, std::memory_order_relaxed);
+        app.hmag.store(mag, std::memory_order_relaxed);
+        app.hbtn.store(btn, std::memory_order_relaxed);
+        app.hts.store(s.ts, std::memory_order_relaxed);
+
+        auto target = t0 + std::chrono::microseconds((long long)periodUs);
+        while (std::chrono::high_resolution_clock::now() < target) _mm_pause();
+    }
+    if (hasDevice) dev->close();
+    timeEndPeriod(1);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  AGGREGATOR THREAD
+// ═════════════════════════════════════════════════════════════════════════════
+void aggregatorThread(App& app)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    Sample s{};
+    double winOpen = 0; float cO = 0, cC = 0, cH = 0, cL = 1e9f; bool started = false;
+    double jMean = 1.0, jJit = 0.0, jLast = 0.0;
+
+    while (app.running)
+    {
+        bool any = false;
+        while (app.ring.pop(s))
+        {
+            any = true; float mag = s.mag;
+            if (jLast > 0.0) {
+                double iv = s.ts - jLast, dv = fabs(iv - jMean);
+                jMean += 0.01 * (iv - jMean); jJit += 0.01 * (dv - jJit);
+            }
+            jLast = s.ts;
+            double dur = app.candleMs.load() * (1.0 + std::min(jJit / 2.0, 2.0));
+
+            if (!started) { winOpen = s.ts; cO = cC = cH = cL = mag; started = true; }
+            else {
+                cC = mag;
+                if (mag > cH) cH = mag;
+                if (mag < cL) cL = mag;
+                if (s.ts - winOpen >= dur) {
+                    Candle c{ winOpen,s.ts,cO,cC,cH,cL,(cC > cO) };
+                    {
+                        std::lock_guard<std::mutex> lk(app.mtx);
+                        app.candles.push_back(c);
+                        if ((int)app.candles.size() > cfg::MAX_CANDLES)
+                            app.candles.pop_front();
+                    }
+                    started = false;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(app.mtx);
+                app.live = { winOpen,s.ts,cO,cC,cH,cL,(cC > cO) };
+                app.liveOpen = started;
+            }
+        }
+        if (!any) std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  NETWORK THREAD
+// ═════════════════════════════════════════════════════════════════════════════
+void networkThread(App& app)
+{
+    WSADATA wsa{}; if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) { WSACleanup(); return; }
+    BOOL bc = TRUE; setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char*)&bc, sizeof(bc));
+    sockaddr_in dst{}; dst.sin_family = AF_INET;
+    dst.sin_port = htons((u_short)cfg::NET_PORT);
+    dst.sin_addr.s_addr = INADDR_BROADCAST;
+    Sample s{}; int cnt = 0;
+    while (app.running) {
+        if (app.netRing.pop(s)) {
+            if (app.netEnabled && (++cnt % cfg::NET_EVERY == 0)) {
+                sendto(sock, (char*)&s, sizeof(s), 0, (sockaddr*)&dst, sizeof(dst));
+                app.netPkts.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        else std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+    closesocket(sock); WSACleanup();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  OPENGL TEXT  (uses CHAI3D bitmap font – no extra dep)
+// ═════════════════════════════════════════════════════════════════════════════
+//  SELF-CONTAINED PIXEL FONT  (no CHAI3D font API, no GLUT, zero extra deps)
+//  Each glyph is a 5×7 bitmap stored as 5 column bytes (bit0=top row).
+//  drawTextPx(px, py, str, r,g,b) renders at pixel coords, 1px per bit.
+//  Scale with FONT_SCALE (2 = 10×14 px glyphs).
+// ═════════════════════════════════════════════════════════════════════════════
+
+static int g_fbW = 1400, g_fbH = 860;  // updated each frame by onFbSize
+
+// ── Glyph table: ASCII 32..126, 5 columns × 7 rows ──────────────────────────
+// Each entry is 5 bytes; bit0 of each byte = topmost pixel of that column.
+static const uint8_t GLYPHS[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, // 32 space
+    {0x00,0x00,0x5F,0x00,0x00}, // 33 !
+    {0x00,0x07,0x00,0x07,0x00}, // 34 "
+    {0x14,0x7F,0x14,0x7F,0x14}, // 35 #
+    {0x24,0x2A,0x7F,0x2A,0x12}, // 36 $
+    {0x23,0x13,0x08,0x64,0x62}, // 37 %
+    {0x36,0x49,0x55,0x22,0x50}, // 38 &
+    {0x00,0x05,0x03,0x00,0x00}, // 39 '
+    {0x00,0x1C,0x22,0x41,0x00}, // 40 (
+    {0x00,0x41,0x22,0x1C,0x00}, // 41 )
+    {0x08,0x2A,0x1C,0x2A,0x08}, // 42 *
+    {0x08,0x08,0x3E,0x08,0x08}, // 43 +
+    {0x00,0x50,0x30,0x00,0x00}, // 44 ,
+    {0x08,0x08,0x08,0x08,0x08}, // 45 -
+    {0x00,0x60,0x60,0x00,0x00}, // 46 .
+    {0x20,0x10,0x08,0x04,0x02}, // 47 /
+    {0x3E,0x51,0x49,0x45,0x3E}, // 48 0
+    {0x00,0x42,0x7F,0x40,0x00}, // 49 1
+    {0x42,0x61,0x51,0x49,0x46}, // 50 2
+    {0x21,0x41,0x45,0x4B,0x31}, // 51 3
+    {0x18,0x14,0x12,0x7F,0x10}, // 52 4
+    {0x27,0x45,0x45,0x45,0x39}, // 53 5
+    {0x3C,0x4A,0x49,0x49,0x30}, // 54 6
+    {0x01,0x71,0x09,0x05,0x03}, // 55 7
+    {0x36,0x49,0x49,0x49,0x36}, // 56 8
+    {0x06,0x49,0x49,0x29,0x1E}, // 57 9
+    {0x00,0x36,0x36,0x00,0x00}, // 58 :
+    {0x00,0x56,0x36,0x00,0x00}, // 59 ;
+    {0x00,0x08,0x14,0x22,0x41}, // 60 <
+    {0x14,0x14,0x14,0x14,0x14}, // 61 =
+    {0x41,0x22,0x14,0x08,0x00}, // 62 >
+    {0x02,0x01,0x51,0x09,0x06}, // 63 ?
+    {0x30,0x49,0x79,0x41,0x3E}, // 64 @
+    {0x7E,0x11,0x11,0x11,0x7E}, // 65 A
+    {0x7F,0x49,0x49,0x49,0x36}, // 66 B
+    {0x3E,0x41,0x41,0x41,0x22}, // 67 C
+    {0x7F,0x41,0x41,0x22,0x1C}, // 68 D
+    {0x7F,0x49,0x49,0x49,0x41}, // 69 E
+    {0x7F,0x09,0x09,0x09,0x01}, // 70 F
+    {0x3E,0x41,0x49,0x49,0x7A}, // 71 G
+    {0x7F,0x08,0x08,0x08,0x7F}, // 72 H
+    {0x00,0x41,0x7F,0x41,0x00}, // 73 I
+    {0x20,0x40,0x41,0x3F,0x01}, // 74 J
+    {0x7F,0x08,0x14,0x22,0x41}, // 75 K
+    {0x7F,0x40,0x40,0x40,0x40}, // 76 L
+    {0x7F,0x02,0x04,0x02,0x7F}, // 77 M
+    {0x7F,0x04,0x08,0x10,0x7F}, // 78 N
+    {0x3E,0x41,0x41,0x41,0x3E}, // 79 O
+    {0x7F,0x09,0x09,0x09,0x06}, // 80 P
+    {0x3E,0x41,0x51,0x21,0x5E}, // 81 Q
+    {0x7F,0x09,0x19,0x29,0x46}, // 82 R
+    {0x46,0x49,0x49,0x49,0x31}, // 83 S
+    {0x01,0x01,0x7F,0x01,0x01}, // 84 T
+    {0x3F,0x40,0x40,0x40,0x3F}, // 85 U
+    {0x1F,0x20,0x40,0x20,0x1F}, // 86 V
+    {0x3F,0x40,0x38,0x40,0x3F}, // 87 W
+    {0x63,0x14,0x08,0x14,0x63}, // 88 X
+    {0x03,0x04,0x78,0x04,0x03}, // 89 Y
+    {0x61,0x51,0x49,0x45,0x43}, // 90 Z
+    {0x00,0x7F,0x41,0x41,0x00}, // 91 [
+    {0x02,0x04,0x08,0x10,0x20}, // 92 backslash
+    {0x00,0x41,0x41,0x7F,0x00}, // 93 ]
+    {0x04,0x02,0x01,0x02,0x04}, // 94 ^
+    {0x40,0x40,0x40,0x40,0x40}, // 95 _
+    {0x00,0x01,0x02,0x04,0x00}, // 96 `
+    {0x20,0x54,0x54,0x54,0x78}, // 97 a
+    {0x7F,0x48,0x44,0x44,0x38}, // 98 b
+    {0x38,0x44,0x44,0x44,0x20}, // 99 c
+    {0x38,0x44,0x44,0x48,0x7F}, // 100 d
+    {0x38,0x54,0x54,0x54,0x18}, // 101 e
+    {0x08,0x7E,0x09,0x01,0x02}, // 102 f
+    {0x08,0x14,0x54,0x54,0x3C}, // 103 g
+    {0x7F,0x08,0x04,0x04,0x78}, // 104 h
+    {0x00,0x44,0x7D,0x40,0x00}, // 105 i
+    {0x20,0x40,0x44,0x3D,0x00}, // 106 j
+    {0x00,0x7F,0x10,0x28,0x44}, // 107 k
+    {0x00,0x41,0x7F,0x40,0x00}, // 108 l
+    {0x7C,0x04,0x18,0x04,0x78}, // 109 m
+    {0x7C,0x08,0x04,0x04,0x78}, // 110 n
+    {0x38,0x44,0x44,0x44,0x38}, // 111 o
+    {0x7C,0x14,0x14,0x14,0x08}, // 112 p
+    {0x08,0x14,0x14,0x18,0x7C}, // 113 q
+    {0x7C,0x08,0x04,0x04,0x08}, // 114 r
+    {0x48,0x54,0x54,0x54,0x20}, // 115 s
+    {0x04,0x3F,0x44,0x40,0x20}, // 116 t
+    {0x3C,0x40,0x40,0x40,0x7C}, // 117 u
+    {0x1C,0x20,0x40,0x20,0x1C}, // 118 v
+    {0x3C,0x40,0x30,0x40,0x3C}, // 119 w
+    {0x44,0x28,0x10,0x28,0x44}, // 120 x
+    {0x0C,0x50,0x50,0x50,0x3C}, // 121 y
+    {0x44,0x64,0x54,0x4C,0x44}, // 122 z
+    {0x00,0x08,0x36,0x41,0x00}, // 123 {
+    {0x00,0x00,0x7F,0x00,0x00}, // 124 |
+    {0x00,0x41,0x36,0x08,0x00}, // 125 }
+    {0x08,0x04,0x08,0x10,0x08}, // 126 ~
+};
+
+// Scale: 2 = 10×14 px glyphs (good at 1400px wide), 1 = 5×7 tiny
+static const int FONT_SCALE = 2;
+static const int GLYPH_W = 5 * FONT_SCALE;   // pixels per glyph incl. gap
+static const int GLYPH_H = 7 * FONT_SCALE;
+static const int GLYPH_GAP = 1 * FONT_SCALE;
+
+// Draw string at pixel position (px, py = bottom-left of first glyph).
+// Uses pixel-space ortho internally; restores normalised ortho on exit.
+static void drawTextPx(float px, float py, const char* str,
+    float r = 1.f, float g2 = 1.f, float b = 1.f, float a = 1.f)
+{
+    if (!str || !str[0]) return;
+
+    // Switch to pixel-space ortho
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glOrtho(0, g_fbW, 0, g_fbH, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+
+    glColor4f(r, g2, b, a);
+    glBegin(GL_QUADS);
+
+    float cx = px;
+    for (const char* p = str; *p; ++p)
+    {
+        int c = (unsigned char)*p;
+        if (c < 32 || c > 126) { cx += GLYPH_W + GLYPH_GAP; continue; }
+        const uint8_t* col = GLYPHS[c - 32];
+
+        for (int col_i = 0; col_i < 5; ++col_i)
+        {
+            uint8_t bits = col[col_i];
+            for (int row_i = 0; row_i < 7; ++row_i)
+            {
+                if (bits & (1 << row_i))
+                {
+                    // col_i  left→right (bit0 = leftmost column of glyph)
+                    // row_i  bit0 = top of glyph, but OpenGL Y goes up,
+                    //        so invert: row 0 → top = py + (6)*scale
+                    float x0 = cx + col_i * FONT_SCALE;
+                    float y0 = py + (6 - row_i) * FONT_SCALE;
+                    float x1 = x0 + FONT_SCALE;
+                    float y1 = y0 + FONT_SCALE;
+                    glVertex2f(x0, y0); glVertex2f(x1, y0);
+                    glVertex2f(x1, y1); glVertex2f(x0, y1);
+                }
+            }
+        }
+        cx += GLYPH_W + GLYPH_GAP;
+    }
+    glEnd();
+
+    // Restore normalised ortho
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    glOrtho(0, 1, 0, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  RENDER HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Chart area margins in normalised [0..1]
+// Left margin wide enough for Y labels, bottom for X labels
+static const float ML = 0.07f;   // left   (Y-axis labels)
+static const float MR = 0.97f;   // right
+static const float MB = 0.10f;   // bottom (X-axis timestamps)
+static const float MT = 0.82f;   // top    (info panel below this)
+
+static void fillRect(float x0, float y0, float x1, float y1,
+    float r, float g2, float b, float a = 1.f)
+{
+    glColor4f(r, g2, b, a);
+    glBegin(GL_QUADS);
+    glVertex2f(x0, y0); glVertex2f(x1, y0);
+    glVertex2f(x1, y1); glVertex2f(x0, y1);
+    glEnd();
+}
+
+static void drawCandle(float xc, float hw,
+    float oY, float clY, float hY, float lY,
+    bool bull, float alpha)
+{
+    if (bull) glColor4f(0.114f, 0.722f, 0.416f, alpha);
+    else     glColor4f(0.902f, 0.220f, 0.220f, alpha);
+    float top = std::max(oY, clY), bot = std::min(oY, clY);
+    float bh = top - bot; if (bh < 0.0010f) bh = 0.0010f;
+    glBegin(GL_QUADS);
+    glVertex2f(xc - hw, bot); glVertex2f(xc + hw, bot);
+    glVertex2f(xc + hw, bot + bh); glVertex2f(xc - hw, bot + bh);
+    glEnd();
+    glLineWidth(1.4f);
+    glBegin(GL_LINES);
+    glVertex2f(xc, bot + bh); glVertex2f(xc, hY);
+    glVertex2f(xc, bot);    glVertex2f(xc, lY);
+    glEnd();
+}
+
+// Convert a magnitude value to chart Y in [0..1] using the FIXED Y range
+static inline float yOf(float m)
+{
+    float t = (m - cfg::YMIN) / (cfg::YMAX - cfg::YMIN);
+    return MB + t * (MT - MB);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  GLFW CALLBACKS
+// ═════════════════════════════════════════════════════════════════════════════
+static App* g_app = nullptr;
+
+static void onKey(GLFWwindow* w, int key, int, int action, int)
+{
+    if (action != GLFW_PRESS || !g_app) return;
+    switch (key) {
+    case GLFW_KEY_ESCAPE: glfwSetWindowShouldClose(w, GLFW_TRUE); break;
+    case GLFW_KEY_EQUAL: case GLFW_KEY_KP_ADD: {
+        // Multiply by ~1.122 (half-semitone) → 12 presses = 10×
+        double v = std::min(g_app->candleMs.load() * 1.122, cfg::CANDLE_MS_MAX);
+        g_app->candleMs.store(v);
+        printf("[UI] Candle window: %.1f ms  (%.1f bars/sec)\n",
+            v, 1000.0 / v); break;
+    }
+    case GLFW_KEY_MINUS: case GLFW_KEY_KP_SUBTRACT: {
+        double v = std::max(g_app->candleMs.load() / 1.122, cfg::CANDLE_MS_MIN);
+        g_app->candleMs.store(v);
+        printf("[UI] Candle window: %.1f ms  (%.1f bars/sec)\n",
+            v, 1000.0 / v); break;
+    }
+    case GLFW_KEY_LEFT_BRACKET: {  // [ → minimum window = 1 ms (max rate 1000 Hz)
+        g_app->candleMs.store(cfg::CANDLE_MS_MIN);
+        printf("[UI] MAX RATE: 1 ms per bar (1000 bars/sec)\n"); break;
+    }
+    case GLFW_KEY_RIGHT_BRACKET: { // ] → maximum window = 1000 ms (min rate 1 Hz)
+        g_app->candleMs.store(cfg::CANDLE_MS_MAX);
+        printf("[UI] MIN RATE: 1000 ms per bar (1 bar/sec)\n"); break;
+    }
+    case GLFW_KEY_N: {
+        bool en = !g_app->netEnabled.load(); g_app->netEnabled.store(en);
+        printf("[UI] Net: %s\n", en ? "ON" : "OFF"); break;
+    }
+    default: break;
+    }
+}
+static void onFbSize(GLFWwindow*, int w, int h) { glViewport(0, 0, w, h); g_fbW = w; g_fbH = h; }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MAIN
+// ═════════════════════════════════════════════════════════════════════════════
+int main()
+{
+    App app; g_app = &app;
+    printf("=== HapticCandlestick ===  50-slot fixed window\n");
+    printf("+/-  finer candle window step  (1 ms .. 1000 ms)\n");
+    printf("[    set 1 ms window   = 1000 bars/sec (MAX rate)\n");
+    printf("]    set 1000 ms window = 1 bar/sec    (MIN rate)\n");
+    printf("N    toggle UDP network  |  ESC quit\n");
+    printf("Default window: %.0f ms  (%.0f bars/sec)\n\n",
+        cfg::CANDLE_MS_DEF, 1000.0 / cfg::CANDLE_MS_DEF);
+
+    std::thread tHaptic([&] { hapticThread(app); });
+    std::thread tAgg([&] { aggregatorThread(app); });
+    std::thread tNet([&] { networkThread(app); });
+
+    if (!glfwInit()) {
+        app.running = false;
+        tHaptic.join(); tAgg.join(); tNet.join(); return 1;
+    }
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+
+    GLFWwindow* win = glfwCreateWindow(cfg::WIN_W, cfg::WIN_H,
+        "Haptic Candlestick  |  50 slots  |  Novint Falcon / CHAI3D  |  1ms-1000ms window",
+        nullptr, nullptr);
+    if (!win) {
+        glfwTerminate(); app.running = false;
+        tHaptic.join(); tAgg.join(); tNet.join(); return 1;
+    }
+
+    glfwMakeContextCurrent(win);
+    glfwSwapInterval(1);
+    glfwSetKeyCallback(win, onKey);
+    glfwSetFramebufferSizeCallback(win, onFbSize);
+    glfwGetFramebufferSize(win, &g_fbW, &g_fbH);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_MULTISAMPLE);
+
+
+    // ── Render loop ────────────────────────────────────────────────────────
+    while (!glfwWindowShouldClose(win))
+    {
+        glfwGetFramebufferSize(win, &g_fbW, &g_fbH);
+        glViewport(0, 0, g_fbW, g_fbH);
+        glClearColor(0.07f, 0.09f, 0.13f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        // Normalised ortho
+        glMatrixMode(GL_PROJECTION); glLoadIdentity();
+        glOrtho(0, 1, 0, 1, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+
+        // ── Snapshot ──────────────────────────────────────────────────────
+        std::deque<Candle> snap;
+        Candle live{}; bool liveOpen = false;
+        {
+            std::lock_guard<std::mutex> lk(app.mtx);
+            snap = app.candles; live = app.live; liveOpen = app.liveOpen;
+        }
+        // Append live (forming) candle as the rightmost slot
+        if (liveOpen) snap.push_back(live);
+
+        int nTotal = (int)snap.size();
+
+        // ── Layout constants ──────────────────────────────────────────────
+        const float CW = MR - ML;
+        const float CH = MT - MB;
+        // Fixed slot width based on VISIBLE count (never changes)
+        const float slot = CW / (float)cfg::VISIBLE;
+        const float hw = slot * 0.34f;    // candle body half-width
+
+        // ── Chart background ──────────────────────────────────────────────
+        fillRect(ML, MB, MR, MT, 0.09f, 0.11f, 0.15f);
+
+        // ── Fixed Y grid lines ────────────────────────────────────────────
+        glLineWidth(0.5f);
+        glColor4f(0.25f, 0.29f, 0.38f, 0.6f);
+        glBegin(GL_LINES);
+        for (int i = 0; i <= cfg::Y_DIVS; ++i) {
+            float gy = MB + CH * ((float)i / cfg::Y_DIVS);
+            glVertex2f(ML, gy); glVertex2f(MR, gy);
+        }
+        // Vertical grid every 5 slots
+        for (int i = 0; i <= cfg::VISIBLE; i += 5) {
+            float gx = ML + slot * i;
+            glVertex2f(gx, MB); glVertex2f(gx, MT);
+        }
+        glEnd();
+
+        // ── Static mid-axis line (bright, fixed at YMID) ──────────────────
+        float midY = yOf(cfg::YMID);
+        glLineWidth(1.2f);
+        glColor4f(0.45f, 0.55f, 0.75f, 0.85f);
+        glEnable(GL_LINE_STIPPLE);
+        glLineStipple(1, 0xF0F0);
+        glBegin(GL_LINES);
+        glVertex2f(ML, midY); glVertex2f(MR, midY);
+        glEnd();
+        glDisable(GL_LINE_STIPPLE);
+
+        // ── Y-axis labels (fixed, always the same) ────────────────────────
+        // Left tick marks + text labels
+        glLineWidth(1.0f);
+        glColor4f(0.50f, 0.55f, 0.65f, 0.8f);
+        glBegin(GL_LINES);
+        for (int i = 0; i <= cfg::Y_DIVS; ++i) {
+            float gy = MB + CH * ((float)i / cfg::Y_DIVS);
+            glVertex2f(ML, gy); glVertex2f(ML - 0.012f, gy);
+        }
+        glEnd();
+
+        // Y labels: value in mm (convert metres to mm for readability)
+        for (int i = 0; i <= cfg::Y_DIVS; ++i) {
+            float frac = (float)i / cfg::Y_DIVS;
+            float val = cfg::YMIN + frac * (cfg::YMAX - cfg::YMIN);
+            float gy = MB + CH * frac;
+            char buf[16]; snprintf(buf, sizeof(buf), "%.1f", val * 1000.0f);  // mm
+            // pixel coords: x near left margin, y centred on grid line
+            float px = (ML - 0.065f) * g_fbW;
+            float py = gy * g_fbH - 7.0f;    // -7 to vertically centre the glyph
+            drawTextPx(px, py, buf, 0.65f, 0.70f, 0.80f);
+        }
+        // "mm" unit label on the Y axis
+        drawTextPx((ML - 0.065f) * g_fbW, MT * g_fbH + 8, "mag(mm)", 0.55f, 0.60f, 0.72f);
+
+        // ── Candles – placed in fixed slots, newest on right ──────────────
+        // Slot 0 = leftmost, slot VISIBLE-1 = rightmost
+        // If we have fewer than VISIBLE candles, fill from the right.
+        // i.e. candle[nTotal-1] → slot VISIBLE-1
+        //      candle[nTotal-2] → slot VISIBLE-2  etc.
+        for (int slot_i = 0; slot_i < cfg::VISIBLE; ++slot_i)
+        {
+            // Which candle index maps to this slot?
+            int candleIdx = nTotal - cfg::VISIBLE + slot_i;
+            if (candleIdx < 0) continue;   // slot not yet filled
+
+            const Candle& c = snap[candleIdx];
+            float xc = ML + (slot_i + 0.5f) * slot;
+            float oY = yOf(c.open);
+            float clY = yOf(c.close);
+            float hY = yOf(c.high);
+            float lY = yOf(c.low);
+
+            bool isLive = (candleIdx == nTotal - 1) && liveOpen;
+            drawCandle(xc, hw, oY, clY, hY, lY, c.bull, isLive ? 0.55f : 1.0f);
+        }
+
+        // ── Live magnitude crosshair (yellow dashed, moves) ───────────────
+        float liveMag = app.hmag.load(std::memory_order_relaxed);
+        float cy = yOf(liveMag);
+        cy = std::max(MB + 0.001f, std::min(MT - 0.001f, cy));
+        glLineWidth(1.0f);
+        glColor4f(1.0f, 0.85f, 0.20f, 0.80f);
+        glEnable(GL_LINE_STIPPLE); glLineStipple(2, 0xAAAA);
+        glBegin(GL_LINES); glVertex2f(ML, cy); glVertex2f(MR, cy); glEnd();
+        glDisable(GL_LINE_STIPPLE);
+
+        // ── Axis frame ────────────────────────────────────────────────────
+        glLineWidth(1.2f);
+        glColor3f(0.40f, 0.44f, 0.54f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(ML, MB); glVertex2f(MR, MB);
+        glVertex2f(MR, MT); glVertex2f(ML, MT);
+        glEnd();
+
+        // ── X-axis: timestamps below each 5th slot ────────────────────────
+        // Ticks every 5 slots
+        glLineWidth(1.0f);
+        glColor3f(0.40f, 0.44f, 0.54f);
+        glBegin(GL_LINES);
+        for (int slot_i = 0; slot_i < cfg::VISIBLE; slot_i += 5) {
+            float gx = ML + (slot_i + 0.5f) * slot;
+            glVertex2f(gx, MB); glVertex2f(gx, MB - 0.012f);
+        }
+        glEnd();
+
+        // Timestamp text under every 5th slot
+        for (int slot_i = 0; slot_i < cfg::VISIBLE; slot_i += 5)
+        {
+            int candleIdx = nTotal - cfg::VISIBLE + slot_i;
+            float gx = ML + (slot_i + 0.5f) * slot;
+            char buf[20];
+            if (candleIdx >= 0 && candleIdx < nTotal)
+            {
+                // Show time in seconds since start, 1 decimal place
+                double tSec = snap[candleIdx].t0 / 1000.0;
+                snprintf(buf, sizeof(buf), "%.1fs", tSec);
+            }
+            else
+            {
+                snprintf(buf, sizeof(buf), "---");
+            }
+            float px = gx * g_fbW - 14.0f;   // centre roughly on the tick
+            float py = (MB - 0.058f) * g_fbH;
+            drawTextPx(px, py, buf, 0.55f, 0.60f, 0.72f);
+        }
+        // "time" axis label
+        drawTextPx((ML + CW * 0.44f) * g_fbW, (MB - 0.085f) * g_fbH,
+            "time (s)", 0.50f, 0.55f, 0.68f);
+
+        // ── INFO PANEL  (below chart, above bottom edge) ───────────────────
+        // Panel background
+        fillRect(0.0f, 0.83f, 1.0f, 1.0f, 0.08f, 0.10f, 0.15f, 0.95f);
+        // Separator line
+        glLineWidth(0.8f); glColor3f(0.25f, 0.28f, 0.36f);
+        glBegin(GL_LINES);
+        glVertex2f(0.0f, 0.83f); glVertex2f(1.0f, 0.83f);
+        glEnd();
+
+        float ix = app.hx.load(std::memory_order_relaxed);
+        float iy = app.hy.load(std::memory_order_relaxed);
+        float iz = app.hz.load(std::memory_order_relaxed);
+        float im = app.hmag.load(std::memory_order_relaxed);
+        double its = app.hts.load(std::memory_order_relaxed);
+        uint8_t ibtn = app.hbtn.load(std::memory_order_relaxed);
+
+        // ── Three info rows ───────────────────────────────────────────────
+        //   row1 (top)    : section headers / labels
+        //   row2 (middle) : live x y z mag  +  timestamp
+        //   row3 (bottom) : packet rate  +  net stats
+        float row1y = 0.968f * g_fbH;   // header labels
+        float row2y = 0.920f * g_fbH;   // x y z mag timestamp
+        float row3y = 0.865f * g_fbH;   // rate  +  network
+
+        char buf[64];
+
+        // ── Row 1: section headers ────────────────────────────────────────
+        drawTextPx(0.02f * g_fbW, row1y, "INSTANTANEOUS PACKET",
+            0.45f, 0.50f, 0.62f);
+        drawTextPx(0.60f * g_fbW, row1y, "PACKET RATE",
+            0.45f, 0.50f, 0.62f);
+        drawTextPx(0.82f * g_fbW, row1y, "NETWORK",
+            0.45f, 0.50f, 0.62f);
+
+        // ── Row 2: live x y z mag + timestamp ────────────────────────────
+        // X  (green)
+        snprintf(buf, sizeof(buf), "X: %+.4f m", ix);
+        drawTextPx(0.02f * g_fbW, row2y, buf, 0.40f, 0.88f, 0.45f);
+        // Y  (blue)
+        snprintf(buf, sizeof(buf), "Y: %+.4f m", iy);
+        drawTextPx(0.16f * g_fbW, row2y, buf, 0.40f, 0.65f, 0.98f);
+        // Z  (orange)
+        snprintf(buf, sizeof(buf), "Z: %+.4f m", iz);
+        drawTextPx(0.30f * g_fbW, row2y, buf, 0.98f, 0.62f, 0.22f);
+        // Magnitude  (yellow-white)
+        snprintf(buf, sizeof(buf), "Mag: %.4f m  (%.2f mm)", im, im * 1000.0f);
+        drawTextPx(0.44f * g_fbW, row2y, buf, 1.0f, 0.92f, 0.35f);
+        // Timestamp
+        snprintf(buf, sizeof(buf), "T: %.3f s", its / 1000.0);
+        drawTextPx(0.72f * g_fbW, row2y, buf, 0.70f, 0.75f, 0.88f);
+
+        // ── Row 3: packet rate + network ─────────────────────────────────
+        double curMs = app.candleMs.load(std::memory_order_relaxed);
+        double barsHz = 1000.0 / curMs;   // bars per second
+
+        // Logarithmic position on 1–1000 ms scale for the rate bar
+        // log10(1)=0, log10(1000)=3  → normalise to [0..1]
+        float  logFrac = (float)((log10(curMs) - 0.0) / 3.0);
+        logFrac = std::max(0.0f, std::min(1.0f, logFrac));
+
+        // Rate bar background outline
+        float bx0 = 0.02f * g_fbW, bx1 = 0.55f * g_fbW;
+        float by0 = row3y - 2, by1 = row3y + float(GLYPH_H) + 4;
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+        glOrtho(0, g_fbW, 0, g_fbH, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+
+        // Background track
+        glColor4f(0.18f, 0.22f, 0.30f, 1.0f);
+        glBegin(GL_QUADS);
+        glVertex2f(bx0, by0); glVertex2f(bx1, by0);
+        glVertex2f(bx1, by1); glVertex2f(bx0, by1);
+        glEnd();
+
+        // Fill: colour shifts cyan (fast/left) → amber (slow/right)
+        float barX1 = bx0 + (bx1 - bx0) * logFrac;
+        // At logFrac=0 (1ms=1000Hz) → pure cyan; at logFrac=1 (1000ms=1Hz) → amber
+        float br = logFrac;
+        float bg2 = 0.75f;
+        float bb = 1.0f - logFrac;
+        glColor4f(br, bg2, bb, 0.85f);
+        glBegin(GL_QUADS);
+        glVertex2f(bx0, by0); glVertex2f(barX1, by0);
+        glVertex2f(barX1, by1); glVertex2f(bx0, by1);
+        glEnd();
+
+        // Outline
+        glColor4f(0.35f, 0.40f, 0.52f, 0.8f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(bx0, by0); glVertex2f(bx1, by0);
+        glVertex2f(bx1, by1); glVertex2f(bx0, by1);
+        glEnd();
+
+        // Tick marks at 1, 10, 100, 1000 ms
+        glColor4f(0.45f, 0.50f, 0.62f, 0.6f);
+        glBegin(GL_LINES);
+        for (int ms_tick : {1, 2, 5, 10, 20, 50, 100, 200, 500, 1000}) {
+            float fx = (float)((log10((double)ms_tick)) / 3.0);
+            float tx = bx0 + (bx1 - bx0) * fx;
+            glVertex2f(tx, by0); glVertex2f(tx, by0 - 5);
+        }
+        glEnd();
+
+        glMatrixMode(GL_PROJECTION); glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+        // restore normalised ortho
+        glMatrixMode(GL_PROJECTION); glLoadIdentity();
+        glOrtho(0, 1, 0, 1, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+
+        // Rate text overlaid on bar
+        if (barsHz >= 100.0)
+            snprintf(buf, sizeof(buf), "%.0f ms = %.0f bars/s", curMs, barsHz);
+        else if (barsHz >= 10.0)
+            snprintf(buf, sizeof(buf), "%.1f ms = %.1f bars/s", curMs, barsHz);
+        else
+            snprintf(buf, sizeof(buf), "%.0f ms = %.2f bars/s", curMs, barsHz);
+        // dark text on bar for contrast
+        drawTextPx(bx0 + 4, row3y, buf, 0.05f, 0.05f, 0.08f);   // shadow
+        drawTextPx(bx0 + 3, row3y + 1, buf, 1.0f, 1.0f, 1.0f);    // white on top
+
+        // Endpoint labels
+        drawTextPx(bx0 - 1, row3y - float(GLYPH_H) - 4, "1ms",
+            0.30f, 0.85f, 0.95f);
+        drawTextPx(bx1 - 22, row3y - float(GLYPH_H) - 4, "1000ms",
+            0.95f, 0.75f, 0.25f);
+
+        // Shortcut hint
+        drawTextPx(0.57f * g_fbW, row3y, "+/- step  [ max  ] min",
+            0.38f, 0.42f, 0.52f);
+
+        // Net packets + button state
+        snprintf(buf, sizeof(buf), "Pkts:%llu  Btn:%X",
+            (unsigned long long)app.netPkts.load(), ibtn);
+        drawTextPx(0.82f * g_fbW, row3y, buf,
+            app.netEnabled ? 0.22f : 0.40f,
+            app.netEnabled ? 0.88f : 0.45f,
+            app.netEnabled ? 0.42f : 0.40f);
+
+        // ── Demo mode stripe ──────────────────────────────────────────────
+        if (app.demoMode)
+        {
+            fillRect(0.0f, 0.0f, 0.005f, 1.0f, 0.95f, 0.65f, 0.10f, 0.8f);
+            drawTextPx(0.008f * g_fbW, 0.50f * g_fbH, "DEMO", 0.95f, 0.65f, 0.10f);
+        }
+
+        glfwSwapBuffers(win);
+        glfwPollEvents();
+    }
+
+    app.running = false;
+    tHaptic.join(); tAgg.join(); tNet.join();
+    glfwDestroyWindow(win); glfwTerminate();
+    printf("Shutdown. Packets sent: %llu\n", (unsigned long long)app.netPkts.load());
+    return 0;
+}
+
+/*
+ * UDP receiver (Python, any LAN machine):
+ *   import socket, struct
+ *   s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ *   s.bind(('', 9000))
+ *   while True:
+ *       data, _ = s.recvfrom(64)
+ *       ts,x,y,z,mag,btn = struct.unpack('<dffffB', data[:25])
+ *       print(f'{ts/1000:8.3f}s  x={x*1000:+7.3f}  y={y*1000:+7.3f}  '
+ *             f'z={z*1000:+7.3f}  mag={mag*1000:6.3f}mm')
+ */
