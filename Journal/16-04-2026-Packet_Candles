@@ -1,0 +1,905 @@
+/*
+ * HapticCandlestick.cpp
+ * =====================
+ * Drop this single file into an existing CHAI3D example project
+ * (e.g. copy the "01-mydevice" example folder, replace its .cpp).
+ *
+ * What it does:
+ *   - Opens the Novint Falcon via CHAI3D
+ *   - Polls position at ~1 kHz on a dedicated high-priority thread
+ *   - Aggregates samples into OHLC "packets" (candlestick bars)
+ *   - Renders them with OpenGL:
+ *       X axis = timestamp (rolling window)
+ *       Y axis = position magnitude  sqrt(x^2 + y^2 + z^2)
+ *       Bar height = magnitude delta (open vs close of each window)
+ *       Wick       = high / low of each window
+ *       Green bar  = magnitude increased over the window
+ *       Red bar    = magnitude decreased over the window
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  ADDITIONAL DEPENDENCY  (only ONE extra lib needed)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  The CHAI3D built project already links:
+ *    opengl32.lib  glu32.lib  glfw3.lib  winmm.lib  setupapi.lib  hid.lib
+ *
+ *  You only need to add:
+ *    ws2_32.lib   <-- Winsock2 for the UDP network broadcast
+ *
+ *  In Visual Studio:
+ *    Project → Properties → Linker → Input → Additional Dependencies
+ *    Add:  ws2_32.lib
+ *
+ *  That is the ONLY change needed to a standard CHAI3D built project.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * CONTROLS:
+ *   ESC        quit
+ *   + / -      increase / decrease candle window duration
+ *   R          reset Y-axis zoom
+ *   N          toggle UDP network broadcast on/off
+ */
+
+ // ─── Windows (must come before any GL or Winsock header) ──────────────────────
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <windows.h>
+#include <mmsystem.h>           // timeBeginPeriod / timeEndPeriod
+#pragma comment(lib, "winmm.lib")
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+
+// ─── CHAI3D ────────────────────────────────────────────────────────────────────
+#include "chai3d.h"
+using namespace chai3d;
+
+// ─── OpenGL / GLFW  (already in CHAI3D project includes) ──────────────────────
+#include <GLFW/glfw3.h>
+
+// ─── Standard library ─────────────────────────────────────────────────────────
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  CONFIGURATION  –  tweak here
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace cfg
+{
+    // Window
+    constexpr int    WIN_W = 1400;
+    constexpr int    WIN_H = 800;
+
+    // Chart
+    constexpr int    MAX_CANDLES = 80;       // candles shown at once
+    constexpr double CANDLE_MS_DEF = 150.0;    // default ms per candle
+    constexpr double CANDLE_MS_MIN = 30.0;
+    constexpr double CANDLE_MS_MAX = 2000.0;
+    constexpr double YSMOOTH = 0.05;     // Y-range EMA smoothing
+    constexpr double YPAD = 0.10;     // 10% padding top/bottom
+
+    // Haptic
+    constexpr double HAPTIC_HZ = 1000.0;   // target poll rate
+    constexpr double FORCE_K = 0.0;       // spring N/m (0 = no force)
+    constexpr double FORCE_MAX = 3.0;       // Falcon max ~3 N
+
+    // Network (UDP broadcast)
+    constexpr int    NET_PORT = 9000;
+    constexpr int    NET_EVERY = 5;         // send every Nth sample (~200 Hz)
+
+    // Ring buffer  (must be power of 2)
+    constexpr int    RING_SZ = 4096;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  DATA STRUCTURES
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Raw sample pushed by the haptic thread at ~1 kHz
+#pragma pack(push,1)
+struct Sample
+{
+    double  ts;     // ms since app start
+    float   x, y, z;
+    float   mag;    // sqrt(x^2+y^2+z^2)
+    uint8_t btn;    // Falcon button bitmask
+};
+#pragma pack(pop)
+
+// Completed OHLC candle
+struct Candle
+{
+    double  t0, t1;                   // open/close timestamps (ms)
+    float   open, close, high, low;   // magnitude values
+    bool    bull;                     // close > open
+};
+
+// ─── Lock-free single-producer / single-consumer ring buffer ──────────────────
+template<typename T, int N>
+struct Ring
+{
+    static_assert((N& (N - 1)) == 0, "N must be power of 2");
+    alignas(64) std::atomic<int> head{ 0 };
+    alignas(64) std::atomic<int> tail{ 0 };
+    std::array<T, N> buf{};
+
+    bool push(const T& v)
+    {
+        int h = head.load(std::memory_order_relaxed);
+        int n = (h + 1) & (N - 1);
+        if (n == tail.load(std::memory_order_acquire)) return false;
+        buf[h] = v;
+        head.store(n, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T& out)
+    {
+        int t = tail.load(std::memory_order_relaxed);
+        if (t == head.load(std::memory_order_acquire)) return false;
+        out = buf[t];
+        tail.store((t + 1) & (N - 1), std::memory_order_release);
+        return true;
+    }
+
+    int size() const
+    {
+        int h = head.load(std::memory_order_acquire);
+        int t = tail.load(std::memory_order_acquire);
+        return (h - t + N) & (N - 1);
+    }
+};
+
+// ─── Precision timer (QueryPerformanceCounter) ────────────────────────────────
+struct Timer
+{
+    LARGE_INTEGER freq, start;
+    Timer() { QueryPerformanceFrequency(&freq); reset(); }
+    void   reset() { QueryPerformanceCounter(&start); }
+    double ms() const
+    {
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        return double(now.QuadPart - start.QuadPart) * 1000.0 / double(freq.QuadPart);
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SHARED APPLICATION STATE
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct App
+{
+    // Lifecycle
+    std::atomic<bool> running{ true };
+    Timer             clock;
+
+    // Haptic → aggregator  (lock-free SPSC)
+    Ring<Sample, cfg::RING_SZ> ring;
+
+    // Haptic → network  (separate SPSC ring, same producer)
+    Ring<Sample, 512> netRing;
+
+    // Aggregator → renderer  (mutex-protected)
+    std::mutex         mtx;
+    std::deque<Candle> candles;
+    Candle             live{};
+    bool               liveOpen{ false };
+
+    // HUD atomics  (written by haptic thread, read by render thread)
+    std::atomic<float>    hx{ 0 }, hy{ 0 }, hz{ 0 }, hmag{ 0 };
+    std::atomic<uint8_t>  hbtn{ 0 };
+    std::atomic<double>   hts{ 0 };
+
+    // Adaptive candle window duration (ms), adjustable at runtime via +/-
+    std::atomic<double> candleMs{ cfg::CANDLE_MS_DEF };
+
+    // Y-range for chart (smoothed via EMA each frame)
+    float yMin{ 0.0f }, yMax{ 0.06f };
+
+    // Network toggle
+    std::atomic<bool>     netEnabled{ true };
+    std::atomic<uint64_t> netPkts{ 0 };
+
+    // Device mode
+    bool demoMode{ false };   // set true when no Falcon found
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  THREAD: HAPTIC
+//  Priority: TIME_CRITICAL  – this is the real-time core
+// ═════════════════════════════════════════════════════════════════════════════
+
+void hapticThread(App& app)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    timeBeginPeriod(1);
+
+    // ── Try to open the Falcon ──────────────────────────────────────────────
+    cHapticDeviceHandler handler;
+    cGenericHapticDevicePtr dev;
+    handler.getDevice(dev, 0);
+
+    bool hasDevice = (dev != nullptr);
+    if (hasDevice)
+    {
+        dev->open();
+        dev->calibrate();
+    }
+    else
+    {
+        app.demoMode = true;
+        printf("[HAPTIC] No device found – running in demo mode.\n");
+    }
+
+    const double periodUs = 1000000.0 / cfg::HAPTIC_HZ;
+    cVector3d zeroForce(0, 0, 0);
+    double demoPhase = 0.0;
+
+    while (app.running)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        float x, y, z, mag;
+        uint8_t btn = 0;
+
+        if (hasDevice)
+        {
+            // ── Real device ────────────────────────────────────────────────
+            cVector3d pos;
+            dev->getPosition(pos);
+            x = (float)pos.x();
+            y = (float)pos.y();
+            z = (float)pos.z();
+            mag = (float)pos.length();  // CHAI3D: sqrt(x^2+y^2+z^2)
+
+            // Read up to 4 buttons
+            bool b[4]{};
+            for (int i = 0; i < 4; ++i) dev->getUserSwitch(i, b[i]);
+            btn = (b[0] ? 0x1 : 0) | (b[1] ? 0x2 : 0) | (b[2] ? 0x4 : 0) | (b[3] ? 0x8 : 0);
+
+            // Optional spring-back force
+            if (cfg::FORCE_K > 0.0)
+            {
+                cVector3d f = pos * (-cfg::FORCE_K);
+                // clampMagnitude not in all CHAI3D builds -- manual clamp:
+                double flen = f.length();
+                if (flen > cfg::FORCE_MAX && flen > 0.0) f *= (cfg::FORCE_MAX / flen);
+                dev->setForce(f);
+            }
+            else
+            {
+                dev->setForce(zeroForce);
+            }
+        }
+        else
+        {
+            // ── Demo: multi-frequency sine ─────────────────────────────────
+            demoPhase += (2.0 * M_PI) / cfg::HAPTIC_HZ;
+            x = 0.035f * (float)sin(demoPhase);
+            y = 0.025f * (float)cos(demoPhase * 1.37);
+            z = 0.018f * (float)sin(demoPhase * 0.73 + 1.0)
+                + 0.010f * (float)sin(demoPhase * 4.1);
+            mag = sqrtf(x * x + y * y + z * z);
+        }
+
+        Sample s;
+        s.ts = app.clock.ms();
+        s.x = x;  s.y = y;  s.z = z;
+        s.mag = mag;
+        s.btn = btn;
+
+        app.ring.push(s);
+        app.netRing.push(s);
+
+        // Update HUD atomics (relaxed – render thread sees them eventually)
+        app.hx.store(x, std::memory_order_relaxed);
+        app.hy.store(y, std::memory_order_relaxed);
+        app.hz.store(z, std::memory_order_relaxed);
+        app.hmag.store(mag, std::memory_order_relaxed);
+        app.hbtn.store(btn, std::memory_order_relaxed);
+        app.hts.store(s.ts, std::memory_order_relaxed);
+
+        // ── Busy-spin for remaining ~1 ms slot ────────────────────────────
+        // Avoids OS sleep jitter; _mm_pause reduces power during spin
+        auto target = t0 + std::chrono::microseconds((long long)periodUs);
+        while (std::chrono::high_resolution_clock::now() < target)
+            _mm_pause();
+    }
+
+    if (hasDevice) dev->close();
+    timeEndPeriod(1);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  THREAD: AGGREGATOR
+//  Drains the ring, builds OHLC candles with jitter-adaptive windows
+// ═════════════════════════════════════════════════════════════════════════════
+
+void aggregatorThread(App& app)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    Sample s{};
+    double winOpen = 0.0;
+    float  cOpen = 0.0f, cClose = 0.0f;
+    float  cHigh = 0.0f, cLow = 1e9f;
+    bool   started = false;
+
+    // Jitter estimator (exponential moving average)
+    double jMean = 1.0, jJit = 0.0, jLast = 0.0;
+
+    while (app.running)
+    {
+        bool any = false;
+
+        while (app.ring.pop(s))
+        {
+            any = true;
+            float mag = s.mag;
+
+            // Update inter-arrival jitter EWMA
+            if (jLast > 0.0)
+            {
+                double iv = s.ts - jLast;
+                double dev = fabs(iv - jMean);
+                jMean += 0.01 * (iv - jMean);
+                jJit += 0.01 * (dev - jJit);
+            }
+            jLast = s.ts;
+
+            // Adaptive duration: widen window up to 3x when jitter is high
+            double scale = 1.0 + std::min(jJit / 2.0, 2.0);
+            double durMs = app.candleMs.load(std::memory_order_relaxed) * scale;
+
+            if (!started)
+            {
+                winOpen = s.ts;
+                cOpen = cClose = cHigh = mag;
+                cLow = mag;
+                started = true;
+            }
+            else
+            {
+                cClose = mag;
+                if (mag > cHigh) cHigh = mag;
+                if (mag < cLow)  cLow = mag;
+
+                if (s.ts - winOpen >= durMs)
+                {
+                    Candle c;
+                    c.t0 = winOpen; c.t1 = s.ts;
+                    c.open = cOpen;   c.close = cClose;
+                    c.high = cHigh;   c.low = cLow;
+                    c.bull = (cClose > cOpen);
+
+                    {
+                        std::lock_guard<std::mutex> lk(app.mtx);
+                        app.candles.push_back(c);
+                        if ((int)app.candles.size() > cfg::MAX_CANDLES)
+                            app.candles.pop_front();
+                    }
+                    started = false;
+                }
+            }
+
+            // Always publish live (forming) candle for the renderer
+            {
+                std::lock_guard<std::mutex> lk(app.mtx);
+                app.live.t0 = winOpen;
+                app.live.t1 = s.ts;
+                app.live.open = cOpen;
+                app.live.close = cClose;
+                app.live.high = cHigh;
+                app.live.low = cLow;
+                app.live.bull = (cClose > cOpen);
+                app.liveOpen = started;
+            }
+        }
+
+        if (!any)
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  THREAD: NETWORK  (UDP broadcast of raw Sample packets)
+// ═════════════════════════════════════════════════════════════════════════════
+
+void networkThread(App& app)
+{
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
+
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) { WSACleanup(); return; }
+
+    BOOL bc = TRUE;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char*)&bc, sizeof(bc));
+
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons((u_short)cfg::NET_PORT);
+    dst.sin_addr.s_addr = INADDR_BROADCAST;
+
+    Sample s{};
+    int counter = 0;
+
+    while (app.running)
+    {
+        if (app.netRing.pop(s))
+        {
+            if (app.netEnabled && (++counter % cfg::NET_EVERY == 0))
+            {
+                sendto(sock, (char*)&s, sizeof(s), 0,
+                    (sockaddr*)&dst, sizeof(dst));
+                app.netPkts.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        else
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+    }
+
+    closesocket(sock);
+    WSACleanup();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  RENDER HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Chart viewport margins in normalised [0..1] coords
+static const float ML = 0.07f, MR = 0.97f, MB = 0.07f, MT = 0.87f;
+
+static void fillRect(float x0, float y0, float x1, float y1,
+    float r, float g, float b, float a = 1.0f)
+{
+    glColor4f(r, g, b, a);
+    glBegin(GL_QUADS);
+    glVertex2f(x0, y0); glVertex2f(x1, y0);
+    glVertex2f(x1, y1); glVertex2f(x0, y1);
+    glEnd();
+}
+
+static void drawCandle(float xc, float hw,
+    float oY, float clY, float hY, float lY,
+    bool bull, float alpha)
+{
+    if (bull) glColor4f(0.114f, 0.722f, 0.416f, alpha);   // #1DB86A green
+    else      glColor4f(0.902f, 0.220f, 0.220f, alpha);   // #E63838 red
+
+    float top = std::max(oY, clY);
+    float bot = std::min(oY, clY);
+    float bh = top - bot;
+    if (bh < 0.0012f) bh = 0.0012f;   // minimum visible body height
+
+    // Candle body
+    glBegin(GL_QUADS);
+    glVertex2f(xc - hw, bot);
+    glVertex2f(xc + hw, bot);
+    glVertex2f(xc + hw, bot + bh);
+    glVertex2f(xc - hw, bot + bh);
+    glEnd();
+
+    // Wicks (upper and lower)
+    glLineWidth(1.5f);
+    glBegin(GL_LINES);
+    glVertex2f(xc, bot + bh); glVertex2f(xc, hY);
+    glVertex2f(xc, bot);      glVertex2f(xc, lY);
+    glEnd();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  GLFW CALLBACKS
+// ═════════════════════════════════════════════════════════════════════════════
+
+static App* g_app = nullptr;
+
+static void onKey(GLFWwindow* w, int key, int, int action, int)
+{
+    if (action != GLFW_PRESS || !g_app) return;
+    switch (key)
+    {
+    case GLFW_KEY_ESCAPE:
+        glfwSetWindowShouldClose(w, GLFW_TRUE);
+        break;
+    case GLFW_KEY_EQUAL:
+    case GLFW_KEY_KP_ADD:
+    {
+        double v = std::min(g_app->candleMs.load() * 1.25, cfg::CANDLE_MS_MAX);
+        g_app->candleMs.store(v);
+        printf("[UI] Candle window: %.0f ms\n", v);
+        break;
+    }
+    case GLFW_KEY_MINUS:
+    case GLFW_KEY_KP_SUBTRACT:
+    {
+        double v = std::max(g_app->candleMs.load() / 1.25, cfg::CANDLE_MS_MIN);
+        g_app->candleMs.store(v);
+        printf("[UI] Candle window: %.0f ms\n", v);
+        break;
+    }
+    case GLFW_KEY_R:
+        g_app->yMin = 0.0f;
+        g_app->yMax = 0.06f;
+        printf("[UI] Y-axis reset.\n");
+        break;
+    case GLFW_KEY_N:
+    {
+        bool en = !g_app->netEnabled.load();
+        g_app->netEnabled.store(en);
+        printf("[UI] Network broadcast: %s\n", en ? "ON" : "OFF");
+        break;
+    }
+    default: break;
+    }
+}
+
+static void onFbSize(GLFWwindow*, int w, int h)
+{
+    glViewport(0, 0, w, h);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MAIN
+// ═════════════════════════════════════════════════════════════════════════════
+
+int main()
+{
+    App app;
+    g_app = &app;
+
+    printf("=== HapticCandlestick ===\n");
+    printf("Controls: +/- candle window | R reset Y | N toggle net | ESC quit\n");
+    printf("UDP broadcast port %d  |  wire format: ts[d8] x[f4] y[f4] z[f4] mag[f4] btn[u1]\n\n",
+        cfg::NET_PORT);
+
+    // ── Launch background threads ──────────────────────────────────────────
+    std::thread tHaptic([&] { hapticThread(app);     });
+    std::thread tAgg([&] { aggregatorThread(app); });
+    std::thread tNet([&] { networkThread(app);    });
+
+    // ── GLFW init ──────────────────────────────────────────────────────────
+    if (!glfwInit())
+    {
+        fprintf(stderr, "glfwInit failed\n");
+        app.running = false;
+        tHaptic.join(); tAgg.join(); tNet.join();
+        return 1;
+    }
+
+    // Compatibility profile so legacy immediate-mode GL works without
+    // setting up VAOs/VBOs (matches what CHAI3D examples use)
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_SAMPLES, 4);   // 4x MSAA
+
+    char title[128];
+    snprintf(title, sizeof(title),
+        "Haptic Candlestick  |  Novint Falcon via CHAI3D  |  UDP port %d",
+        cfg::NET_PORT);
+
+    GLFWwindow* win = glfwCreateWindow(cfg::WIN_W, cfg::WIN_H, title, nullptr, nullptr);
+    if (!win)
+    {
+        fprintf(stderr, "glfwCreateWindow failed\n");
+        glfwTerminate();
+        app.running = false;
+        tHaptic.join(); tAgg.join(); tNet.join();
+        return 1;
+    }
+
+    glfwMakeContextCurrent(win);
+    glfwSwapInterval(1);   // vsync
+    glfwSetKeyCallback(win, onKey);
+    glfwSetFramebufferSizeCallback(win, onFbSize);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_MULTISAMPLE);
+
+    // ── Render loop ────────────────────────────────────────────────────────
+    while (!glfwWindowShouldClose(win))
+    {
+        int fbW, fbH;
+        glfwGetFramebufferSize(win, &fbW, &fbH);
+        glViewport(0, 0, fbW, fbH);
+
+        // Dark navy background
+        glClearColor(0.07f, 0.09f, 0.13f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        // 2D ortho: (0,0) bottom-left, (1,1) top-right
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, 1, 0, 1, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+
+        // ── Snapshot candle data (short critical section) ─────────────────
+        std::deque<Candle> snap;
+        Candle live{};
+        bool   liveOpen = false;
+        {
+            std::lock_guard<std::mutex> lk(app.mtx);
+            snap = app.candles;
+            live = app.live;
+            liveOpen = app.liveOpen;
+        }
+        if (liveOpen) snap.push_back(live);
+
+        int nTotal = (int)snap.size();
+        int nVis = std::min(nTotal, cfg::MAX_CANDLES);
+        int iStart = nTotal - nVis;
+
+        // ── Dynamic Y-axis range (EMA smoothed) ───────────────────────────
+        if (nVis > 0)
+        {
+            float vMin = 1e9f, vMax = -1e9f;
+            for (int i = iStart; i < nTotal; ++i)
+            {
+                if (snap[i].low < vMin) vMin = snap[i].low;
+                if (snap[i].high > vMax) vMax = snap[i].high;
+            }
+            float pad = std::max(0.003f, (vMax - vMin) * (float)cfg::YPAD);
+            app.yMin += (float)cfg::YSMOOTH * ((vMin - pad) - app.yMin);
+            app.yMax += (float)cfg::YSMOOTH * ((vMax + pad) - app.yMax);
+        }
+        float yRange = (app.yMax > app.yMin) ? (app.yMax - app.yMin) : 1e-6f;
+        float CH = MT - MB;
+        float CW = MR - ML;
+
+        // Magnitude → chart Y coordinate
+        auto yOf = [&](float m) -> float {
+            return MB + ((m - app.yMin) / yRange) * CH;
+            };
+
+        // ── Chart background ──────────────────────────────────────────────
+        fillRect(ML, MB, MR, MT, 0.09f, 0.11f, 0.15f);
+
+        // ── Horizontal grid lines ─────────────────────────────────────────
+        const int NGRID = 8;
+        glLineWidth(0.5f);
+        glColor4f(0.28f, 0.32f, 0.40f, 0.55f);
+        glBegin(GL_LINES);
+        for (int i = 0; i <= NGRID; ++i)
+        {
+            float y = MB + CH * ((float)i / NGRID);
+            glVertex2f(ML, y); glVertex2f(MR, y);
+        }
+        // Vertical grid (~10 divisions)
+        for (int i = 0; i <= 10; ++i)
+        {
+            float x = ML + CW * ((float)i / 10.0f);
+            glVertex2f(x, MB); glVertex2f(x, MT);
+        }
+        glEnd();
+
+        // ── Y-axis tick marks ─────────────────────────────────────────────
+        glLineWidth(1.0f);
+        glColor4f(0.45f, 0.50f, 0.60f, 0.7f);
+        glBegin(GL_LINES);
+        for (int i = 0; i <= NGRID; ++i)
+        {
+            float y = MB + CH * ((float)i / NGRID);
+            glVertex2f(ML, y);
+            glVertex2f(ML - 0.012f, y);
+            glVertex2f(MR, y);
+            glVertex2f(MR + 0.006f, y);
+        }
+        glEnd();
+
+        // ── Candles ───────────────────────────────────────────────────────
+        if (nVis > 0)
+        {
+            float slot = CW / (float)nVis;
+            float hw = slot * 0.36f;   // candle body half-width
+
+            for (int i = 0; i < nVis; ++i)
+            {
+                const Candle& c = snap[iStart + i];
+                float xc = ML + (i + 0.5f) * slot;
+                float oY = yOf(c.open);
+                float clY = yOf(c.close);
+                float hY = yOf(c.high);
+                float lY = yOf(c.low);
+                bool  isLive = (i == nVis - 1) && liveOpen;
+
+                drawCandle(xc, hw, oY, clY, hY, lY, c.bull,
+                    isLive ? 0.60f : 1.0f);
+            }
+        }
+
+        // ── Live magnitude crosshair (yellow dashed) ──────────────────────
+        float liveMag = app.hmag.load(std::memory_order_relaxed);
+        float cy = yOf(liveMag);
+        cy = std::max(MB + 0.001f, std::min(MT - 0.001f, cy));
+
+        glLineWidth(1.0f);
+        glColor4f(1.0f, 0.85f, 0.20f, 0.75f);
+        glEnable(GL_LINE_STIPPLE);
+        glLineStipple(2, 0xAAAA);
+        glBegin(GL_LINES);
+        glVertex2f(ML, cy); glVertex2f(MR, cy);
+        glEnd();
+        glDisable(GL_LINE_STIPPLE);
+
+        // ── Axis frame ────────────────────────────────────────────────────
+        glLineWidth(1.2f);
+        glColor3f(0.40f, 0.44f, 0.54f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(ML, MB); glVertex2f(MR, MB);
+        glVertex2f(MR, MT); glVertex2f(ML, MT);
+        glEnd();
+
+        // ── X-axis tick marks ─────────────────────────────────────────────
+        if (nVis > 0)
+        {
+            float slot = CW / (float)nVis;
+            int   every = std::max(1, nVis / 10);
+            glColor3f(0.40f, 0.44f, 0.54f);
+            glLineWidth(1.0f);
+            glBegin(GL_LINES);
+            for (int i = 0; i < nVis; i += every)
+            {
+                float xc = ML + (i + 0.5f) * slot;
+                glVertex2f(xc, MB);
+                glVertex2f(xc, MB - 0.012f);
+            }
+            glEnd();
+        }
+
+        // ── X-axis time label strip ───────────────────────────────────────
+        // Coloured pips below the chart showing time progression
+        if (nVis >= 2)
+        {
+            double t0 = snap[iStart].t0;
+            double t1 = snap[iStart + nVis - 1].t1;
+            double tSpan = std::max(t1 - t0, 1.0);
+            float  slot = CW / (float)nVis;
+            int    every = std::max(1, nVis / 10);
+
+            for (int i = 0; i < nVis; i += every)
+            {
+                float xc = ML + (i + 0.5f) * slot;
+                float frac = (float)((snap[iStart + i].t0 - t0) / tSpan);
+                // Blue → white tint as time progresses left to right
+                fillRect(xc - 0.003f, MB - 0.028f,
+                    xc + 0.003f, MB - 0.015f,
+                    0.35f + 0.45f * frac,
+                    0.45f + 0.35f * frac,
+                    0.85f);
+            }
+        }
+
+        // ── HUD strip (above chart) ───────────────────────────────────────
+        fillRect(0.0f, MT + 0.005f, 1.0f, 1.0f, 0.10f, 0.13f, 0.18f, 0.92f);
+
+        // -- X / Y / Z sign squares --
+        // Green  = positive axis displacement
+        // Red    = negative axis displacement
+        // Grey   = near zero
+        float hx_ = app.hx.load(std::memory_order_relaxed);
+        float hy_ = app.hy.load(std::memory_order_relaxed);
+        float hz_ = app.hz.load(std::memory_order_relaxed);
+        float mag_ = app.hmag.load(std::memory_order_relaxed);
+
+        struct { float cx; float val; } axes[3] = {
+            {0.030f, hx_},
+            {0.065f, hy_},
+            {0.100f, hz_},
+        };
+        for (auto& a : axes)
+        {
+            float r, g, b;
+            if (a.val > 0.003f) { r = 0.15f; g = 0.85f; b = 0.40f; }
+            else if (a.val < -0.003f) { r = 0.90f; g = 0.22f; b = 0.22f; }
+            else { r = 0.45f; g = 0.50f; b = 0.62f; }
+            fillRect(a.cx - 0.010f, MT + 0.018f,
+                a.cx + 0.010f, MT + 0.070f, r, g, b);
+        }
+
+        // -- Magnitude bar (blue, fills proportionally to yMax) --
+        float magFrac = (app.yMax > 0.0f)
+            ? std::min(mag_ / app.yMax, 1.0f) : 0.0f;
+        // Background outline
+        glLineWidth(0.5f);
+        glColor4f(0.35f, 0.40f, 0.50f, 0.6f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(0.13f, MT + 0.025f); glVertex2f(0.28f, MT + 0.025f);
+        glVertex2f(0.28f, MT + 0.065f); glVertex2f(0.13f, MT + 0.065f);
+        glEnd();
+        // Fill
+        fillRect(0.13f, MT + 0.025f, 0.13f + 0.15f * magFrac, MT + 0.065f,
+            0.20f, 0.55f, 0.95f);
+
+        // -- Candle window duration bar (purple) --
+        float durFrac = (float)((app.candleMs.load() - cfg::CANDLE_MS_MIN)
+            / (cfg::CANDLE_MS_MAX - cfg::CANDLE_MS_MIN));
+        glColor4f(0.35f, 0.40f, 0.50f, 0.6f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(0.30f, MT + 0.025f); glVertex2f(0.45f, MT + 0.025f);
+        glVertex2f(0.45f, MT + 0.065f); glVertex2f(0.30f, MT + 0.065f);
+        glEnd();
+        fillRect(0.30f, MT + 0.025f, 0.30f + 0.15f * durFrac, MT + 0.065f,
+            0.55f, 0.25f, 0.90f);
+
+        // -- Ring buffer utilisation (orange bar, top-right) --
+        float ringFrac = (float)app.ring.size() / cfg::RING_SZ;
+        fillRect(0.82f, MT + 0.030f, 0.82f + 0.10f * ringFrac, MT + 0.058f,
+            0.95f, 0.65f, 0.10f);
+
+        // -- Network status pip (green = on, dim = off) --
+        float netA = app.netEnabled ? 0.9f : 0.25f;
+        fillRect(0.940f, MT + 0.020f, 0.965f, MT + 0.070f,
+            0.10f, 0.85f, 0.45f, netA);
+
+        // -- Demo mode amber stripe on left edge --
+        if (app.demoMode)
+            fillRect(0.0f, 0.0f, 0.006f, 1.0f, 0.95f, 0.65f, 0.10f, 0.8f);
+
+        glfwSwapBuffers(win);
+        glfwPollEvents();
+    }
+
+    // ── Graceful shutdown ──────────────────────────────────────────────────
+    app.running = false;
+    tHaptic.join();
+    tAgg.join();
+    tNet.join();
+
+    glfwDestroyWindow(win);
+    glfwTerminate();
+
+    printf("Shutdown complete. Packets sent: %llu\n",
+        (unsigned long long)app.netPkts.load());
+    return 0;
+}
+
+/*
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  OPTIONAL: ADD READABLE TEXT LABELS
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The CHAI3D project has no bundled font renderer. For Y-axis magnitude
+ * numbers and timestamp labels, use one of these options:
+ *
+ *   A) CHAI3D's own cBitmap font  (zero extra setup)
+ *      #include <graphics/CFont.h>
+ *      cFontPtr font = NEW_CFONTCALIBRI20();
+ *      font->renderText("0.045 m", ...);
+ *
+ *   B) stb_truetype  (single header, drop in project folder, no linker changes)
+ *      https://github.com/nothings/stb/blob/master/stb_truetype.h
+ *
+ *   C) FTGL via NuGet  (Install-Package ftgl, adds ftgl.lib + freetype.lib)
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  PYTHON UDP RECEIVER  (run on any machine on the same LAN)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * import socket, struct
+ * s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ * s.bind(('', 9000))
+ * while True:
+ *     data, _ = s.recvfrom(64)
+ *     ts, x, y, z, mag, btn = struct.unpack('<dffffB', data[:25])
+ *     print(f'{ts:10.1f}ms  x={x*1000:+6.2f}  y={y*1000:+6.2f}  '
+ *           f'z={z*1000:+6.2f}  mag={mag*1000:5.2f}mm  btn={btn:04b}')
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
