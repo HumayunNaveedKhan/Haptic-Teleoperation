@@ -1,0 +1,608 @@
+/*
+ * HapticServer.cpp  –  Master / Operator Side
+ * =============================================
+ * Teleoperation logic  :  EBA (Energy Bounding Algorithm) + Force Projection
+ *                         from Dr. Riaz Uddin's implementation (Document 3)
+ * Visualization        :  Candlestick charts (position magnitude, local + remote)
+ *                         Status panel (positions, forces, EBA params, delay)
+ *
+ * Flow per 1-kHz tick:
+ *   1. Read MASTER haptic device position
+ *   2. Non-blocking recv  <- Client: {slave_pos[3], slave_force[3]}
+ *   3. EBA + Projection   -> compute master feedback force
+ *   4. Apply force to MASTER device
+ *   5. Non-blocking send  -> Client: {master_pos[3]}
+ *   6. Feed candle ring buffers
+ *
+ * Keys:  1=toggle force-field  M=mirror  F=fullscreen  Q/ESC=quit
+ * *** SET CLIENT_IP ***
+ */
+
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib,"ws2_32.lib")
+#include <mmsystem.h>
+#pragma comment(lib,"winmm.lib")
+
+#include "chai3d.h"
+using namespace chai3d;
+#include <GLFW/glfw3.h>
+
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  CONFIG   *** SET CLIENT_IP ***
+// ═════════════════════════════════════════════════════════════════════════════
+namespace cfg {
+    static const char* CLIENT_IP = "192.168.0.123"; // slave PC
+    constexpr uint16_t UDP_PORT = 4000;
+    constexpr int      WIN_W = 1600, WIN_H = 900;
+    constexpr int      VISIBLE = 60, MAX_CANDLES = 62;
+    constexpr double   CANDLE_MS = 20.0;
+    constexpr float    YMIN = 0.000f, YMAX = 0.150f; // pos magnitude range (m)
+    constexpr int      Y_DIVS = 5;
+    constexpr double   HAPTIC_HZ = 1000.0;
+    constexpr double   KP = 200.0;   // [N/m] spring (used when EBA off)
+    constexpr int      RING_SZ = 4096;
+    constexpr float    CMB = 0.26f, CMT = 0.97f; // chart bottom/top (norm)
+    constexpr float    PNL = 0.00f, PNH = 0.24f; // status panel (norm)
+}
+
+// ─── UDP Packets (binary, packed) ────────────────────────────────────────────
+#pragma pack(push,1)
+struct C2S { float sx, sy, sz, sfx, sfy, sfz; double ts; }; // slave→master : pos + force + timestamp
+struct S2C { float mx, my, mz;              double ts; }; // master→slave : pos + timestamp
+#pragma pack(pop)
+
+// ─── Teleoperation state (EBA + Projection, identical to Doc-3) ──────────────
+namespace eba {
+    double pos_master[3] = {}, pos_slave[3] = {};   // current positions (m)
+    double Fd[3] = {};                             // slave force received (N) – sign flipped on recv
+    double dFe[3] = {}, BETA[3] = {}, uBETA[3] = {};
+    double Bmax[3] = {}, Bmin[3] = {};
+    double Xd[3] = {}, XdP[3] = {}, DXd[3] = {};
+    double ProjFOR[3] = {}, UnitV[3] = {};
+    double FOR_Mag = 0, InnerProduct = 0;
+    double c1 = 50, c2 = 100;
+    bool   enable = true, projection = true;
+}
+
+// ─── Display state ────────────────────────────────────────────────────────────
+std::atomic<float>  g_lx{ 0 }, g_ly{ 0 }, g_lz{ 0 }, g_lmag{ 0 };  // master live pos
+std::atomic<float>  g_rx{ 0 }, g_ry{ 0 }, g_rz{ 0 }, g_rmag{ 0 };  // slave  live pos
+std::atomic<float>  g_fx{ 0 }, g_fy{ 0 }, g_fz{ 0 }, g_fmag{ 0 };  // applied force
+std::atomic<double> g_delay{ 0 }, g_avgDelay{ 0 };
+std::atomic<uint64_t> g_sent{ 0 }, g_recv{ 0 };
+char g_clientIP[32] = "---";
+bool g_useFF = true, g_mirror = false;
+
+// ─── Candle data structures ───────────────────────────────────────────────────
+struct Sample { double ts; float mag; };
+struct Candle { double t0, t1; float open, close, high, low; bool bull; };
+
+template<typename T, int N>
+struct Ring {
+    static_assert((N& (N - 1)) == 0, "pow2");
+    alignas(64) std::atomic<int> head{ 0 }, tail{ 0 };
+    std::array<T, N> buf{};
+    bool push(const T& v) {
+        int h = head.load(std::memory_order_relaxed), n = (h + 1) & (N - 1);
+        if (n == tail.load(std::memory_order_acquire))return false;
+        buf[h] = v; head.store(n, std::memory_order_release); return true;
+    }
+    bool pop(T& o) {
+        int t = tail.load(std::memory_order_relaxed);
+        if (t == head.load(std::memory_order_acquire))return false;
+        o = buf[t]; tail.store((t + 1) & (N - 1), std::memory_order_release); return true;
+    }
+};
+
+Ring<Sample, cfg::RING_SZ> g_masterRing, g_slaveRing;
+
+std::mutex             g_masterMtx, g_slaveMtx;
+std::deque<Candle>     g_masterCandles, g_slaveCandles;
+Candle                 g_masterLive{}, g_slaveLive{};
+bool                   g_masterLO = false, g_slaveLO = false;
+std::atomic<bool>      g_running{ true };
+
+// ─── Timer ───────────────────────────────────────────────────────────────────
+struct HRTimer {
+    LARGE_INTEGER freq, start;
+    HRTimer() { QueryPerformanceFrequency(&freq); reset(); }
+    void reset() { QueryPerformanceCounter(&start); }
+    double ms()const {
+        LARGE_INTEGER n; QueryPerformanceCounter(&n);
+        return double(n.QuadPart - start.QuadPart) * 1000.0 / double(freq.QuadPart);
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  HAPTIC THREAD   (1 kHz, TIME_CRITICAL)
+// ═════════════════════════════════════════════════════════════════════════════
+void hapticThread() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    timeBeginPeriod(1);
+
+    cHapticDeviceHandler handler; cGenericHapticDevicePtr dev;
+    handler.getDevice(dev, 0);
+    bool has = (dev != nullptr);
+    if (has) { dev->open(); dev->calibrate(); }
+    else printf("[MASTER] Demo mode – no device.\n");
+
+    // UDP setup: server BINDS and waits for client to appear
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    SOCKADDR_IN saddr{}; saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(cfg::UDP_PORT); saddr.sin_addr.s_addr = INADDR_ANY;
+    bind(sock, (SOCKADDR*)&saddr, sizeof(saddr));
+    u_long nb = 1; ioctlsocket(sock, FIONBIO, &nb); // non-blocking
+
+    SOCKADDR_IN caddr{}; int caddrlen = sizeof(caddr);
+
+    HRTimer clock; double demoPhase = 0;
+    C2S pktIn{}; S2C pktOut{};
+    SOCKADDR_IN lastClient{}; bool hasClient = false;
+
+    // delay rolling average
+    double delaySum = 0; int delayCnt = 0;
+
+    while (g_running) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        double nowMs = clock.ms();
+        float x, y, z;
+
+        // ── Read master device ───────────────────────────────────────────────
+        if (has) {
+            cVector3d pos; dev->getPosition(pos);
+            x = (float)pos.x(); y = (float)pos.y(); z = (float)pos.z();
+        }
+        else {
+            demoPhase += (2.0 * M_PI) / cfg::HAPTIC_HZ;
+            x = 0.030f * (float)sin(demoPhase * 1.05f);
+            y = 0.022f * (float)cos(demoPhase * 0.87f);
+            z = 0.014f * (float)sin(demoPhase * 1.40f);
+        }
+        eba::pos_master[0] = x; eba::pos_master[1] = y; eba::pos_master[2] = z;
+
+        // ── Non-blocking recv from slave ─────────────────────────────────────
+        SOCKADDR_IN from{}; int fl = sizeof(from);
+        int r = (int)recvfrom(sock, (char*)&pktIn, sizeof(pktIn), 0, (SOCKADDR*)&from, &fl);
+        if (r == (int)sizeof(pktIn)) {
+            lastClient = from; hasClient = true;
+            // slave position
+            eba::pos_slave[0] = pktIn.sx;
+            eba::pos_slave[1] = pktIn.sy;
+            eba::pos_slave[2] = pktIn.sz;
+            // slave force  (negate: master feels what slave feels)
+            eba::Fd[0] = -pktIn.sfx;
+            eba::Fd[1] = -pktIn.sfy;
+            eba::Fd[2] = -pktIn.sfz;
+            // RTT / delay
+            double rtt = nowMs - pktIn.ts;
+            delaySum += rtt; delayCnt++;
+            g_delay.store(rtt);
+            if (delayCnt >= 200) { g_avgDelay.store(delaySum / delayCnt); delaySum = 0; delayCnt = 0; }
+            g_recv.fetch_add(1, std::memory_order_relaxed);
+            // update client IP string
+            inet_ntop(AF_INET, &from.sin_addr, g_clientIP, sizeof(g_clientIP));
+
+            // update slave ring
+            float sm = sqrtf(pktIn.sx * pktIn.sx + pktIn.sy * pktIn.sy + pktIn.sz * pktIn.sz);
+            g_slaveRing.push({ nowMs,sm });
+            g_rx.store(pktIn.sx); g_ry.store(pktIn.sy); g_rz.store(pktIn.sz);
+            g_rmag.store(sm);
+        }
+
+        // ── EBA + Projection (Doc-3 logic, verbatim) ─────────────────────────
+        cVector3d force(0, 0, 0);
+        if (g_useFF && has) {
+            double FOR_Mag2 = 0;
+            for (int i = 0; i < 3; i++) {
+                eba::XdP[i] = eba::Xd[i];
+                eba::Xd[i] = eba::pos_master[i];
+                eba::DXd[i] = eba::Xd[i] - eba::XdP[i];
+            }
+            if (eba::enable) {
+                for (int i = 0; i < 3; i++) {
+                    if (eba::DXd[i] != 0.0) {
+                        eba::uBETA[i] = eba::BETA[i] = (eba::Fd[i] - eba::dFe[i]) / eba::DXd[i];
+                        double td = eba::dFe[i] / eba::DXd[i];
+                        double sq = sqrt(td * td + eba::c2 * eba::c2);
+                        eba::Bmax[i] = std::min(eba::c2 - td + sq, eba::c1);
+                        eba::Bmin[i] = eba::c2 - td - sq;
+                        eba::BETA[i] = std::max(eba::Bmin[i], std::min(eba::Bmax[i], eba::BETA[i]));
+                    }
+                    eba::dFe[i] += eba::BETA[i] * eba::DXd[i];
+                    FOR_Mag2 += eba::Fd[i] * eba::Fd[i];
+                }
+                eba::FOR_Mag = sqrt(FOR_Mag2);
+                eba::InnerProduct = 0;
+                for (int i = 0; i < 3; i++) {
+                    eba::UnitV[i] = (eba::FOR_Mag > 1e-9) ? eba::Fd[i] / eba::FOR_Mag : 0.0;
+                    eba::InnerProduct += eba::dFe[i] * eba::UnitV[i];
+                }
+                for (int i = 0; i < 3; i++) {
+                    eba::ProjFOR[i] = eba::InnerProduct * eba::UnitV[i];
+                    force((int)i) = eba::projection ? -eba::ProjFOR[i] : -eba::dFe[i];
+                }
+            }
+            else {
+                // EBA off → direct force
+                for (int i = 0; i < 3; i++) force((int)i) = eba::Fd[i];
+            }
+        }
+        if (has) dev->setForce(force);
+
+        // ── Send master pos to slave ─────────────────────────────────────────
+        if (hasClient) {
+            pktOut.mx = (float)eba::pos_master[0];
+            pktOut.my = (float)eba::pos_master[1];
+            pktOut.mz = (float)eba::pos_master[2];
+            pktOut.ts = nowMs;
+            sendto(sock, (char*)&pktOut, sizeof(pktOut), 0, (SOCKADDR*)&lastClient, sizeof(lastClient));
+            g_sent.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // ── Update display globals ───────────────────────────────────────────
+        float lm = sqrtf(x * x + y * y + z * z);
+        g_masterRing.push({ nowMs,lm });
+        g_lx.store(x); g_ly.store(y); g_lz.store(z); g_lmag.store(lm);
+        g_fx.store((float)force.x()); g_fy.store((float)force.y());
+        g_fz.store((float)force.z());
+        g_fmag.store((float)force.length());
+
+        // busy-wait for 1 kHz
+        auto tgt = t0 + std::chrono::microseconds((long long)(1000000.0 / cfg::HAPTIC_HZ));
+        while (std::chrono::high_resolution_clock::now() < tgt) _mm_pause();
+    }
+    if (has) { dev->setForce(cVector3d(0, 0, 0)); dev->close(); }
+    closesocket(sock); WSACleanup(); timeEndPeriod(1);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  AGGREGATOR THREAD  (builds candle deques from ring buffers)
+// ═════════════════════════════════════════════════════════════════════════════
+static void buildCandles(Ring<Sample, cfg::RING_SZ>& ring,
+    std::mutex& mtx, std::deque<Candle>& candles, Candle& live, bool& liveOpen,
+    double& wO, float& cO, float& cC, float& cH, float& cL, bool& started)
+{
+    Sample s{};
+    while (ring.pop(s)) {
+        float m = s.mag;
+        if (!started) { wO = s.ts; cO = cC = cH = cL = m; started = true; }
+        else {
+            cC = m; if (m > cH)cH = m; if (m < cL)cL = m;
+            if (s.ts - wO >= cfg::CANDLE_MS) {
+                Candle c{ wO,s.ts,cO,cC,cH,cL,(cC > cO) };
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    candles.push_back(c);
+                    if ((int)candles.size() > cfg::MAX_CANDLES)candles.pop_front();
+                }
+                started = false;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            live = { wO,s.ts,cO,cC,cH,cL,(cC > cO) }; liveOpen = started;
+        }
+    }
+}
+
+void aggregatorThread() {
+    double lwO = 0, rwO = 0; float lcO = 0, lcC = 0, lcH = 0, lcL = 1e9f, rcO = 0, rcC = 0, rcH = 0, rcL = 1e9f;
+    bool lSt = false, rSt = false;
+    while (g_running) {
+        buildCandles(g_masterRing, g_masterMtx, g_masterCandles, g_masterLive, g_masterLO,
+            lwO, lcO, lcC, lcH, lcL, lSt);
+        buildCandles(g_slaveRing, g_slaveMtx, g_slaveCandles, g_slaveLive, g_slaveLO,
+            rwO, rcO, rcC, rcH, rcL, rSt);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  PIXEL FONT + OPENGL HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+static int g_W = 1600, g_H = 900;
+static const uint8_t GLYPHS[][5] = {
+    {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
+    {0x14,0x7F,0x14,0x7F,0x14},{0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},
+    {0x36,0x49,0x55,0x22,0x50},{0x00,0x05,0x03,0x00,0x00},{0x00,0x1C,0x22,0x41,0x00},
+    {0x00,0x41,0x22,0x1C,0x00},{0x08,0x2A,0x1C,0x2A,0x08},{0x08,0x08,0x3E,0x08,0x08},
+    {0x00,0x50,0x30,0x00,0x00},{0x08,0x08,0x08,0x08,0x08},{0x00,0x60,0x60,0x00,0x00},
+    {0x20,0x10,0x08,0x04,0x02},{0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},
+    {0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},{0x18,0x14,0x12,0x7F,0x10},
+    {0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},{0x00,0x36,0x36,0x00,0x00},
+    {0x00,0x56,0x36,0x00,0x00},{0x00,0x08,0x14,0x22,0x41},{0x14,0x14,0x14,0x14,0x14},
+    {0x41,0x22,0x14,0x08,0x00},{0x02,0x01,0x51,0x09,0x06},{0x30,0x49,0x79,0x41,0x3E},
+    {0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},{0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},
+    {0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},
+    {0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x04,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},
+    {0x1F,0x20,0x40,0x20,0x1F},{0x3F,0x40,0x38,0x40,0x3F},{0x63,0x14,0x08,0x14,0x63},
+    {0x03,0x04,0x78,0x04,0x03},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7F,0x41,0x41,0x00},
+    {0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7F,0x00},{0x04,0x02,0x01,0x02,0x04},
+    {0x40,0x40,0x40,0x40,0x40},{0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},
+    {0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},{0x38,0x44,0x44,0x48,0x7F},
+    {0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x08,0x14,0x54,0x54,0x3C},
+    {0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},
+    {0x00,0x7F,0x10,0x28,0x44},{0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},
+    {0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},{0x7C,0x14,0x14,0x14,0x08},
+    {0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
+    {0x04,0x3F,0x44,0x40,0x20},{0x3C,0x40,0x40,0x40,0x7C},{0x1C,0x20,0x40,0x20,0x1C},
+    {0x3C,0x40,0x30,0x40,0x3C},{0x44,0x28,0x10,0x28,0x44},{0x0C,0x50,0x50,0x50,0x3C},
+    {0x44,0x64,0x54,0x4C,0x44},{0x00,0x08,0x36,0x41,0x00},{0x00,0x00,0x7F,0x00,0x00},
+    {0x00,0x41,0x36,0x08,0x00},{0x08,0x04,0x08,0x10,0x08},
+};
+static const int FS = 2, GW = 5 * FS, GGAP = FS;
+
+static void drawText(float px, float py, const char* s,
+    float r = 1, float g = 1, float b = 1, float a = 1) {
+    if (!s || !s[0])return;
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0, g_W, 0, g_H, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glColor4f(r, g, b, a); glBegin(GL_QUADS);
+    float cx = px;
+    for (const char* p = s; *p; ++p) {
+        int c = (unsigned char)*p; if (c < 32 || c>126) { cx += GW + GGAP; continue; }
+        const uint8_t* col = GLYPHS[c - 32];
+        for (int ci = 0; ci < 5; ++ci) {
+            uint8_t bits = col[ci];
+            for (int ri = 0; ri < 7; ++ri) {
+                if (bits & (1 << ri)) {
+                    float x0 = cx + ci * FS, y0 = py + (6 - ri) * FS, x1 = x0 + FS, y1 = y0 + FS;
+                    glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1);
+                }
+            }
+        }
+        cx += GW + GGAP;
+    }
+    glEnd();
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glMatrixMode(GL_MODELVIEW); glPopMatrix();
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+}
+static void rect(float x0, float y0, float x1, float y1, float r, float g, float b, float a = 1) {
+    glColor4f(r, g, b, a); glBegin(GL_QUADS);
+    glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1); glEnd();
+}
+static inline float yOf(float m, float yb, float yt) {
+    return yb + ((m - cfg::YMIN) / (cfg::YMAX - cfg::YMIN)) * (yt - yb);
+}
+
+// ─── Candlestick chart ─────────────────────────────────────────────────────
+static void drawChart(const std::deque<Candle>& snap, bool liveOpen, float liveMag,
+    float pL, float pR, float MB, float MT,
+    const char* title, float tr, float tg, float tb) {
+    float CW = pR - pL, CH = MT - MB;
+    float slot = CW / (float)cfg::VISIBLE, hw = slot * 0.34f;
+    int nT = (int)snap.size();
+    rect(pL, MB, pR, MT, 0.08f, 0.10f, 0.14f);
+    // grid
+    glLineWidth(0.5f); glColor4f(0.22f, 0.26f, 0.35f, 0.6f); glBegin(GL_LINES);
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) { float gy = MB + CH * ((float)i / cfg::Y_DIVS); glVertex2f(pL, gy); glVertex2f(pR, gy); }
+    for (int i = 0; i <= cfg::VISIBLE; i += 5) { float gx = pL + slot * i; glVertex2f(gx, MB); glVertex2f(gx, MT); }
+    glEnd();
+    // mid line
+    float midY = yOf((cfg::YMIN + cfg::YMAX) * 0.5f, MB, MT);
+    glLineWidth(1.0f); glColor4f(0.40f, 0.50f, 0.70f, 0.7f);
+    glEnable(GL_LINE_STIPPLE); glLineStipple(1, 0xF0F0);
+    glBegin(GL_LINES); glVertex2f(pL, midY); glVertex2f(pR, midY); glEnd();
+    glDisable(GL_LINE_STIPPLE);
+    // Y axis ticks + labels
+    glLineWidth(1.0f); glColor4f(0.45f, 0.50f, 0.60f, 0.8f); glBegin(GL_LINES);
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) { float gy = MB + CH * ((float)i / cfg::Y_DIVS); glVertex2f(pL, gy); glVertex2f(pL - 0.010f, gy); }
+    glEnd();
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) {
+        float frac = (float)i / cfg::Y_DIVS, val = cfg::YMIN + frac * (cfg::YMAX - cfg::YMIN);
+        char lb[12]; snprintf(lb, sizeof(lb), "%.0f", val * 1000.0f);
+        drawText((pL - 0.060f) * g_W, (MB + CH * frac) * g_H - 7, lb, 0.50f, 0.55f, 0.68f);
+    }
+    drawText((pL - 0.058f) * g_W, MT * g_H + 6, "mm", 0.40f, 0.45f, 0.58f);
+    // candles
+    for (int si = 0; si < cfg::VISIBLE; ++si) {
+        int ci = nT - cfg::VISIBLE + si; if (ci < 0)continue;
+        const Candle& c = snap[ci]; float xc = pL + (si + 0.5f) * slot;
+        float oY = yOf(c.open, MB, MT), clY = yOf(c.close, MB, MT);
+        float hY = yOf(c.high, MB, MT), lY = yOf(c.low, MB, MT);
+        float alpha = (ci == nT - 1 && liveOpen) ? 0.55f : 1.0f;
+        if (c.bull)glColor4f(0.11f, 0.72f, 0.42f, alpha);
+        else       glColor4f(0.90f, 0.22f, 0.22f, alpha);
+        float top = std::max(oY, clY), bot = std::min(oY, clY);
+        float bh = top - bot; if (bh < 0.001f)bh = 0.001f;
+        glBegin(GL_QUADS);
+        glVertex2f(xc - hw, bot); glVertex2f(xc + hw, bot); glVertex2f(xc + hw, bot + bh); glVertex2f(xc - hw, bot + bh);
+        glEnd();
+        glLineWidth(1.3f); glBegin(GL_LINES); glVertex2f(xc, bot + bh); glVertex2f(xc, hY); glVertex2f(xc, bot); glVertex2f(xc, lY); glEnd();
+    }
+    // live price line
+    float cy = yOf(liveMag, MB, MT); cy = std::max(MB + 0.001f, std::min(MT - 0.001f, cy));
+    glLineWidth(1.0f); glColor4f(1.0f, 0.85f, 0.20f, 0.80f);
+    glEnable(GL_LINE_STIPPLE); glLineStipple(2, 0xAAAA);
+    glBegin(GL_LINES); glVertex2f(pL, cy); glVertex2f(pR, cy); glEnd();
+    glDisable(GL_LINE_STIPPLE);
+    // border
+    glLineWidth(1.0f); glColor3f(0.35f, 0.40f, 0.50f); glBegin(GL_LINE_LOOP);
+    glVertex2f(pL, MB); glVertex2f(pR, MB); glVertex2f(pR, MT); glVertex2f(pL, MT); glEnd();
+    // X axis time labels
+    glLineWidth(0.8f); glColor3f(0.35f, 0.40f, 0.50f); glBegin(GL_LINES);
+    for (int si = 0; si < cfg::VISIBLE; si += 10) { float gx = pL + (si + 0.5f) * slot; glVertex2f(gx, MB); glVertex2f(gx, MB - 0.012f); }
+    glEnd();
+    for (int si = 0; si < cfg::VISIBLE; si += 10) {
+        int ci = nT - cfg::VISIBLE + si; float gx = pL + (si + 0.5f) * slot; char lb[16];
+        if (ci >= 0 && ci < nT)snprintf(lb, sizeof(lb), "%.1fs", snap[ci].t0 / 1000.0);
+        else snprintf(lb, sizeof(lb), "--");
+        drawText(gx * g_W - 12, (MB - 0.028f) * g_H, lb, 0.45f, 0.50f, 0.60f);
+    }
+    drawText((pL + CW * 0.30f) * g_W, (MT + 0.008f) * g_H, title, tr, tg, tb);
+}
+
+// ─── Status panel ─────────────────────────────────────────────────────────
+static void drawStatusPanel() {
+    const float PNL = cfg::PNL, PNH = cfg::PNH, pH = PNH - PNL;
+    rect(0, PNL, 1, PNH, 0.05f, 0.07f, 0.11f, 0.97f);
+    glLineWidth(0.8f); glColor3f(0.20f, 0.24f, 0.32f);
+    glBegin(GL_LINES); glVertex2f(0, PNH); glVertex2f(1, PNH); glEnd();
+    glBegin(GL_LINES); glVertex2f(0.5f, PNL); glVertex2f(0.5f, PNH); glEnd();
+
+    float r1 = (PNL + pH * 0.87f) * g_H, r2 = (PNL + pH * 0.67f) * g_H;
+    float r3 = (PNL + pH * 0.48f) * g_H, r4 = (PNL + pH * 0.28f) * g_H, r5 = (PNL + pH * 0.10f) * g_H;
+    char buf[128];
+
+    // ── LEFT: Master (local) ──────────────────────────────────────────────
+    drawText(0.02f * g_W, r1, "MASTER  [local]", 0.30f, 0.82f, 0.40f);
+    float lx = g_lx, ly_ = g_ly, lz = g_lz, lm = g_lmag;
+    snprintf(buf, sizeof(buf), "Pos  X:%+.4f  Y:%+.4f  Z:%+.4f   |%.4fm", lx, ly_, lz, lm);
+    drawText(0.02f * g_W, r2, buf, 0.35f, 0.85f, 0.42f);
+    float fx = g_fx, fy = g_fy, fz = g_fz, fm = g_fmag;
+    snprintf(buf, sizeof(buf), "Force X:%+.2f  Y:%+.2f  Z:%+.2f  N   |%.2fN", fx, fy, fz, fm);
+    drawText(0.02f * g_W, r3, buf, 0.90f, 0.40f, 0.30f);
+    // force bar
+    float bL = 0.02f, bR = 0.48f, bY0 = r3 / g_H - 0.030f, bY1 = bY0 + 0.013f;
+    rect(bL, bY0, bR, bY1, 0.12f, 0.14f, 0.18f, 0.8f);
+    float ff = std::min(fm / 8.0f, 1.0f);
+    rect(bL, bY0, bL + (bR - bL) * ff, bY1, ff < 0.5f ? 0.15f : 0.95f, ff < 0.5f ? 0.85f : 0.30f, 0.20f, 0.90f);
+    // EBA params
+    snprintf(buf, sizeof(buf), "EBA:%s  c1:%.0f  c2:%.0f  Proj:%s  FF:%s",
+        eba::enable ? "ON" : "OFF", eba::c1, eba::c2,
+        eba::projection ? "ON" : "OFF", g_useFF ? "ON" : "OFF");
+    drawText(0.02f * g_W, r4, buf, 0.55f, 0.60f, 0.75f);
+    snprintf(buf, sizeof(buf), "Sent:%llu   [1]=FF  [E]=EBA  [P]=Proj  Q=quit",
+        (unsigned long long)g_sent.load());
+    drawText(0.02f * g_W, r5, buf, 0.32f, 0.36f, 0.48f);
+
+    // ── RIGHT: Slave (remote) ─────────────────────────────────────────────
+    drawText(0.52f * g_W, r1, "SLAVE  [remote]", 0.35f, 0.58f, 0.95f);
+    float rx = g_rx, ry = g_ry, rz = g_rz, rm = g_rmag;
+    double lag = g_delay.load(), avg = g_avgDelay.load();
+    float sf = (lag > 300) ? 0.40f : 1.0f;
+    snprintf(buf, sizeof(buf), "Pos  X:%+.4f  Y:%+.4f  Z:%+.4f   |%.4fm", rx, ry, rz, rm);
+    drawText(0.52f * g_W, r2, buf, 0.35f * sf, 0.62f * sf, 0.95f * sf);
+    // EBA dFe display
+    snprintf(buf, sizeof(buf), "Fd   X:%+.2f  Y:%+.2f  Z:%+.2f  N   (recv slave force)",
+        (float)eba::Fd[0], (float)eba::Fd[1], (float)eba::Fd[2]);
+    drawText(0.52f * g_W, r3, buf, 0.65f, 0.65f, 0.30f);
+    // delay bar
+    float lagR = (lag < 5) ? 0.15f : (lag < 20) ? 0.95f : 0.95f;
+    float lagG = (lag < 5) ? 0.90f : (lag < 20) ? 0.85f : 0.25f;
+    float lagB = (lag < 5) ? 0.30f : (lag < 20) ? 0.10f : 0.15f;
+    snprintf(buf, sizeof(buf), "Delay:%.1fms  Avg:%.1fms  Recv:%llu",
+        lag, avg, (unsigned long long)g_recv.load());
+    drawText(0.52f * g_W, r4, buf, lagR, lagG, lagB);
+    float lf = (float)std::min(lag / 50.0, 1.0);
+    rect(0.52f, r4 / g_H - 0.022f, 0.52f + 0.46f * lf, r4 / g_H - 0.012f, lagR, lagG, lagB, 0.80f);
+    rect(0.52f, r4 / g_H - 0.022f, 0.98f, r4 / g_H - 0.012f, 0.15f, 0.18f, 0.24f, 0.40f);
+    snprintf(buf, sizeof(buf), "Client:%s  Port:%d  %s",
+        g_clientIP, cfg::UDP_PORT, lag < 1000 ? "LINK UP" : "WAITING");
+    drawText(0.52f * g_W, r5, buf,
+        lag < 1000 ? 0.35f : 0.65f, lag < 1000 ? 0.75f : 0.35f, lag < 1000 ? 0.40f : 0.30f);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  GLFW CALLBACKS
+// ═════════════════════════════════════════════════════════════════════════════
+static void onKey(GLFWwindow* w, int key, int, int action, int) {
+    if (action != GLFW_PRESS)return;
+    switch (key) {
+    case GLFW_KEY_ESCAPE:case GLFW_KEY_Q: glfwSetWindowShouldClose(w, GLFW_TRUE); break;
+    case GLFW_KEY_1: g_useFF = !g_useFF;   printf("[FF]  %s\n", g_useFF ? "ON" : "OFF"); break;
+    case GLFW_KEY_E: eba::enable = !eba::enable; printf("[EBA] %s\n", eba::enable ? "ON" : "OFF"); break;
+    case GLFW_KEY_P: eba::projection = !eba::projection; printf("[PROJ] %s\n", eba::projection ? "ON" : "OFF"); break;
+    case GLFW_KEY_M: g_mirror = !g_mirror; break;
+    default:break;
+    }
+}
+static void onResize(GLFWwindow*, int w, int h) { glViewport(0, 0, w, h); g_W = w; g_H = h; }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MAIN
+// ═════════════════════════════════════════════════════════════════════════════
+int main() {
+    printf("╔══════════════════════════════════════════════════╗\n");
+    printf("║  Haptic Teleoperation  –  MASTER / SERVER side   ║\n");
+    printf("║  EBA + Projection   Bilateral control   1 kHz    ║\n");
+    printf("╠══════════════════════════════════════════════════╣\n");
+    printf("║  Bind port : %d                                ║\n", cfg::UDP_PORT);
+    printf("║  Keys: 1=FF  E=EBA  P=Proj  M=mirror  Q=quit    ║\n");
+    printf("╚══════════════════════════════════════════════════╝\n\n");
+
+    std::thread tH(hapticThread);
+    std::thread tA(aggregatorThread);
+
+    if (!glfwInit()) { g_running = false; tH.join(); tA.join(); return 1; }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+
+    GLFWwindow* win = glfwCreateWindow(cfg::WIN_W, cfg::WIN_H,
+        "Haptic Teleoperation – MASTER (Server)", nullptr, nullptr);
+    if (!win) { glfwTerminate(); g_running = false; tH.join(); tA.join(); return 1; }
+
+    glfwMakeContextCurrent(win); glfwSwapInterval(1);
+    glfwSetKeyCallback(win, onKey); glfwSetFramebufferSizeCallback(win, onResize);
+    glfwGetFramebufferSize(win, &g_W, &g_H);
+
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_LINE_SMOOTH); glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_MULTISAMPLE);
+
+    const float LCL = 0.07f, LCR = 0.49f, RCL = 0.51f, RCR = 0.93f;
+
+    while (!glfwWindowShouldClose(win)) {
+        glfwGetFramebufferSize(win, &g_W, &g_H);
+        glViewport(0, 0, g_W, g_H);
+        glClearColor(0.05f, 0.07f, 0.10f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+
+        std::deque<Candle> mSnap, sSnap;
+        Candle mLive{}, sLive{}; bool mLO = false, sLO = false;
+        { std::lock_guard<std::mutex> lk(g_masterMtx); mSnap = g_masterCandles; mLive = g_masterLive; mLO = g_masterLO; }
+        { std::lock_guard<std::mutex> lk(g_slaveMtx); sSnap = g_slaveCandles; sLive = g_slaveLive; sLO = g_slaveLO; }
+        if (mLO)mSnap.push_back(mLive);
+        if (sLO)sSnap.push_back(sLive);
+
+        // centre divider
+        glLineWidth(1.5f); glColor3f(0.22f, 0.28f, 0.38f);
+        glBegin(GL_LINES); glVertex2f(0.5f, cfg::PNH); glVertex2f(0.5f, 1.0f); glEnd();
+
+        drawChart(mSnap, mLO, g_lmag.load(), LCL, LCR, cfg::CMB, cfg::CMT,
+            "MASTER  position magnitude", 0.28f, 0.82f, 0.38f);
+        drawChart(sSnap, sLO, g_rmag.load(), RCL, RCR, cfg::CMB, cfg::CMT,
+            "SLAVE  position magnitude", 0.35f, 0.58f, 0.95f);
+
+        drawStatusPanel();
+
+        glfwSwapBuffers(win); glfwPollEvents();
+    }
+
+    g_running = false;
+    tH.join(); tA.join();
+    glfwDestroyWindow(win); glfwTerminate();
+    printf("Shutdown. Sent:%llu  Recv:%llu\n",
+        (unsigned long long)g_sent.load(), (unsigned long long)g_recv.load());
+    return 0;
+}
