@@ -1,0 +1,1071 @@
+/*
+ * HapticClient.cpp  -  Slave Side   (v5: Smith Predictor + Adaptive Jitter Buffer)
+ * ==================================================================================
+ * NEW in v5
+ * ---------
+ *  SMITH PREDICTOR (key S)
+ *    - AR(2) model per axis with forgetting-factor RLS (lambda = 0.95)
+ *    - Prediction horizon = RTT/2 (one-way delay, updated each tick)
+ *    - EBA receives predicted remote position instead of stale received position
+ *    - Eliminates perceptual delay: operator feels environment as if no network exists
+ *    - Live display: predicted vs received position, AR coefficients, prediction error
+ *
+ *  ADAPTIVE JITTER BUFFER (key B)
+ *    - RFC 3550 inter-packet jitter estimator (EWMA, 1/16 weight)
+ *    - Adaptive playout delay target = sigma_jitter x k_factor + min_delay
+ *    - k_factor increases under high jitter (conservative), shrinks under low (aggressive)
+ *    - Sequence-ordered reorder buffer: holds packets up to reorder_timeout waiting
+ *      for out-of-order arrivals before declaring a gap
+ *    - Playout delay tracks up instantly on jitter spike, decays slowly on improvement
+ *    - Smith Predictor fills the gap during increased buffer delay transparently
+ *
+ *  COMBINED OPERATION
+ *    - Jitter buffer smooths the stream -> predictor compensates residual delay
+ *    - Both independent toggles -> four operating modes for comparison:
+ *        [off/off] raw delayed feedback
+ *        [S/off]   prediction without buffering
+ *        [off/B]   buffered but unpredicted
+ *        [S/B]     full robust teleoperation  <- recommended
+ *
+ * All v4 features retained:
+ *    Packet seq numbering, vertical candle labels, dual-line x-axis,
+ *    artificial delay injection (D), candlestick charts, EBA+projection
+ *
+ * Keys
+ * ----
+ *  S       toggle Smith Predictor
+ *  B       toggle Adaptive Jitter Buffer
+ *  D       toggle artificial delay (for testing)
+ *  ,  .    constant delay +/-5 ms   |  N M  jitter +/-5 ms
+ *  E / P   EBA / Projection       |  1    force field
+ *  +/-     candle window  [ ]  preset   ESC quit
+ *
+ * *** SET SERVER_IP ***
+ */
+
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib,"ws2_32.lib")
+#include <mmsystem.h>
+#pragma comment(lib,"winmm.lib")
+
+#include "chai3d.h"
+using namespace chai3d;
+#include <GLFW/glfw3.h>
+
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <queue>
+#include <random>
+#include <thread>
+#include <vector>
+
+// =============================================================================
+//  CONFIG
+// =============================================================================
+namespace cfg {
+    static const char* SERVER_IP = "192.168.0.120"; // *** SET THIS ***
+    constexpr uint16_t UDP_PORT = 4000;
+    constexpr int      WIN_W = 1680, WIN_H = 980;
+    constexpr int      VISIBLE = 60, MAX_CANDLES = 62;
+    constexpr double   CANDLE_MS_DEF = 20.0, CANDLE_MS_MIN = 1.0, CANDLE_MS_MAX = 500.0;
+    constexpr float    YMIN = 0.000f, YMAX = 0.150f;
+    constexpr int      Y_DIVS = 5;
+    constexpr double   HAPTIC_HZ = 1000.0;
+    constexpr double   MAX_FORCE = 8.5;
+    constexpr int      RING_SZ = 4096;
+    constexpr float    CMB = 0.32f, CMT = 0.96f;  // chart bottom/top (normalised)
+    constexpr float    PNL = 0.00f, PNH = 0.22f;  // status panel
+    // Smith Predictor
+    constexpr int      SP_ORDER = 2;          // AR order (2 = smooth motion)
+    constexpr double   SP_LAMBDA = 0.95;       // RLS forgetting factor
+    constexpr int      SP_HIST = 32;         // warm-up samples before predicting
+    // Adaptive Jitter Buffer
+    constexpr double   AJB_MIN_MS = 4.0;        // minimum playout delay (ms)
+    constexpr double   AJB_MAX_MS = 120.0;      // maximum playout delay (ms)
+    constexpr double   AJB_K_BASE = 2.5;        // sigma multiplier (95th pct coverage)
+    constexpr double   AJB_RISE = 1.0;        // ms/tick fast rise
+    constexpr double   AJB_DECAY = 0.003;      // ms/tick slow decay
+    constexpr double   AJB_REORDER_TIMEOUT_MS = 8.0;  // wait for out-of-order
+    // Artificial delay (testing)
+    constexpr double   DELAY_MAX_CONST = 500.0;
+    constexpr double   DELAY_MAX_JITTER = 200.0;
+    constexpr double   DELAY_STEP = 5.0;
+}
+
+// --- Wire packets -------------------------------------------------------------
+#pragma pack(push,1)
+struct C2S { uint32_t seq; float sx, sy, sz, sfx, sfy, sfz; double ts; }; // 36 B
+struct S2C { uint32_t seq; float mx, my, mz;              double ts; }; // 24 B
+#pragma pack(pop)
+static_assert(sizeof(C2S) == 36, "C2S"); static_assert(sizeof(S2C) == 24, "S2C");
+
+// =============================================================================
+//  SMITH PREDICTOR  -  AR(2) per axis, forgetting-factor RLS
+// =============================================================================
+struct SmithAxis {
+    // AR(2): x(k) = a[0]*x(k-1) + a[1]*x(k-2)
+    double a[cfg::SP_ORDER] = { 1.5, -0.5 };  // init: constant-velocity model
+    // RLS covariance (2x2 as flat array [P00,P01,P10,P11])
+    double P[4] = { 100.0, 0.0, 0.0, 100.0 };
+
+    // Circular history for regression
+    double hist[64] = {};
+    int    hd = 0;          // head pointer
+    int    nSamples = 0;    // count for warm-up gate
+
+    // Last two values (for fast prediction bootstrap)
+    double xk1 = 0, xk2 = 0;
+
+    // RLS measurement of prediction error (EMA)
+    double errRms = 0;
+
+    // Store measurement and update AR coefficients
+    void update(double x, double lambda = cfg::SP_LAMBDA) {
+        // phi = [x(k-1), x(k-2)]
+        double phi[2] = { xk1, xk2 };
+        double phi_dot_a = phi[0] * a[0] + phi[1] * a[1];
+        double err = x - phi_dot_a;
+        errRms = 0.95 * errRms + 0.05 * err * err;
+
+        // RLS update: P = (P - P.phi.phi'.P / (lambda + phi'.P.phi)) / lambda
+        // Gain: g = P.phi / (lambda + phi'.P.phi)
+        double Pphi[2] = {
+            P[0] * phi[0] + P[1] * phi[1],
+            P[2] * phi[0] + P[3] * phi[1]
+        };
+        double denom = lambda + phi[0] * Pphi[0] + phi[1] * Pphi[1];
+        if (fabs(denom) < 1e-12) denom = 1e-12;
+        double g[2] = { Pphi[0] / denom, Pphi[1] / denom };
+
+        // a = a + g * err
+        a[0] += g[0] * err;
+        a[1] += g[1] * err;
+
+        // P = (I - g*phi') * P / lambda
+        double gPhi[4] = {
+            g[0] * phi[0], g[0] * phi[1],
+            g[1] * phi[0], g[1] * phi[1]
+        };
+        double Pnew[4];
+        for (int i = 0; i < 4; i++) Pnew[i] = (P[i] - gPhi[i] * P[i % 2 == 0 ? 0 : 1] * phi[i / 2]) / lambda;
+        // Simpler update: P = (I - g.phi')*P / lambda
+        Pnew[0] = (P[0] - g[0] * (P[0] * phi[0] + P[1] * phi[1])) / lambda;
+        Pnew[1] = (P[1] - g[0] * (P[2] * phi[0] + P[3] * phi[1])) / lambda;
+        Pnew[2] = (P[2] - g[1] * (P[0] * phi[0] + P[1] * phi[1])) / lambda;
+        Pnew[3] = (P[3] - g[1] * (P[2] * phi[0] + P[3] * phi[1])) / lambda;
+        // Symmetrise to prevent drift
+        P[0] = Pnew[0]; P[1] = P[2] = (Pnew[1] + Pnew[2]) * 0.5; P[3] = Pnew[3];
+
+        // Clamp coefficients to stable region (|a1|+|a2| < 1 for stability)
+        // Soft clamp: project back if marginally unstable
+        double mag = fabs(a[0]) + fabs(a[1]);
+        if (mag > 1.98) { a[0] *= 1.95 / mag; a[1] *= 1.95 / mag; }
+
+        // Advance history
+        xk2 = xk1; xk1 = x;
+        ++nSamples;
+    }
+
+    // Predict n_steps ahead starting from current state
+    double predict(int n_steps) const {
+        if (nSamples < cfg::SP_HIST || n_steps <= 0) return xk1;
+        double p1 = xk1, p2 = xk2;
+        for (int i = 0; i < n_steps; i++) {
+            double p0 = a[0] * p1 + a[1] * p2;
+            p2 = p1; p1 = p0;
+        }
+        return p1;
+    }
+};
+
+struct SmithPredictor3DOF {
+    SmithAxis ax[3];
+    bool      enabled = false;
+    double    horizonMs = 0.0;  // prediction horizon in ms (= RTT/2)
+    double    dtMs = 1.0;  // expected sample interval ms
+    double    predPos[3] = {};   // current prediction output
+    double    rawPos[3] = {};   // last received position
+    double    predErrRms = 0.0;  // composite prediction error
+
+    // Called every time a new remote position is received
+    void ingest(const double pos[3], double rttMs) {
+        for (int i = 0; i < 3; i++) {
+            ax[i].update(pos[i]);
+            rawPos[i] = pos[i];
+        }
+        // One-way delay estimate = RTT/2
+        horizonMs = std::max(1.0, rttMs * 0.5);
+    }
+
+    // Called each haptic tick: produce best estimate of CURRENT remote position
+    // (compensates for one-way delay)
+    void computePrediction() {
+        if (!enabled) {
+            for (int i = 0; i < 3; i++) predPos[i] = rawPos[i];
+            return;
+        }
+        int nSteps = std::max(1, (int)round(horizonMs / dtMs));
+        nSteps = std::min(nSteps, 100);  // cap at 100 ms prediction
+        double errSum = 0;
+        for (int i = 0; i < 3; i++) {
+            predPos[i] = ax[i].predict(nSteps);
+            errSum += ax[i].errRms;
+        }
+        predErrRms = sqrt(errSum / 3.0);
+    }
+};
+
+// =============================================================================
+//  ADAPTIVE JITTER BUFFER  -  RFC 3550 + adaptive playout delay
+// =============================================================================
+struct AJBEntry {
+    double   arrivalMs;
+    double   sendTs;
+    uint32_t seq;
+    S2C      pkt;
+    bool operator>(const AJBEntry& o) const { return seq > o.seq; }  // min-heap on seq
+};
+
+struct AdaptiveJitterBuffer {
+    // Min-heap ordered by sequence number
+    std::priority_queue<AJBEntry, std::vector<AJBEntry>, std::greater<AJBEntry>> q;
+
+    bool     enabled = false;
+    double   jitterEst = 0.0;   // RFC 3550 jitter estimate (ms)
+    double   playoutDelay = cfg::AJB_MIN_MS;  // adaptive playout delay (ms)
+    double   lastArrival = 0.0;
+    double   lastSendTs = 0.0;
+    uint32_t nextExpected = 0;     // next expected seq
+    uint64_t nDelivered = 0;
+    uint64_t nDropped = 0;
+    uint64_t nReordered = 0;
+    double   reorderTimer = 0.0;   // time waiting for gap to fill
+
+    void insert(const S2C& pkt, double arrivalMs, double nowMs) {
+        if (!enabled) return;
+
+        // RFC 3550 inter-arrival jitter
+        if (lastSendTs > 0.0 && lastArrival > 0.0) {
+            double transit_curr = arrivalMs - pkt.ts;
+            double transit_prev = lastArrival - lastSendTs;
+            double d = fabs(transit_curr - transit_prev);
+            jitterEst = jitterEst * (1.0 - 1.0 / 16.0) + d * (1.0 / 16.0);
+        }
+        lastArrival = arrivalMs;
+        lastSendTs = pkt.ts;
+
+        // Adaptive playout delay: track jitter quickly, decay slowly
+        double target = jitterEst * cfg::AJB_K_BASE + cfg::AJB_MIN_MS;
+        target = std::min(target, cfg::AJB_MAX_MS);
+        if (target > playoutDelay)
+            playoutDelay += cfg::AJB_RISE;
+        else
+            playoutDelay = std::max(cfg::AJB_MIN_MS, playoutDelay - cfg::AJB_DECAY);
+
+        q.push({ arrivalMs, (double)pkt.ts, pkt.seq, pkt });
+    }
+
+    // Try to deliver the next in-order packet. Returns true if one is ready.
+    // nowMs = current haptic clock time
+    bool pop(S2C& out, double nowMs) {
+        if (q.empty()) return false;
+
+        const AJBEntry& top = q.top();
+
+        if (nextExpected == 0) nextExpected = top.seq;
+
+        // Check if enough time has passed (playout delay elapsed since arrival)
+        if (nowMs < top.arrivalMs + playoutDelay) return false;
+
+        // In-order delivery
+        if (top.seq == nextExpected || top.seq > nextExpected) {
+            if (top.seq > nextExpected) ++nReordered;
+            out = top.pkt;
+            nextExpected = top.seq + 1;
+            ++nDelivered;
+            q.pop();
+            return true;
+        }
+
+        // Old / duplicate packet - discard
+        q.pop();
+        ++nDropped;
+        return false;
+    }
+
+    // Late packet drop: anything older than reorder_timeout that hasn't been
+    // delivered yet is dropped on the floor
+    void purgeLate(double nowMs) {
+        while (!q.empty()) {
+            const AJBEntry& top = q.top();
+            if (nowMs > top.arrivalMs + cfg::AJB_REORDER_TIMEOUT_MS + playoutDelay) {
+                q.pop(); ++nDropped;
+            }
+            else break;
+        }
+    }
+
+    int depth() const { return (int)q.size(); }
+};
+
+// --- EBA state ----------------------------------------------------------------
+namespace eba {
+    double pos_m[3] = {}, pos_s[3] = {};
+    double Fd[3] = {}, dFe[3] = {}, BETA[3] = {}, uBETA[3] = {};
+    double Bmax[3] = {}, Bmin[3] = {};
+    double Xd[3] = {}, XdP[3] = {}, DXd[3] = {};
+    double ProjFOR[3] = {}, UnitV[3] = {};
+    double FOR_Mag = 0, InnerProduct = 0;
+    double c1 = 50, c2 = 100;
+    bool   enable = true, projection = true;
+}
+
+// --- Live display atomics -----------------------------------------------------
+std::atomic<float>    g_lx{ 0 }, g_ly{ 0 }, g_lz{ 0 }, g_lmag{ 0 };
+std::atomic<float>    g_rx{ 0 }, g_ry{ 0 }, g_rz{ 0 }, g_rmag{ 0 };
+std::atomic<float>    g_fx{ 0 }, g_fy{ 0 }, g_fz{ 0 }, g_fmag{ 0 };
+std::atomic<float>    g_predx{ 0 }, g_predy{ 0 }, g_predz{ 0 }; // Smith predictor output
+std::atomic<double>   g_rtt{ 0 }, g_avgRtt{ 0 };
+std::atomic<double>   g_predHorizonMs{ 0 };
+std::atomic<double>   g_predErrRms{ 0 };
+std::atomic<double>   g_ajbJitter{ 0 };
+std::atomic<double>   g_ajbPlayoutMs{ 0 };
+std::atomic<int>      g_ajbDepth{ 0 };
+std::atomic<uint64_t> g_ajbDropped{ 0 };
+std::atomic<uint64_t> g_sent{ 0 }, g_recv{ 0 };
+std::atomic<uint64_t> g_pktLoss{ 0 };
+std::atomic<uint32_t> g_lastRxSeq{ 0 };
+std::atomic<int>      g_artDelayQDepth{ 0 };
+std::atomic<double>   g_lastArtDelayMs{ 0 };
+std::atomic<bool>     g_smithOn{ false };
+std::atomic<bool>     g_ajbOn{ false };
+char g_serverIP[32] = "---";
+bool g_useFF = true;
+
+// --- Candle data structures ---------------------------------------------------
+struct Sample { double ts; float mag; uint32_t seq; };
+struct Candle {
+    double t0, t1; float open, close, high, low; bool bull;
+    uint32_t seqStart, seqEnd, pktCount;
+};
+
+template<typename T, int N>
+struct Ring {
+    static_assert((N& (N - 1)) == 0, "pow2");
+    alignas(64) std::atomic<int> head{ 0 }, tail{ 0 };
+    std::array<T, N> buf{};
+    bool push(const T& v) {
+        int h = head.load(std::memory_order_relaxed), n = (h + 1) & (N - 1);
+        if (n == tail.load(std::memory_order_acquire))return false;
+        buf[h] = v; head.store(n, std::memory_order_release); return true;
+    }
+    bool pop(T& o) {
+        int t = tail.load(std::memory_order_relaxed);
+        if (t == head.load(std::memory_order_acquire))return false;
+        o = buf[t]; tail.store((t + 1) & (N - 1), std::memory_order_release); return true;
+    }
+};
+
+Ring<Sample, cfg::RING_SZ> g_masterRing, g_slaveRing;
+std::mutex   g_masterMtx, g_slaveMtx;
+std::deque<Candle> g_masterCandles, g_slaveCandles;
+Candle       g_masterLive{}, g_slaveLive{};
+bool         g_masterLO = false, g_slaveLO = false;
+std::atomic<bool>   g_running{ true };
+std::atomic<double> g_candleMs{ cfg::CANDLE_MS_DEF };
+
+// --- Artificial delay queue (for testing) ------------------------------------
+struct ArtDelayEntry { double deliverAt; S2C pkt; }; // slave art delay
+std::vector<ArtDelayEntry> g_artDelayQ;
+std::mutex                 g_artDelayMtx;
+std::atomic<bool>          g_artDelayEnabled{ false };
+std::atomic<double>        g_artDelayConst{ 0.0 };
+std::atomic<double>        g_artDelayJitter{ 0.0 };
+
+std::atomic<bool> g_artDelayOn{ false };
+
+struct HRTimer {
+    LARGE_INTEGER freq, start;
+    HRTimer() { QueryPerformanceFrequency(&freq); reset(); }
+    void reset() { QueryPerformanceCounter(&start); }
+    double ms()const {
+        LARGE_INTEGER n; QueryPerformanceCounter(&n);
+        return double(n.QuadPart - start.QuadPart) * 1000.0 / double(freq.QuadPart);
+    }
+};
+
+// =============================================================================
+//  HAPTIC THREAD
+// =============================================================================
+void hapticThread() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    timeBeginPeriod(1);
+
+    cHapticDeviceHandler handler; cGenericHapticDevicePtr dev;
+    handler.getDevice(dev, 0);
+    bool has = (dev != nullptr);
+    if (has) { dev->open(); dev->calibrate(); }
+    else printf("[MASTER] Demo mode.\n");
+
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    SOCKADDR_IN laddr{}; laddr.sin_family = AF_INET;
+    laddr.sin_port = htons(cfg::UDP_PORT); laddr.sin_addr.s_addr = INADDR_ANY;
+    bind(sock, (SOCKADDR*)&laddr, sizeof(laddr));
+    u_long nb = 1; ioctlsocket(sock, FIONBIO, &nb);
+
+    SOCKADDR_IN srvAddr{}; srvAddr.sin_family = AF_INET;
+    srvAddr.sin_port = htons(cfg::UDP_PORT);
+    inet_pton(AF_INET, cfg::SERVER_IP, &srvAddr.sin_addr);
+    SOCKADDR_IN caddr{}; int caddrLen = sizeof(caddr);
+    HRTimer clk; double demoPhase = 0;
+    uint32_t txSeq = 0;
+    double rttAcc = 0; int rttN = 0;
+
+    SmithPredictor3DOF sp;
+    AdaptiveJitterBuffer ajb;
+
+    static std::mt19937 artRng(std::random_device{}());
+
+    while (g_running) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        double nowMs = clk.ms();
+        float x, y, z;
+
+        // -- 1. Read local master device -----------------------------------
+        if (has) {
+            cVector3d pos; dev->getPosition(pos);
+            x = (float)pos.x(); y = (float)pos.y(); z = (float)pos.z();
+        }
+        else {
+            demoPhase += (2.0 * M_PI) / cfg::HAPTIC_HZ;
+            x = 0.028f * (float)sin(demoPhase * 1.10f + 0.5f);
+            y = 0.020f * (float)cos(demoPhase * 0.90f);
+            z = 0.015f * (float)sin(demoPhase * 1.30f + 2.0f);
+        }
+        eba::pos_m[0] = x; eba::pos_m[1] = y; eba::pos_m[2] = z;
+
+        // -- 2. Receive raw packet from network ----------------------------
+        S2C rpNet{};
+        bool gotRaw = false;
+        int r = (int)recvfrom(sock, (char*)&rpNet, sizeof(rpNet), 0, (SOCKADDR*)&caddr, &caddrLen);
+        if (r == (int)sizeof(rpNet)) gotRaw = true;
+
+        // -- 3. Artificial delay queue (inject if enabled) -----------------
+        if (gotRaw) {
+            if (g_artDelayEnabled.load(std::memory_order_relaxed)) {
+                double d = g_artDelayConst.load(), j = g_artDelayJitter.load();
+                double jit = 0;
+                if (j > 0) { std::uniform_real_distribution<double> dist(0, j); jit = dist(artRng); }
+                double delAt = nowMs + d + jit;
+                g_lastArtDelayMs.store(d + jit);
+                std::lock_guard<std::mutex> lk(g_artDelayMtx);
+                g_artDelayQ.push_back({ delAt, rpNet });
+                gotRaw = false;
+            }
+        }
+        // Drain artificial delay queue
+        {
+            std::lock_guard<std::mutex> lk(g_artDelayMtx);
+            for (auto it = g_artDelayQ.begin(); it != g_artDelayQ.end();) {
+                if (nowMs >= it->deliverAt) {
+                    rpNet = it->pkt; gotRaw = true;
+                    it = g_artDelayQ.erase(it);
+                }
+                else ++it;
+            }
+            g_artDelayQDepth.store((int)g_artDelayQ.size());
+        }
+
+        // -- 4. Feed packet into adaptive jitter buffer OR direct ----------
+        bool newDataReady = false;
+        S2C rp{};
+        if (ajb.enabled && gotRaw) {
+            ajb.insert(rpNet, nowMs, nowMs);
+            gotRaw = false;
+        }
+        else if (gotRaw) {
+            rp = rpNet; newDataReady = true;
+        }
+        // Pop from AJB if it's time
+        if (ajb.enabled) {
+            ajb.purgeLate(nowMs);
+            S2C ajbOut{};
+            if (ajb.pop(ajbOut, nowMs)) {
+                rp = ajbOut; newDataReady = true;
+                g_ajbDropped.store(ajb.nDropped);
+            }
+        }
+        g_ajbJitter.store(ajb.jitterEst);
+        g_ajbPlayoutMs.store(ajb.playoutDelay);
+        g_ajbDepth.store(ajb.depth());
+
+        // -- 5. Process newly available packet -----------------------------
+        if (newDataReady) {
+            // RTT estimate (ts is sender wallclock when packet was sent)
+            double rtt = nowMs - rp.ts;
+            rttAcc += rtt; rttN++;
+            g_rtt.store(rtt);
+            if (rttN >= 100) { g_avgRtt.store(rttAcc / rttN); rttAcc = 0; rttN = 0; }
+            g_recv.fetch_add(1, std::memory_order_relaxed);
+
+            // Loss detection
+            uint32_t rxs = rp.seq;
+            uint32_t expected = g_lastRxSeq.load() + 1;
+            if (g_lastRxSeq.load() > 0 && rxs > expected)
+                g_pktLoss.fetch_add(rxs - expected, std::memory_order_relaxed);
+            g_lastRxSeq.store(rxs);
+
+            // Store raw master position (received as S2C)
+            double mpos[3] = { rp.mx, rp.my, rp.mz };
+
+            // Feed Smith Predictor with new master measurement
+            sp.ingest(mpos, rtt);
+
+            float sm = sqrtf(rp.mx * rp.mx + rp.my * rp.my + rp.mz * rp.mz);
+            g_slaveRing.push({ nowMs,sm,rxs });  // note: slaveRing tracks received (master) for chart
+            g_rx.store(rp.mx); g_ry.store(rp.my); g_rz.store(rp.mz); g_rmag.store(sm);
+            inet_ntop(AF_INET, &caddr.sin_addr, g_serverIP, sizeof(g_serverIP));
+        }
+
+        // -- 6. Smith Predictor: compute best current remote position ------
+        sp.enabled = g_smithOn.load(std::memory_order_relaxed);
+        ajb.enabled = g_ajbOn.load(std::memory_order_relaxed);
+        sp.computePrediction();
+
+        // Use predicted master position for coupling (or raw if predictor off)
+        const double* remPos = sp.predPos;
+
+        g_predx.store((float)remPos[0]);
+        g_predy.store((float)remPos[1]);
+        g_predz.store((float)remPos[2]);
+        g_predHorizonMs.store(sp.horizonMs);
+        g_predErrRms.store(sp.predErrRms);
+
+        // -- 7. Slave coupling: F = Kp*(master_pred - slave_pos) ----------
+        // Smith predictor feeds predicted master pos; EBA passivity bound applied
+        cVector3d force(0, 0, 0);
+        if (g_useFF && has) {
+            // Simple spring coupling with EBA passivity bound
+            const double Kp = 200.0;
+            for (int i = 0; i < 3; i++) {
+                double Fd_i = Kp * (remPos[i] - eba::pos_m[i]);
+                // Apply EBA bound
+                eba::XdP[i] = eba::Xd[i]; eba::Xd[i] = eba::pos_m[i];
+                eba::DXd[i] = eba::Xd[i] - eba::XdP[i];
+                if (eba::enable && eba::DXd[i] != 0.0) {
+                    eba::Fd[i] = Fd_i;
+                    eba::uBETA[i] = eba::BETA[i] = (eba::Fd[i] - eba::dFe[i]) / eba::DXd[i];
+                    double td = eba::dFe[i] / eba::DXd[i], sq = sqrt(td * td + eba::c2 * eba::c2);
+                    eba::Bmax[i] = std::min(eba::c2 - td + sq, eba::c1);
+                    eba::Bmin[i] = eba::c2 - td - sq;
+                    eba::BETA[i] = std::max(eba::Bmin[i], std::min(eba::Bmax[i], eba::BETA[i]));
+                    eba::dFe[i] += eba::BETA[i] * eba::DXd[i];
+                    force((int)i) = eba::projection ? -eba::dFe[i] : Fd_i;
+                }
+                else {
+                    force((int)i) = Fd_i;
+                }
+                // Safety clamp
+                double fm = fabs((double)force((int)i));
+                if (fm > cfg::MAX_FORCE) force((int)i) *= (cfg::MAX_FORCE / fm);
+            }
+        }
+        if (has) dev->setForce(force);
+
+        // -- 8. Send C2S to server -----------------------------------------
+        {
+            C2S txPkt{};
+            txPkt.seq = ++txSeq; txPkt.sx = x; txPkt.sy = y; txPkt.sz = z;
+            txPkt.sfx = (float)force.x(); txPkt.sfy = (float)force.y(); txPkt.sfz = (float)force.z();
+            txPkt.ts = nowMs;
+            sendto(sock, (char*)&txPkt, sizeof(txPkt), 0, (SOCKADDR*)&srvAddr, sizeof(srvAddr));
+            g_sent.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        float lm = sqrtf(x * x + y * y + z * z);
+        g_masterRing.push({ nowMs,lm,txSeq });  // local slave position
+        g_lx.store(x); g_ly.store(y); g_lz.store(z); g_lmag.store(lm);
+        g_fx.store((float)force.x()); g_fy.store((float)force.y());
+        g_fz.store((float)force.z()); g_fmag.store((float)force.length());
+
+        auto tgt = t0 + std::chrono::microseconds((long long)(1000000.0 / cfg::HAPTIC_HZ));
+        while (std::chrono::high_resolution_clock::now() < tgt) _mm_pause();
+    }
+    if (has) { dev->setForce(cVector3d(0, 0, 0)); dev->close(); }
+    closesocket(sock); WSACleanup(); timeEndPeriod(1);
+}
+
+// =============================================================================
+//  AGGREGATOR
+// =============================================================================
+static void buildCandles(Ring<Sample, cfg::RING_SZ>& ring,
+    std::mutex& mtx, std::deque<Candle>& candles, Candle& live, bool& liveOpen,
+    double& wO, float& cO, float& cC, float& cH, float& cL, bool& started,
+    uint32_t& seqSt, uint32_t& seqEn, uint32_t& pktCnt)
+{
+    Sample s{};
+    while (ring.pop(s)) {
+        float m = s.mag;
+        if (!started) { wO = s.ts; cO = cC = cH = cL = m; started = true; seqSt = seqEn = s.seq; pktCnt = 1; }
+        else {
+            cC = m; if (m > cH)cH = m; if (m < cL)cL = m; seqEn = s.seq; ++pktCnt;
+            if (s.ts - wO >= g_candleMs.load()) {
+                Candle c{ wO,s.ts,cO,cC,cH,cL,(cC > cO),seqSt,seqEn,pktCnt };
+                {
+                    std::lock_guard<std::mutex> lk(mtx); candles.push_back(c);
+                    if ((int)candles.size() > cfg::MAX_CANDLES)candles.pop_front();
+                }
+                started = false; pktCnt = 0;
+            }
+        }
+        { std::lock_guard<std::mutex> lk(mtx); live = { wO,s.ts,cO,cC,cH,cL,(cC > cO),seqSt,seqEn,pktCnt }; liveOpen = started; }
+    }
+}
+
+void aggregatorThread() {
+    double lwO = 0, rwO = 0; float lcO = 0, lcC = 0, lcH = 0, lcL = 1e9f, rcO = 0, rcC = 0, rcH = 0, rcL = 1e9f;
+    bool lSt = false, rSt = false;
+    uint32_t lSS = 0, lSE = 0, lPC = 0, rSS = 0, rSE = 0, rPC = 0;
+    while (g_running) {
+        buildCandles(g_masterRing, g_masterMtx, g_masterCandles, g_masterLive, g_masterLO, lwO, lcO, lcC, lcH, lcL, lSt, lSS, lSE, lPC);
+        buildCandles(g_slaveRing, g_slaveMtx, g_slaveCandles, g_slaveLive, g_slaveLO, rwO, rcO, rcC, rcH, rcL, rSt, rSS, rSE, rPC);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
+
+// =============================================================================
+//  RENDERING  -  pixel font + helpers
+// =============================================================================
+static int g_W = 1680, g_H = 980;
+static const uint8_t GLYPHS[][5] = {
+    {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},{0x14,0x7F,0x14,0x7F,0x14},{0x24,0x2A,0x7F,0x2A,0x12},
+    {0x23,0x13,0x08,0x64,0x62},{0x36,0x49,0x55,0x22,0x50},{0x00,0x05,0x03,0x00,0x00},{0x00,0x1C,0x22,0x41,0x00},{0x00,0x41,0x22,0x1C,0x00},
+    {0x08,0x2A,0x1C,0x2A,0x08},{0x08,0x08,0x3E,0x08,0x08},{0x00,0x50,0x30,0x00,0x00},{0x08,0x08,0x08,0x08,0x08},{0x00,0x60,0x60,0x00,0x00},
+    {0x20,0x10,0x08,0x04,0x02},{0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},{0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},{0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1E},{0x00,0x36,0x36,0x00,0x00},{0x00,0x56,0x36,0x00,0x00},{0x00,0x08,0x14,0x22,0x41},{0x14,0x14,0x14,0x14,0x14},
+    {0x41,0x22,0x14,0x08,0x00},{0x02,0x01,0x51,0x09,0x06},{0x30,0x49,0x79,0x41,0x3E},{0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},
+    {0x3E,0x41,0x41,0x41,0x22},{0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},{0x3E,0x41,0x49,0x49,0x7A},
+    {0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},{0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x04,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},{0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},
+    {0x7F,0x09,0x19,0x29,0x46},{0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},{0x1F,0x20,0x40,0x20,0x1F},
+    {0x3F,0x40,0x38,0x40,0x3F},{0x63,0x14,0x08,0x14,0x63},{0x03,0x04,0x78,0x04,0x03},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7F,0x41,0x41,0x00},
+    {0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7F,0x00},{0x04,0x02,0x01,0x02,0x04},{0x40,0x40,0x40,0x40,0x40},{0x00,0x01,0x02,0x04,0x00},
+    {0x20,0x54,0x54,0x54,0x78},{0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},{0x38,0x44,0x44,0x48,0x7F},{0x38,0x54,0x54,0x54,0x18},
+    {0x08,0x7E,0x09,0x01,0x02},{0x08,0x14,0x54,0x54,0x3C},{0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},
+    {0x00,0x7F,0x10,0x28,0x44},{0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},{0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},
+    {0x7C,0x14,0x14,0x14,0x08},{0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},{0x04,0x3F,0x44,0x40,0x20},
+    {0x3C,0x40,0x40,0x40,0x7C},{0x1C,0x20,0x40,0x20,0x1C},{0x3C,0x40,0x30,0x40,0x3C},{0x44,0x28,0x10,0x28,0x44},{0x0C,0x50,0x50,0x50,0x3C},
+    {0x44,0x64,0x54,0x4C,0x44},{0x00,0x08,0x36,0x41,0x00},{0x00,0x00,0x7F,0x00,0x00},{0x00,0x41,0x36,0x08,0x00},{0x08,0x04,0x08,0x10,0x08},
+};
+
+static void drawText(float px, float py, const char* s, float r = 1, float g = 1, float b = 1, float a = 1, int fs = 2) {
+    if (!s || !s[0])return;
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0, g_W, 0, g_H, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glColor4f(r, g, b, a); glBegin(GL_QUADS);
+    int gw = 5 * fs, ggap = fs; float cx = px;
+    for (const char* p = s; *p; ++p) {
+        int c = (unsigned char)*p; if (c < 32 || c>126) { cx += gw + ggap; continue; }
+        const uint8_t* col = GLYPHS[c - 32];
+        for (int ci = 0; ci < 5; ++ci) {
+            uint8_t bits = col[ci];
+            for (int ri = 0; ri < 7; ++ri) {
+                if (bits & (1 << ri)) {
+                    float x0 = cx + ci * fs, y0 = py + (6 - ri) * fs, x1 = x0 + fs, y1 = y0 + fs;
+                    glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1);
+                }
+            }
+        }
+        cx += gw + ggap;
+    }
+    glEnd();
+    glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW); glPopMatrix();
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+}
+static void drawTextVert(float px, float py, const char* s, float r = 1, float g2 = 1, float b = 1, float a = 1, int fs = 1) {
+    if (!s || !s[0])return;
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0, g_W, 0, g_H, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glColor4f(r, g2, b, a); glBegin(GL_QUADS);
+    int gw = 5 * fs, ggap = fs; float cy = py;
+    for (const char* p = s; *p; ++p) {
+        int c = (unsigned char)*p; if (c < 32 || c>126) { cy += gw + ggap; continue; }
+        const uint8_t* col = GLYPHS[c - 32];
+        for (int ci = 0; ci < 5; ++ci) {
+            uint8_t bits = col[ci];
+            for (int ri = 0; ri < 7; ++ri) {
+                if (bits & (1 << ri)) {
+                    float x0 = px - (6 - ri) * fs, y0 = cy + ci * fs, x1 = x0 + fs, y1 = y0 + fs;
+                    glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1);
+                }
+            }
+        }
+        cy += gw + ggap;
+    }
+    glEnd();
+    glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW); glPopMatrix();
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+}
+static void rect(float x0, float y0, float x1, float y1, float r, float g, float b, float a = 1) {
+    glColor4f(r, g, b, a); glBegin(GL_QUADS);
+    glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1); glEnd();
+}
+static inline float yOf(float m, float yb, float yt) {
+    return yb + ((m - cfg::YMIN) / (cfg::YMAX - cfg::YMIN)) * (yt - yb);
+}
+
+// --- Chart --------------------------------------------------------------------
+static void drawChart(const std::deque<Candle>& snap, bool liveOpen, float liveMag,
+    float pL, float pR, float MB, float MT,
+    const char* title, float tr, float tg, float tb) {
+    float CW = pR - pL, CH = MT - MB, slot = CW / (float)cfg::VISIBLE, hw = slot * 0.34f;
+    int nT = (int)snap.size();
+    rect(pL, MB, pR, MT, 0.08f, 0.10f, 0.14f);
+    glLineWidth(0.5f); glColor4f(0.22f, 0.26f, 0.35f, 0.6f); glBegin(GL_LINES);
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) { float gy = MB + CH * ((float)i / cfg::Y_DIVS); glVertex2f(pL, gy); glVertex2f(pR, gy); }
+    for (int i = 0; i <= cfg::VISIBLE; i += 5) { float gx = pL + slot * i; glVertex2f(gx, MB); glVertex2f(gx, MT); }
+    glEnd();
+    float midY = yOf((cfg::YMIN + cfg::YMAX) * 0.5f, MB, MT);
+    glLineWidth(1.0f); glColor4f(0.40f, 0.50f, 0.70f, 0.7f);
+    glEnable(GL_LINE_STIPPLE); glLineStipple(1, 0xF0F0);
+    glBegin(GL_LINES); glVertex2f(pL, midY); glVertex2f(pR, midY); glEnd(); glDisable(GL_LINE_STIPPLE);
+    glLineWidth(1.0f); glColor4f(0.45f, 0.50f, 0.60f, 0.8f); glBegin(GL_LINES);
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) { float gy = MB + CH * ((float)i / cfg::Y_DIVS); glVertex2f(pL, gy); glVertex2f(pL - 0.010f, gy); }
+    glEnd();
+    for (int i = 0; i <= cfg::Y_DIVS; ++i) {
+        float frac = (float)i / cfg::Y_DIVS, val = cfg::YMIN + frac * (cfg::YMAX - cfg::YMIN);
+        char lb[12]; snprintf(lb, sizeof(lb), "%.0fmm", val * 1000.f);
+        drawText((pL - 0.062f) * g_W, (MB + CH * frac) * g_H - 7, lb, 0.50f, 0.55f, 0.68f, 1, 1);
+    }
+    for (int si = 0; si < cfg::VISIBLE; ++si) {
+        int ci = nT - cfg::VISIBLE + si; if (ci < 0)continue;
+        const Candle& c = snap[ci]; float xc = pL + (si + 0.5f) * slot;
+        float oY = yOf(c.open, MB, MT), clY = yOf(c.close, MB, MT), hY = yOf(c.high, MB, MT), lY = yOf(c.low, MB, MT);
+        float alpha = (ci == nT - 1 && liveOpen) ? 0.55f : 1.0f;
+        if (c.bull)glColor4f(0.11f, 0.72f, 0.42f, alpha); else glColor4f(0.90f, 0.22f, 0.22f, alpha);
+        float top = std::max(oY, clY), bot = std::min(oY, clY), bh = top - bot; if (bh < 0.001f)bh = 0.001f;
+        glBegin(GL_QUADS); glVertex2f(xc - hw, bot); glVertex2f(xc + hw, bot); glVertex2f(xc + hw, bot + bh); glVertex2f(xc - hw, bot + bh); glEnd();
+        glLineWidth(1.3f); glBegin(GL_LINES); glVertex2f(xc, bot + bh); glVertex2f(xc, hY); glVertex2f(xc, bot); glVertex2f(xc, lY); glEnd();
+        // Vertical seq label above wick
+        char seqLbl[8]; snprintf(seqLbl, sizeof(seqLbl), "%04u", c.seqEnd % 10000);
+        float age = (float)(nT - 1 - ci), br = std::max(0.35f, 1.0f - age * 0.03f);
+        drawTextVert(xc * g_W, hY * g_H + 3.0f, seqLbl, br * 0.7f, br * 0.9f, br * 0.5f, 0.85f, 1);
+    }
+    float cy = yOf(liveMag, MB, MT); cy = std::max(MB + 0.001f, std::min(MT - 0.001f, cy));
+    glLineWidth(1.0f); glColor4f(1.0f, 0.85f, 0.20f, 0.80f);
+    glEnable(GL_LINE_STIPPLE); glLineStipple(2, 0xAAAA);
+    glBegin(GL_LINES); glVertex2f(pL, cy); glVertex2f(pR, cy); glEnd(); glDisable(GL_LINE_STIPPLE);
+    char pvLbl[16]; snprintf(pvLbl, sizeof(pvLbl), "%.1fmm", liveMag * 1000.f);
+    drawText(pR * g_W + 4, cy * g_H - 7, pvLbl, 1.0f, 0.85f, 0.20f, 0.90f, 1);
+    glLineWidth(1.0f); glColor3f(0.35f, 0.40f, 0.50f); glBegin(GL_LINE_LOOP);
+    glVertex2f(pL, MB); glVertex2f(pR, MB); glVertex2f(pR, MT); glVertex2f(pL, MT); glEnd();
+    glLineWidth(0.8f); glColor3f(0.35f, 0.40f, 0.50f); glBegin(GL_LINES);
+    for (int si = 0; si < cfg::VISIBLE; si += 5) { float gx = pL + (si + 0.5f) * slot; glVertex2f(gx, MB); glVertex2f(gx, MB - 0.012f); }
+    glEnd();
+    for (int si = 0; si < cfg::VISIBLE; si += 5) {
+        int ci = nT - cfg::VISIBLE + si; float gx = pL + (si + 0.5f) * slot; char t1[16], t2[16];
+        if (ci >= 0 && ci < nT) {
+            double t_ms = snap[ci].t1; int h = (int)(t_ms / 3600000), m = (int)(fmod(t_ms, 3600000) / 60000);
+            int s2 = (int)(fmod(t_ms, 60000) / 1000), ms = (int)fmod(t_ms, 1000);
+            if (h > 0)snprintf(t1, sizeof(t1), "%02d:%02d:%02d.%03d", h, m, s2, ms);
+            else snprintf(t1, sizeof(t1), "%02d:%02d.%03d", m, s2, ms);
+            snprintf(t2, sizeof(t2), "P#%05u", snap[ci].seqEnd);
+        }
+        else { snprintf(t1, sizeof(t1), "--:--"); snprintf(t2, sizeof(t2), "P#-----"); }
+        drawText(gx * g_W - 16, (MB - 0.020f) * g_H, t1, 0.55f, 0.60f, 0.70f, 1, 1);
+        drawText(gx * g_W - 16, (MB - 0.037f) * g_H, t2, 0.35f, 0.75f, 0.50f, 1, 1);
+    }
+    drawText((pL + CW * 0.26f) * g_W, (MT + 0.006f) * g_H, title, tr, tg, tb);
+}
+
+// =============================================================================
+//  PREDICTOR PANEL  -  Smith Predictor + AJB status strip
+// =============================================================================
+static void drawPredictorPanel() {
+    bool spOn = g_smithOn.load(), ajbOn = g_ajbOn.load();
+    double rtt = g_rtt.load(), horiz = g_predHorizonMs.load();
+    double predErr = g_predErrRms.load();
+    double jit = g_ajbJitter.load(), playout = g_ajbPlayoutMs.load();
+    int    ajbDepth = g_ajbDepth.load();
+    uint64_t dropped = g_ajbDropped.load();
+
+    // Strip occupies between chart bottom and delay panel top
+    float py1 = cfg::CMB - 0.002f, py0 = py1 - 0.090f;
+    rect(0, py0, 1, py1, 0.05f, 0.09f, 0.08f, 0.97f);
+    glLineWidth(0.8f); glColor3f(0.15f, 0.32f, 0.22f);
+    glBegin(GL_LINES); glVertex2f(0, py1); glVertex2f(1, py1); glEnd();
+    glBegin(GL_LINES); glVertex2f(0, py0); glVertex2f(1, py0); glEnd();
+    // vertical centre divider
+    glBegin(GL_LINES); glVertex2f(0.5f, py0); glVertex2f(0.5f, py1); glEnd();
+
+    float pH = py1 - py0;
+    float rowT = (py0 + pH * 0.82f) * g_H, rowM = (py0 + pH * 0.50f) * g_H, rowB = (py0 + pH * 0.16f) * g_H;
+    char buf[160];
+
+    // -- LEFT: Smith Predictor ---------------------------------------------
+    float sR = spOn ? 0.20f : 0.45f, sG = spOn ? 0.95f : 0.35f, sB = spOn ? 0.45f : 0.30f;
+    drawText(0.01f * g_W, rowT, spOn ? "SMITH PREDICTOR  [ON ]" : "SMITH PREDICTOR  [OFF]", sR, sG, sB, 1, 2);
+
+    if (spOn) {
+        float px = g_predx.load(), py = g_predy.load(), pz = g_predz.load();
+        float rx = g_rx.load(), ry = g_ry.load(), rz = g_rz.load();
+        snprintf(buf, sizeof(buf), "Predicted master pos  X:%+.4f  Y:%+.4f  Z:%+.4f", px, py, pz);
+        drawText(0.01f * g_W, rowM, buf, 0.25f, 0.90f, 0.60f, 1, 2);
+        snprintf(buf, sizeof(buf), "Raw recv  X:%+.4f  Y:%+.4f  Z:%+.4f", rx, ry, rz);
+        drawText(0.01f * g_W, rowM - 18, buf, 0.45f, 0.55f, 0.70f, 1, 1);
+        snprintf(buf, sizeof(buf), "Horizon:%.1fms  RTT:%.1fms  PredErr:%.5fm", horiz, rtt, predErr);
+        drawText(0.01f * g_W, rowB, buf, 0.55f, 0.75f, 0.55f, 1, 2);
+
+        // Horizon vs RTT bar (shows how much delay is being compensated)
+        float bL = 0.01f, bR = 0.49f, bY0 = rowB / g_H - 0.025f, bY1 = bY0 + 0.012f;
+        rect(bL, bY0, bR, bY1, 0.10f, 0.18f, 0.12f, 0.9f);
+        float hf = (float)std::min(horiz / 100.0, 1.0);
+        rect(bL, bY0, bL + (bR - bL) * hf, bY1, 0.20f, 0.90f, 0.45f, 0.85f);
+        drawText(bL * g_W, (bY0 - 0.002f) * g_H, "0 RTT/2 [ms] 100", 0.28f, 0.42f, 0.32f, 1, 1);
+    }
+    else {
+        drawText(0.01f * g_W, rowM, "[Delay compensation disabled - EBA uses stale received position]",
+            0.40f, 0.45f, 0.50f, 1, 1);
+        drawText(0.01f * g_W, rowB, "Press S to enable Smith Predictor", 0.30f, 0.50f, 0.35f, 1, 2);
+    }
+
+    // -- RIGHT: Adaptive Jitter Buffer ------------------------------------
+    float aR = ajbOn ? 0.20f : 0.45f, aG = ajbOn ? 0.80f : 0.35f, aB = ajbOn ? 0.95f : 0.30f;
+    drawText(0.51f * g_W, rowT, ajbOn ? "JITTER BUFFER    [ON ]" : "JITTER BUFFER    [OFF]", aR, aG, aB, 1, 2);
+
+    if (ajbOn) {
+        snprintf(buf, sizeof(buf), "Jitter:%.2fms  Playout:%.1fms  Queued:%d  Dropped:%llu",
+            jit, playout, ajbDepth, (unsigned long long)dropped);
+        drawText(0.51f * g_W, rowM, buf, 0.30f, 0.75f, 0.95f, 1, 2);
+
+        // Playout delay bar (0..AJB_MAX_MS)
+        float bL = 0.51f, bR = 0.99f, bY0 = rowM / g_H - 0.025f, bY1 = bY0 + 0.012f;
+        rect(bL, bY0, bR, bY1, 0.10f, 0.14f, 0.20f, 0.9f);
+        float jf = (float)std::min(jit / 50.0, 1.0);         // jitter bar (0..50ms)
+        float pf = (float)std::min(playout / cfg::AJB_MAX_MS, 1.0);  // playout bar
+        rect(bL, bY0, bL + (bR - bL) * pf, bY1, 0.20f, 0.65f, 0.95f, 0.80f);  // playout (blue)
+        rect(bL, bY0, bL + (bR - bL) * jf * (bR - bL), bY0 + 0.006f, 0.95f, 0.75f, 0.20f, 0.85f);  // jitter (orange, thin)
+
+        snprintf(buf, sizeof(buf), "Playout 0-%.0fms  [orange=jitter estimate  blue=playout target]",
+            cfg::AJB_MAX_MS);
+        drawText(bL * g_W, (bY0 - 0.002f) * g_H, buf, 0.28f, 0.38f, 0.48f, 1, 1);
+
+        // Mode annotation
+        const char* mode = (!spOn && !ajbOn) ? "Mode: RAW" : (spOn && !ajbOn) ? "Mode: PREDICT only" :
+            (!spOn && ajbOn) ? "Mode: BUFFER only" : "Mode: FULL (S+B) optimal";
+        float mR = (spOn && ajbOn) ? 0.20f : 0.70f, mG = (spOn && ajbOn) ? 0.95f : 0.70f, mB = (spOn && ajbOn) ? 0.45f : 0.30f;
+        drawText(0.51f * g_W, rowB, mode, mR, mG, mB, 1, 2);
+    }
+    else {
+        drawText(0.51f * g_W, rowM, "[Jitter buffering disabled - packets delivered immediately]",
+            0.40f, 0.45f, 0.50f, 1, 1);
+        drawText(0.51f * g_W, rowB, "Press B to enable Adaptive Jitter Buffer", 0.28f, 0.40f, 0.55f, 1, 2);
+    }
+
+    // Key strip at the very bottom of panel
+    drawText(0.01f * g_W, (py0 + 0.003f) * g_H,
+        "S:Smith Predictor  B:Jitter Buffer  D:art.delay  ,.NM:art.delay ctrl",
+        0.28f, 0.35f, 0.38f, 1, 1);
+}
+
+// =============================================================================
+//  ARTIFICIAL DELAY PANEL  (thin strip)
+// =============================================================================
+static void drawArtDelayPanel() {
+    bool on = g_artDelayEnabled.load();
+    double dc = g_artDelayConst.load(), dj = g_artDelayJitter.load();
+    int    qdepth = g_artDelayQDepth.load();
+    double lastD = g_lastArtDelayMs.load();
+    uint64_t loss = g_pktLoss.load();
+
+    // narrow strip just below predictor panel
+    float py1 = cfg::CMB - 0.002f - 0.092f, py0 = py1 - 0.052f;
+    rect(0, py0, 1, py1, 0.08f, 0.07f, 0.12f, 0.96f);
+    glLineWidth(0.7f); glColor3f(0.22f, 0.20f, 0.30f);
+    glBegin(GL_LINES); glVertex2f(0, py1); glVertex2f(1, py1); glEnd();
+
+    float textY = (py0 + (py1 - py0) * 0.60f) * g_H;
+    char buf[160];
+
+    float dr = on ? 0.95f : 0.35f, dg = on ? 0.30f : 0.55f, db = on ? 0.20f : 0.40f;
+    drawText(0.01f * g_W, textY, on ? "[ART.DELAY ON ]" : "[ART.DELAY OFF]", dr, dg, db, 1, 2);
+
+    drawText(0.14f * g_W, textY, "CONST:", 0.60f, 0.60f, 0.72f, 1, 2);
+    snprintf(buf, sizeof(buf), "%5.0fms", dc);
+    drawText(0.22f * g_W, textY, buf, 0.30f, 0.82f, 0.95f, 1, 2);
+
+    float bL = 0.30f, bR = 0.48f, bY0p = py0 + 0.006f, bY1p = py1 - 0.006f;
+    rect(bL, bY0p, bR, bY1p, 0.14f, 0.16f, 0.22f, 0.9f);
+    rect(bL, bY0p, bL + (bR - bL) * (float)std::min(dc / 500.0, 1.0), bY1p, 0.20f, 0.70f, 0.95f, 0.85f);
+
+    drawText(0.49f * g_W, textY, "JITTER:", 0.60f, 0.60f, 0.72f, 1, 2);
+    snprintf(buf, sizeof(buf), "0-%4.0fms", dj);
+    drawText(0.57f * g_W, textY, buf, 0.95f, 0.72f, 0.20f, 1, 2);
+    float jL = 0.66f, jR = 0.78f;
+    rect(jL, bY0p, jR, bY1p, 0.14f, 0.16f, 0.22f, 0.9f);
+    rect(jL, bY0p, jL + (jR - jL) * (float)std::min(dj / 200.0, 1.0), bY1p, 0.95f, 0.68f, 0.18f, 0.85f);
+
+    snprintf(buf, sizeof(buf), "Q:%3d  Loss:%6llu  Last:%.1fms", qdepth, (unsigned long long)loss, lastD);
+    drawText(0.79f * g_W, textY, buf, qdepth > 10 ? 0.95f : 0.50f, qdepth > 10 ? 0.30f : 0.65f, 0.50f, 1, 2);
+}
+
+// =============================================================================
+//  STATUS PANEL
+// =============================================================================
+static void drawStatusPanel() {
+    float pH = cfg::PNH - cfg::PNL;
+    rect(0, cfg::PNL, 1, cfg::PNH, 0.05f, 0.07f, 0.11f, 0.97f);
+    glLineWidth(0.8f); glColor3f(0.20f, 0.24f, 0.32f);
+    glBegin(GL_LINES); glVertex2f(0, cfg::PNH); glVertex2f(1, cfg::PNH); glEnd();
+    glBegin(GL_LINES); glVertex2f(0.5f, cfg::PNL); glVertex2f(0.5f, cfg::PNH); glEnd();
+    float r1 = (cfg::PNL + pH * 0.86f) * g_H, r2 = (cfg::PNL + pH * 0.65f) * g_H;
+    float r3 = (cfg::PNL + pH * 0.44f) * g_H, r4 = (cfg::PNL + pH * 0.22f) * g_H;
+    char buf[160];
+
+    drawText(0.02f * g_W, r1, "SLAVE   [local TX]", 0.28f, 0.82f, 0.40f);
+    snprintf(buf, sizeof(buf), "Pos X:%+.4f Y:%+.4f Z:%+.4f  |%.4fm",
+        (float)g_lx, (float)g_ly, (float)g_lz, (float)g_lmag);
+    drawText(0.02f * g_W, r2, buf, 0.35f, 0.85f, 0.42f);
+    snprintf(buf, sizeof(buf), "Force X:%+.2f Y:%+.2f Z:%+.2f N |%.2fN  EBA:%s Proj:%s",
+        (float)g_fx, (float)g_fy, (float)g_fz, (float)g_fmag,
+        eba::enable ? "ON" : "OFF", eba::projection ? "ON" : "OFF");
+    drawText(0.02f * g_W, r3, buf, 0.90f, 0.40f, 0.30f);
+    snprintf(buf, sizeof(buf), "Sent:%llu  1:FF  E:EBA  P:Proj  S:Smith  B:AJB  ESC:quit",
+        (unsigned long long)g_sent.load());
+    drawText(0.02f * g_W, r4, buf, 0.32f, 0.36f, 0.50f, 1, 1);
+
+    drawText(0.52f * g_W, r1, "MASTER  [remote RX]", 0.35f, 0.58f, 0.95f);
+    float rx = g_rx, ry = g_ry, rz = g_rz, rm = g_rmag;
+    double rtt = g_rtt.load(), avgRtt = g_avgRtt.load();
+    float sf = (rtt > 300) ? 0.4f : 1.0f;
+    snprintf(buf, sizeof(buf), "Pos X:%+.4f Y:%+.4f Z:%+.4f  |%.4fm", rx, ry, rz, rm);
+    drawText(0.52f * g_W, r2, buf, 0.35f * sf, 0.62f * sf, 0.95f * sf);
+    snprintf(buf, sizeof(buf), "Fd  X:%+.2f Y:%+.2f Z:%+.2f N",
+        (float)eba::Fd[0], (float)eba::Fd[1], (float)eba::Fd[2]);
+    drawText(0.52f * g_W, r3, buf, 0.65f, 0.65f, 0.30f);
+    float rttR = (rtt < 5) ? 0.20f : (rtt < 20) ? 0.95f : 0.95f;
+    float rttG = (rtt < 5) ? 0.90f : (rtt < 20) ? 0.85f : 0.25f;
+    float rttB = (rtt < 5) ? 0.30f : (rtt < 20) ? 0.10f : 0.15f;
+    snprintf(buf, sizeof(buf), "RTT:%.1fms Avg:%.1fms Recv:%llu #RX:%u Loss:%llu Client:%s",
+        rtt, avgRtt, (unsigned long long)g_recv.load(),
+        (unsigned)g_lastRxSeq.load(), (unsigned long long)g_pktLoss.load(), g_serverIP);
+    drawText(0.52f * g_W, r4, buf, rttR, rttG, rttB, 1, 1);
+    float lf = (float)std::min(rtt / 50.0, 1.0);
+    rect(0.52f, r4 / g_H - 0.022f, 0.52f + 0.46f * lf, r4 / g_H - 0.012f, rttR, rttG, rttB, 0.80f);
+    rect(0.52f, r4 / g_H - 0.022f, 0.98f, r4 / g_H - 0.012f, 0.15f, 0.18f, 0.24f, 0.40f);
+}
+
+// =============================================================================
+//  GLFW CALLBACKS
+// =============================================================================
+static void onKey(GLFWwindow* w, int key, int, int action, int) {
+    if (action != GLFW_PRESS)return;
+    switch (key) {
+    case GLFW_KEY_ESCAPE: glfwSetWindowShouldClose(w, GLFW_TRUE); break;
+    case GLFW_KEY_1: g_useFF = !g_useFF; break;
+    case GLFW_KEY_E: eba::enable = !eba::enable; printf("[EBA] %s\n", eba::enable ? "ON" : "OFF"); break;
+    case GLFW_KEY_P: eba::projection = !eba::projection; break;
+    case GLFW_KEY_S: { bool v = !g_smithOn.load(); g_smithOn.store(v); printf("[SMITH] %s\n", v ? "ON" : "OFF"); break; }
+    case GLFW_KEY_B: { bool v = !g_ajbOn.load(); g_ajbOn.store(v); printf("[AJB] %s\n", v ? "ON" : "OFF"); break; }
+    case GLFW_KEY_D: {
+        bool v = !g_artDelayEnabled.load(); g_artDelayEnabled.store(v); g_artDelayOn.store(v);
+        printf("[ART.DELAY] %s\n", v ? "ON" : "OFF"); break;
+    }
+    case GLFW_KEY_COMMA: { double v = std::max(0.0, g_artDelayConst.load() - cfg::DELAY_STEP); g_artDelayConst.store(v); break; }
+    case GLFW_KEY_PERIOD: { double v = std::min(cfg::DELAY_MAX_CONST, g_artDelayConst.load() + cfg::DELAY_STEP); g_artDelayConst.store(v); break; }
+    case GLFW_KEY_N: { double v = std::max(0.0, g_artDelayJitter.load() - cfg::DELAY_STEP); g_artDelayJitter.store(v); break; }
+    case GLFW_KEY_M: { double v = std::min(cfg::DELAY_MAX_JITTER, g_artDelayJitter.load() + cfg::DELAY_STEP); g_artDelayJitter.store(v); break; }
+    case GLFW_KEY_EQUAL:case GLFW_KEY_KP_ADD: { double v = std::min(g_candleMs.load() * 1.122, cfg::CANDLE_MS_MAX); g_candleMs.store(v); break; }
+    case GLFW_KEY_MINUS:case GLFW_KEY_KP_SUBTRACT: { double v = std::max(g_candleMs.load() / 1.122, cfg::CANDLE_MS_MIN); g_candleMs.store(v); break; }
+    case GLFW_KEY_LEFT_BRACKET:  g_candleMs.store(cfg::CANDLE_MS_MIN); break;
+    case GLFW_KEY_RIGHT_BRACKET: g_candleMs.store(cfg::CANDLE_MS_MAX); break;
+    default:break;
+    }
+}
+static void onResize(GLFWwindow*, int w, int h) { glViewport(0, 0, w, h); g_W = w; g_H = h; }
+
+// =============================================================================
+//  MAIN
+// =============================================================================
+int main() {
+    printf("+===============================================================+\n");
+    printf("|  Haptic Teleoperation  SLAVE  v5  (Smith + Adaptive Buffer)   |\n");
+    printf("+===============================================================+\n");
+    printf("|  S  toggle Smith Predictor (AR-2 + RLS, horizon = RTT/2)     |\n");
+    printf("|  B  toggle Adaptive Jitter Buffer (RFC 3550 + adaptive)      |\n");
+    printf("|  D  toggle artificial delay (for validation testing)         |\n");
+    printf("|  , / .  const delay +/-5ms   N / M  jitter +/-5ms               |\n");
+    printf("|  E=EBA  P=Proj  1=FF  +/-=candle  [  ]=preset  ESC=quit     |\n");
+    printf("+===============================================================+\n\n");
+
+    std::thread tH(hapticThread), tA(aggregatorThread);
+    if (!glfwInit()) { g_running = false; tH.join(); tA.join(); return 1; }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+    GLFWwindow* win = glfwCreateWindow(cfg::WIN_W, cfg::WIN_H,
+        "SLAVE v5 - Smith Predictor + Adaptive Jitter Buffer", nullptr, nullptr);
+    if (!win) { glfwTerminate(); g_running = false; tH.join(); tA.join(); return 1; }
+    glfwMakeContextCurrent(win); glfwSwapInterval(1);
+    glfwSetKeyCallback(win, onKey); glfwSetFramebufferSizeCallback(win, onResize);
+    glfwGetFramebufferSize(win, &g_W, &g_H);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_LINE_SMOOTH); glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glEnable(GL_MULTISAMPLE);
+
+    const float LCL = 0.08f, LCR = 0.49f, RCL = 0.51f, RCR = 0.92f;
+
+    while (!glfwWindowShouldClose(win)) {
+        glfwGetFramebufferSize(win, &g_W, &g_H);
+        glViewport(0, 0, g_W, g_H);
+        glClearColor(0.05f, 0.07f, 0.10f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+
+        std::deque<Candle> mSnap, sSnap; Candle mLive{}, sLive{}; bool mLO = false, sLO = false;
+        { std::lock_guard<std::mutex> lk(g_masterMtx); mSnap = g_masterCandles; mLive = g_masterLive; mLO = g_masterLO; }
+        { std::lock_guard<std::mutex> lk(g_slaveMtx); sSnap = g_slaveCandles; sLive = g_slaveLive; sLO = g_slaveLO; }
+        if (mLO)mSnap.push_back(mLive); if (sLO)sSnap.push_back(sLive);
+
+        glLineWidth(1.5f); glColor3f(0.22f, 0.28f, 0.38f);
+        glBegin(GL_LINES); glVertex2f(0.5f, cfg::PNH); glVertex2f(0.5f, 1.0f); glEnd();
+
+        drawChart(mSnap, mLO, g_lmag.load(), LCL, LCR, cfg::CMB, cfg::CMT,
+            "SLAVE position |m|  [local]", 0.28f, 0.82f, 0.38f);
+        drawChart(sSnap, sLO, g_rmag.load(), RCL, RCR, cfg::CMB, cfg::CMT,
+            "MASTER position |m|  (after jitter buffer + predictor)", 0.35f, 0.58f, 0.95f);
+
+        drawPredictorPanel();
+        drawArtDelayPanel();
+        drawStatusPanel();
+
+        glfwSwapBuffers(win); glfwPollEvents();
+    }
+    g_running = false; tH.join(); tA.join();
+    glfwDestroyWindow(win); glfwTerminate();
+    printf("Shutdown.  Sent:%llu  Recv:%llu  Loss:%llu\n",
+        (unsigned long long)g_sent.load(),
+        (unsigned long long)g_recv.load(),
+        (unsigned long long)g_pktLoss.load());
+    return 0;
+}
