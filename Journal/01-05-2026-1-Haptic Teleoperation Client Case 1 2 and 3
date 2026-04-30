@@ -1,0 +1,157 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mmsystem.h>
+#include <fstream>
+#include <iomanip>
+#include <thread>
+#include <atomic>
+#include <vector>
+#include <deque>
+#include <mutex>
+#include <random>
+#include "chai3d.h"
+#include <GLFW/glfw3.h>
+
+#pragma comment(lib,"ws2_32.lib")
+#pragma comment(lib,"winmm.lib")
+
+using namespace chai3d;
+
+// Config
+namespace cfg {
+    static const char* SERVER_IP = "127.0.0.1"; // CHANGE TO YOUR SERVER IP
+    constexpr uint16_t UDP_PORT = 4000;
+    constexpr double HAPTIC_HZ = 1000.0;
+    constexpr int RING_SZ = 8192;
+}
+
+#pragma pack(push,1)
+struct C2S { uint32_t seq; float sx, sy, sz, sfx, sfy, sfz; double ts; };
+struct S2C { uint32_t seq; float mx, my, mz; double ts; };
+#pragma pack(pop)
+
+struct LogEntry { int testCase; uint32_t seq; double ts; float x, y, z; bool isSend; };
+
+// Globals
+std::atomic<bool> g_running{ true };
+std::atomic<int> g_activeCase{ 0 };
+std::atomic<int> g_logCounter{ 0 };
+double g_posSlave[3], g_posMaster[3];
+
+template<typename T, int N>
+struct Ring {
+    std::atomic<int> head{ 0 }, tail{ 0 };
+    T buf[N];
+    bool push(const T& v) {
+        int h = head.load(), n = (h + 1) % N;
+        if (n == tail.load()) return false;
+        buf[h] = v; head.store(n); return true;
+    }
+    bool pop(T& o) {
+        int t = tail.load();
+        if (t == head.load()) return false;
+        o = buf[t]; tail.store((t + 1) % N); return true;
+    }
+};
+
+Ring<LogEntry, cfg::RING_SZ> g_logRing;
+
+void loggerThread() {
+    std::ofstream file("client_data.csv");
+    file << "Case,Type,Sequence,Timestamp,X,Y,Z\n";
+    LogEntry e;
+    while (g_running || g_logRing.pop(e)) {
+        if (g_logRing.pop(e)) {
+            file << e.testCase << "," << (e.isSend ? "SENT" : "RECV") << "," << e.seq << ","
+                 << std::fixed << std::setprecision(4) << e.ts << "," << e.x << "," << e.y << "," << e.z << "\n";
+            if (++g_logCounter >= 2000) { 
+                file.flush();
+                printf("Test Case %d Logged Successfully.\n", g_activeCase.load());
+                g_activeCase = 0; 
+            }
+        } else std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    file.close();
+}
+
+struct DelayedS2C { double deliverAt; S2C pkt; };
+std::deque<DelayedS2C> g_delayQ;
+std::mutex g_delayMtx;
+
+void hapticThread() {
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    SOCKADDR_IN srvAddr{}; srvAddr.sin_family = AF_INET;
+    srvAddr.sin_port = htons(cfg::UDP_PORT);
+    inet_pton(AF_INET, cfg::SERVER_IP, &srvAddr.sin_addr);
+    u_long nb = 1; ioctlsocket(sock, FIONBIO, &nb);
+
+    uint32_t txSeq = 0;
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    while (g_running) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        double now = std::chrono::duration<double, std::ratio<1, 1000>>(t0 - start_time).count();
+
+        // 1. Recv
+        S2C rp; SOCKADDR_IN from; int fl = sizeof(from);
+        if (recvfrom(sock, (char*)&rp, sizeof(rp), 0, (SOCKADDR*)&from, &fl) == sizeof(rp)) {
+            double d = 0;
+            if (g_activeCase == 2) d = 100.0;
+            else if (g_activeCase == 3) d = 20.0 + (rand() % 481);
+
+            if (d > 0) {
+                std::lock_guard<std::mutex> lk(g_delayMtx);
+                g_delayQ.push_back({ now + d, rp });
+            } else {
+                g_posMaster[0] = rp.mx;
+                if (g_activeCase > 0) g_logRing.push({ g_activeCase, rp.seq, now, rp.mx, rp.my, rp.mz, false });
+            }
+        }
+
+        // 2. Process Delay Queue
+        {
+            std::lock_guard<std::mutex> lk(g_delayMtx);
+            while(!g_delayQ.empty() && now >= g_delayQ.front().deliverAt) {
+                S2C p = g_delayQ.front().pkt;
+                g_posMaster[0] = p.mx;
+                if (g_activeCase > 0) g_logRing.push({ g_activeCase, p.seq, now, p.mx, p.my, p.mz, false });
+                g_delayQ.pop_front();
+            }
+        }
+
+        // 3. Send
+        C2S out{ ++txSeq, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, now };
+        sendto(sock, (char*)&out, sizeof(out), 0, (SOCKADDR*)&srvAddr, sizeof(srvAddr));
+        if (g_activeCase > 0) g_logRing.push({ g_activeCase, out.seq, now, out.sx, out.sy, out.sz, true });
+
+        std::this_thread::sleep_until(t0 + std::chrono::microseconds(1000));
+    }
+    closesocket(sock);
+}
+
+void onKey(GLFWwindow* w, int key, int, int action, int) {
+    if (action != GLFW_PRESS) return;
+    if (key == GLFW_KEY_1) { g_logCounter = 0; g_activeCase = 1; printf("Case 1 Started...\n"); }
+    if (key == GLFW_KEY_2) { g_logCounter = 0; g_activeCase = 2; printf("Case 2 Started...\n"); }
+    if (key == GLFW_KEY_3) { g_logCounter = 0; g_activeCase = 3; printf("Case 3 Started...\n"); }
+    if (key == GLFW_KEY_ESCAPE) g_running = false;
+}
+
+int main() {
+    std::thread t1(hapticThread), t2(loggerThread);
+    if (!glfwInit()) return -1;
+    GLFWwindow* window = glfwCreateWindow(640, 480, "Client", NULL, NULL);
+    glfwSetKeyCallback(window, onKey);
+    while (!glfwWindowShouldClose(window) && g_running) {
+        glfwPollEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    g_running = false; t1.join(); t2.join();
+    glfwTerminate();
+    return 0;
+}
