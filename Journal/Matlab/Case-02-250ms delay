@@ -1,0 +1,30 @@
+clc;
+clear;
+close all;
+
+%% === PACKET DATA ===
+N = 25;   % number of packets
+
+server_posx = 0.0460471 * ones(N,1);
+client_posx = 0.027394  * ones(N,1);
+
+%% === CREATE 250 ms SPACED TIME AXIS ===
+t = (0:N-1) * 0.25;   % seconds
+
+%% === PREPARE BAR DATA ===
+y = [server_posx client_posx];
+
+%% === PLOT ===
+figure;
+bar(t, y, 'grouped');
+
+%% === FORMATTING ===
+xlabel('Time (seconds) [250 ms spacing]');
+ylabel('Position X');
+title('Server vs Client Position (250 ms Packet Spacing)');
+
+legend('Server', 'Client');
+grid on;
+
+set(gca, 'FontSize', 12);
+xtickangle(45);
