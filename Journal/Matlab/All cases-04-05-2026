@@ -1,0 +1,79 @@
+% MATLAB script to visualize network packets with varying delays
+% Data is directly embedded from the experiment CSV files.
+
+%% 1. Embedded Data Arrays (First 25 packets from each dataset)
+
+% --- Case 1: No Delay (From experiment_nodelay.csv) ---
+time_nodelay_ms = [21571.9, 21572.9, 21573.9, 21574.9, 21576.2, 21577.2, 21578.2, 21579.3, 21580.3, 21581.3, 21582.3, 21583.3, 21584.3, 21585.3, 21586.3, 21587.3, 21588.3, 21589.3, 21590.3, 21591.3, 21592.3, 21593.3, 21594.3, 21595.3, 21596.3];
+tx_x_nodelay = [-0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197, -0.0197];
+rx_x_nodelay = [-0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256, -0.0256];
+
+% --- Case 2: Constant Delay (From experiment_const250.csv) ---
+time_const250_ms = [35128.7, 35129.7, 35130.8, 35131.8, 35132.8, 35133.8, 35134.8, 35135.8, 35136.8, 35137.8, 35138.8, 35139.8, 35140.8, 35141.8, 35142.8, 35143.8, 35144.8, 35145.8, 35146.8, 35147.8, 35148.8, 35149.8, 35150.8, 35151.8, 35152.8];
+tx_x_const250 = [0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046, 0.046];
+rx_x_const250 = [0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274, 0.0274];
+
+% --- Case 3: Random Delay (From experiment_rand250_500.csv) ---
+time_rand_ms = [40484.0, 40485.0, 40486.0, 40487.0, 40488.0, 40489.1, 40490.1, 40491.1, 40492.1, 40493.1, 40494.1, 40495.1, 40496.1, 40497.1, 40498.1, 40499.1, 40500.1, 40501.1, 40502.1, 40503.1, 40504.1, 40505.2, 40506.2, 40507.2, 40508.2];
+delay_rand_ms = [1047.53, 909.352, 905.35, 826.631, 1032.52, 915.287, 896.263, 993.445, 1003.45, 951.433, 1058.92, 1016.46, 850.245, 894.284, 857.25, 826.232, 951.427, 850.236, 1059.92, 951.399, 1017.42, 1037.84, 921.345, 1006.38, 824.162];
+tx_x_rand = [0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213, 0.0213];
+rx_x_rand = [0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214, 0.0214];
+
+
+%% 2. Position Arrays and X-Axis Timing Logic
+% Group the X-positions for plotting Server and Client side-by-side
+pos_nodelay  = [tx_x_nodelay', rx_x_nodelay'];
+pos_const250 = [tx_x_const250', rx_x_const250'];
+pos_rand     = [tx_x_rand', rx_x_rand'];
+
+% Timeline 1: Scaled No Delay
+% Normalizing timestamps to start at 0 and multiplying by 1000 
+x1 = (time_nodelay_ms - time_nodelay_ms(1)) / 1000;
+x1_scaled = x1 * 1000; 
+
+% Timeline 2: Uniform 250ms Delay Spacing
+% Building an array where packets are strictly 250ms (0.25s) apart
+num_packets = length(time_const250_ms);
+x2 = (0:num_packets-1) * 0.25; 
+
+% Timeline 3: Random Delay Spacing
+% Normalizing actual delays to visualize intervals between 250ms and 500ms
+% Note: Using MATLAB's 'rescale' function mapping data to a 0.25 - 0.5 sec bounds
+scaled_delays = rescale(delay_rand_ms, 0.25, 0.5);
+x3 = cumsum([0, scaled_delays(1:end-1)]); 
+
+
+%% 3. Plot Generation
+figure('Name', 'Packet Arrival Delay Analysis', 'Color', 'w', 'Position', [100, 100, 1000, 800]);
+
+% --- Subplot 1: No Delay ---
+subplot(3, 1, 1);
+b1 = bar(x1_scaled, pos_nodelay, 'grouped');
+title('Case 1: experiment\_nodelay.csv (Minimal Delay, X-Axis Scaled \times 1000)');
+xlabel('Scaled Time');
+ylabel('Position X');
+legend('Server (tx\_x)', 'Client (rx\_x)', 'Location', 'best');
+grid on;
+
+% --- Subplot 2: Uniform 250ms Delay ---
+subplot(3, 1, 2);
+b2 = bar(x2, pos_const250, 'grouped');
+title('Case 2: experiment\_const250.csv (Uniform 250ms Interpacket Spacing)');
+xlabel('Time (seconds)');
+ylabel('Position X');
+grid on;
+
+% --- Subplot 3: Random Delay ---
+subplot(3, 1, 3);
+b3 = bar(x3, pos_rand, 'grouped');
+title('Case 3: experiment\_rand250\_500.csv (Random 250ms - 500ms Spacing)');
+xlabel('Time (cumulative seconds)');
+ylabel('Position X');
+grid on;
+
+%% 4. Graphical Formatting
+% Removing outlines for cleaner bars and fitting the X-axis bounds perfectly
+set([b1, b2, b3], 'EdgeColor', 'none');
+xlim(subplot(3,1,1), [min(x1_scaled)-1, max(x1_scaled)+1]);
+xlim(subplot(3,1,2), [min(x2)-1, max(x2)+1]);
+xlim(subplot(3,1,3), [min(x3)-1, max(x3)+1]);
