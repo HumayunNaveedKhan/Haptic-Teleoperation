@@ -1,0 +1,26 @@
+clc;
+clear;
+close all;
+
+%% DATA
+timestamps = [563.158 563.158 563.158 563.158 562.881 562.881 562.876 ...
+562.834 562.834 562.834 562.834 562.833 562.834 562.835 562.849 ...
+562.85 562.85 562.851 562.85 562.85 562.85 562.85 562.85 562.85 562.85];
+
+server_posx = -0.0196795 * ones(1,25);
+client_posx = -0.0256383 * ones(1,25);
+
+%% USE SAMPLE INDEX (FIX)
+x = 1:length(timestamps);
+
+y = [server_posx' client_posx'];
+
+figure;
+bar(x, y, 'grouped');
+
+xlabel('Sample Index');
+ylabel('Position X');
+title('Server vs Client Position');
+
+legend('Server', 'Client');
+grid on;
