@@ -1,0 +1,65 @@
+%% Packet Stream Visualization - 4 Scenarios
+clear; clc;
+
+% --- DATA ARRAYS FROM YOUR FILES (First 25 Samples) ---
+
+% Case 1: No Delay
+tx1 = [20307.55 20308.55 20309.55 20310.55 20311.55 20312.55 20313.55 20314.55 20315.55 20316.55 20317.55 20318.55 20319.55 20320.55 20321.55 20322.56 20323.56 20324.56 20325.56 20326.56 20327.71 20328.71 20329.71 20330.71 20331.71];
+delay1 = zeros(1,25);
+
+% Case 2: Constant 250ms Delay
+tx2 = [24243.06 24244.06 24245.06 24246.06 24247.06 24248.06 24249.06 24250.06 24251.06 24252.06 24253.06 24254.06 24255.06 24256.06 24257.06 24258.06 24259.06 24260.06 24261.06 24262.06 24263.07 24264.07 24265.07 24266.07 24267.07];
+delay2 = repmat(250, 1, 25);
+
+% Case 3: Random Delay
+tx3 = [27713.81 27714.81 27715.81 27716.81 27717.81 27718.81 27719.81 27720.81 27721.81 27722.81 27723.81 27724.82 27725.82 27726.82 27727.82 27728.82 27729.82 27730.82 27731.82 27732.82 27733.82 27734.82 27735.82 27736.82 27737.82];
+delay3 = [261.87 275.09 478.21 476.97 284.95 414.75 389.29 414.52 417.18 363.76 475.05 450.18 397.27 329.74 490.87 413.80 491.04 461.00 431.00 414.70 374.10 251.48 354.46 446.70 380.37];
+
+% Case 4: Fixed (Uniform application despite Random Delay)
+tx4 = [39576.55 39577.55 39578.55 39579.55 39580.55 39581.55 39582.55 39583.55 39584.55 39585.55 39586.55 39587.55 39588.55 39589.55 39590.55 39591.56 39592.56 39593.64 39594.64 39595.65 39596.65 39597.65 39598.65 39599.65 39600.65];
+% In Case 4, we use the uniform 'applied' timing for the client stream
+applied4 = [40078.32 40079.32 40080.32 40081.32 40082.32 40083.32 40084.32 40085.32 40086.32 40087.32 40088.32 40089.32 40090.32 40091.32 40092.32 40093.32 40094.32 40095.32 40096.33 40097.33 40098.33 40099.33 40100.33 40101.33 40102.33];
+
+%% PLOTTING
+figure('Color', 'w', 'Name', 'Packet Stream Visualization');
+cases_tx = {tx1, tx2, tx3, tx4};
+case_names = {'Case 1: No Delay (Overlapped)', 'Case 2: Constant 250ms Delay', ...
+              'Case 3: Random Delay (Jittered)', 'Case 4: Fixed (Uniform Replay)'};
+
+for i = 1:4
+    subplot(4, 1, i); hold on;
+    
+    % Normalize X relative to start of TX
+    curr_tx = cases_tx{i} - cases_tx{i}(1);
+    
+    if i == 4
+        % Use the specific 'applied' timing for Case 4 client stream
+        curr_client = applied4 - cases_tx{i}(1);
+    elseif i == 3
+        % Jittered arrival for Case 3
+        curr_client = curr_tx + delay3;
+    else
+        % Standard arrival for Cases 1 & 2
+        curr_client = curr_tx + (i-1)*250; 
+    end
+    
+    % Case 1 needs a scale factor for visual spacing of the overlaps
+    x_scale = 1; if i == 1; x_scale = 100; end
+    
+    % Plot Server Stream (Top)
+    stem(curr_tx * x_scale, ones(1,25), 'Marker', 'none', 'Color', 'k', 'LineWidth', 1.2);
+    % Plot Client Stream (Bottom)
+    stem(curr_client * x_scale, -ones(1,25), 'Marker', 'none', 'Color', 'r', 'LineWidth', 1.2);
+    
+    % Labels
+    for j = 1:25
+        text(curr_tx(j)*x_scale, 1.2, sprintf('S%d', j), 'FontSize', 7, 'HorizontalAlignment', 'center');
+        text(curr_client(j)*x_scale, -1.4, sprintf('C%d', j), 'FontSize', 7, 'HorizontalAlignment', 'center', 'Color', 'r');
+    end
+    
+    title(case_names{i}, 'FontSize', 12);
+    ylim([-2.5 2.5]);
+    set(gca, 'YTick', [-1 1], 'YTickLabel', {'Client (RX)', 'Server (TX)'});
+    grid on;
+end
+xlabel('Time Timeline (ms)');
