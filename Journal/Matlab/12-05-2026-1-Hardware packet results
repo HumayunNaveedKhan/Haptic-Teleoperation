@@ -1,0 +1,77 @@
+%% Feedback Stream Visualization: Sequential Alignment
+clear; clc;
+
+% --- Sequentially Sorted Data Arrays ---
+% To compare "similar packets", we extract the first 25 continuous, 
+% sorted packets from both experiments and map them to Seq 1 -> 25.
+
+% Case 1: Real-time Feedback (Sorted sequentially by transmission)
+tx1 = [0.035 1.035 2.035 3.036 4.036 5.036 6.037 7.037 8.037 9.037 10.038 11.038 12.038 13.04 14.04 15.04 16.04 17.04 18.04 19.04 20.04 21.041 22.041 23.041 24.041];
+rx1 = [15199.283 15245.301 15183.276 15236.297 15145.27 15200.283 15154.271 15267.311 15128.255 15150.27 15326.36 15360.372 15212.29 15377.379 15217.29 15338.363 15387.381 15302.327 15208.286 15189.277 15170.274 15219.29 15385.38 15243.299 15310.344];
+app1 = [15199.283 15245.301 15183.276 15236.297 15145.27 15200.283 15154.271 15267.311 15128.255 15150.27 15326.36 15360.372 15212.29 15377.379 15217.29 15338.363 15387.381 15302.327 15208.286 15189.277 15170.274 15219.29 15385.38 15243.299 15310.344];
+
+% Case 2: RH Buffer Feedback (Sorted sequentially by transmission)
+tx2 = [36495.245 36497.245 36505.247 36507.249 36517.252 36524.255 36525.255 36526.256 36528.256 36529.256 36535.257 36536.257 36538.258 36541.26 36543.26 36544.261 36549.261 36553.262 36556.263 36558.264 36560.265 36562.266 36566.266 36569.267 36571.269];
+rx2 = [52051.406 52053.406 52061.406 52063.406 52073.406 52080.406 52081.406 52082.406 52084.406 52085.406 52091.406 52092.406 52094.406 52097.406 52099.406 52100.406 52105.406 52109.406 52112.406 52114.406 52116.406 52118.406 52122.406 52125.406 52127.406];
+app2 = [52301.544 52303.544 52311.545 52313.545 52323.551 52330.552 52331.554 52332.554 52334.558 52335.573 52341.573 52342.573 52344.573 52347.574 52349.575 52350.581 52355.584 52359.585 52362.585 52364.585 52366.592 52368.592 52372.592 52375.594 52377.594];
+
+% Common Sequence Identifier (1 to 25)
+seq_ids = 1:25;
+
+%% Data Normalization (Removing base clock offset)
+
+% Case 1 Normalization
+n_tx1 = tx1 - min(tx1);
+n_app1 = app1 - min(tx1) - 15000; % Approximation to align relative timelines
+
+% Case 2 Normalization
+n_tx2 = tx2 - min(tx2);
+n_app2 = app2 - min(tx2) - 15000; % Approximation to align relative timelines 
+
+% Re-adjust to start near 0 for clean comparative visual
+min_val1 = min([n_tx1, n_app1]); n_tx1 = n_tx1 - min_val1; n_app1 = n_app1 - min_val1;
+min_val2 = min([n_tx2, n_app2]); n_tx2 = n_tx2 - min_val2; n_app2 = n_app2 - min_val2;
+
+%% PLOTTING
+figure('Color', 'w', 'Position', [100, 100, 1200, 700], 'Name', 'Client Feedback Visualization');
+
+% --- Subplot 1: Real-time Feedback (Jittery & Out of Order) ---
+subplot(2, 1, 1); hold on;
+stem(n_tx1, ones(1,25), 'Marker', 'none', 'Color', 'k', 'LineWidth', 1.5);
+stem(n_app1, -ones(1,25), 'Marker', 'none', 'Color', 'r', 'LineWidth', 1.5);
+
+for i = 1:25
+    % Connection line shows packet trajectory
+    plot([n_tx1(i), n_app1(i)], [1, -1], 'Color', [0.7 0.7 0.7], 'LineStyle', ':', 'LineWidth', 1);
+    
+    % Common Sequence Number Text
+    text(n_tx1(i), 1.1, sprintf('P%d', seq_ids(i)), 'FontSize', 8, 'HorizontalAlignment', 'left', 'Rotation', 90);
+    text(n_app1(i), -1.1, sprintf('P%d', seq_ids(i)), 'FontSize', 8, 'HorizontalAlignment', 'right', 'Rotation', 90, 'Color', 'r');
+end
+
+title('Case 1: Real-Time Feedback (Severe Jitter & Out-of-Sequence Arrivals)', 'FontSize', 12, 'FontWeight', 'bold');
+ylim([-2.2 2.2]); xlim([-10, max([n_tx1, n_app1]) + 20]);
+set(gca, 'YTick', [-1 1], 'YTickLabel', {'Server App (RX)', 'Client Sent (TX)'});
+grid on;
+
+% --- Subplot 2: RH Buffer Implemented ---
+subplot(2, 1, 2); hold on;
+stem(n_tx2, ones(1,25), 'Marker', 'none', 'Color', 'k', 'LineWidth', 1.5);
+stem(n_app2, -ones(1,25), 'Marker', 'none', 'Color', 'b', 'LineWidth', 1.5);
+
+for i = 1:25
+    % Connection line shows packet trajectory
+    plot([n_tx2(i), n_app2(i)], [1, -1], 'Color', [0.7 0.7 0.7], 'LineStyle', ':', 'LineWidth', 1);
+    
+    % Common Sequence Number Text (Identical to Plot 1)
+    text(n_tx2(i), 1.1, sprintf('P%d', seq_ids(i)), 'FontSize', 8, 'HorizontalAlignment', 'left', 'Rotation', 90);
+    text(n_app2(i), -1.1, sprintf('P%d', seq_ids(i)), 'FontSize', 8, 'HorizontalAlignment', 'right', 'Rotation', 90, 'Color', 'b');
+end
+
+title('Case 2: RH Buffer Implemented (Delayed but Perfectly Streamlined)', 'FontSize', 12, 'FontWeight', 'bold');
+ylim([-2.2 2.2]); xlim([-10, max([n_tx2, n_app2]) + 20]);
+set(gca, 'YTick', [-1 1], 'YTickLabel', {'Server App (RH)', 'Client Sent (TX)'});
+xlabel('Normalized Timeline (ms)', 'FontSize', 11, 'FontWeight', 'bold');
+grid on;
+
+sgtitle('Structural Comparison: Contiguous Packet Streams (P1-P25)', 'FontSize', 14);
